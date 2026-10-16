@@ -37,9 +37,10 @@ export function Section({ title, children }: { title: string; children: ReactNod
 
 export function RunHeading({ run, now }: { run: RunView; now: number }) {
   const progress = runProgress(run.jobs);
-  return <header className="ps-heading">
-    <div className="ps-title"><div className="ps-title-line"><h2>{run.title}</h2><Status value={run.status} /></div>
-      <p>{progress.settled} of {progress.total} tasks settled · {formatDuration((run.finishedAt ?? now) - run.createdAt)}</p>
+  return <header className="ps-heading" data-state={run.status}>
+    <div className="ps-title"><p className="ps-eyebrow">{run.kind === "panel" ? "Review panel" : "Worker swarm"}</p>
+      <div className="ps-title-line"><h2>{run.title}</h2><Status value={run.status} /></div>
+      <div className="ps-run-meta"><span><strong>{progress.settled}</strong> of {progress.total} tasks settled</span><span className="ps-elapsed">{formatDuration((run.finishedAt ?? now) - run.createdAt)} elapsed</span></div>
       <progress className="ps-progress" value={progress.settled} max={Math.max(1, progress.total)} aria-label="Settled tasks" />
     </div>
   </header>;
@@ -69,12 +70,13 @@ export function RunOverview({ run, onThread, outcomes = false }: { run: RunView;
     })}</p>}
     {run.status === "partial" || run.status === "failed" || run.status === "cancelled"
       ? <p className="ps-warning">{run.status === "cancelled" ? "This run was stopped. Some results may be missing." : "This run is incomplete. Review the task results below."}</p> : null}
+    <div className="ps-ledger-heading"><span>Execution</span><span>Status</span></div>
     <ul className="ps-task-list">{groups.map((jobs) => <li key={jobs[0]?.key}>{jobs.map((job) => <div key={job.key} className={job.kind === "verifier" ? "ps-task ps-task-verifier" : "ps-task"}>
       <WorkerButton job={job} onThread={onThread} />
       <JobNotice job={job} />
       {!outcomes || job.summary === null || /\b(NOT_VERIFIED|INCONCLUSIVE|BLOCKED|ISSUES)\b/.test(job.summary) ? null : <p className="ps-task-outcome">{job.summary}</p>}
     </div>)}</li>)}</ul>
-    {outcomes && run.kind === "swarm" ? <p className="ps-muted">Finished tasks indicate execution status. Verification verdicts are shown separately.</p> : null}
+    {outcomes && run.kind === "swarm" ? <p className="ps-ledger-note ps-muted">Finished tasks indicate execution status. Verification verdicts are shown separately.</p> : null}
   </div>;
 }
 
@@ -119,12 +121,13 @@ export function Findings({ run }: { run: RunView }) {
   const reviewers = severityCounts(run);
   const max = Math.max(1, ...reviewers.map((reviewer) => reviewer.total));
   return <Section title="Findings">
+    {run.findings.length === 0 ? null : <p className="ps-findings-intro">{run.findings.length} {run.findings.length === 1 ? "finding" : "findings"} reported.</p>}
     <Disclosure title="Counts by reviewer"><div className="ps-severity-bars">{reviewers.map(({ job, counts }) => <div className="ps-reviewer" key={job.key}>
       <span>{job.label}</span><div className="ps-count-track">{severityOrder.map((severity) => <span key={severity} data-severity={severity} style={{ width: `${counts[severity] / max * 100}%` }} />)}</div>
       <span className="ps-counts">{severityOrder.map((severity) => `${counts[severity]} ${severity}`).join(" · ")}</span>
     </div>)}</div></Disclosure>
     {run.findings.length === 0 ? <p className="ps-muted">{run.status === "running" ? "No findings yet. Review is still in progress." : run.status !== "succeeded" || run.jobs.some((job) => job.state !== "succeeded") ? "No findings received. The review is incomplete." : "No findings reported by the completed reviewers."}</p> : <div className="ps-findings">{run.findings.map((finding) => <details key={finding.ref}>
-      <summary><Status value={finding.severity} /><strong>{finding.title}</strong><span className="ps-muted">{finding.ref} · {finding.seat}</span></summary>
+      <summary><Status value={finding.severity} /><span className="ps-finding-copy"><strong>{finding.title}</strong><span className="ps-muted">{finding.ref} · {finding.seat}</span></span></summary>
       <div className="ps-finding-detail"><code>{finding.location}</code><p>{finding.detail}</p>{finding.suggestion === undefined ? null : <p>Suggestion. {finding.suggestion}</p>}</div>
     </details>)}</div>}
   </Section>;
