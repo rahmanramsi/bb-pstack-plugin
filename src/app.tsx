@@ -7,7 +7,7 @@ import { Button } from "../components/ui/button.tsx";
 import type { rpcContract } from "./rpc.ts";
 import { bannerSummary, directiveRunId, panelRunId } from "./ui/layout.ts";
 import { useRunView, useThreadView } from "./ui/live.ts";
-import { Agreement, ChecklistPanel, Findings, LoadMessage, PanelFlow, RunHeading, SwarmGrid, Timeline, Workers } from "./ui/views.tsx";
+import { Agreement, ChecklistPanel, Disclosure, Findings, LoadMessage, PanelFlow, RunHeading, RunOverview, Timeline, Workers } from "./ui/views.tsx";
 import "./ui/styles.css";
 
 const PANEL_ACTION = "pstack-run";
@@ -48,9 +48,9 @@ function RunCard({ threadId, runId }: { threadId: string; runId: string }) {
     {run === null ? <p role="status" className="ps-message">This run does not belong to this thread, or it no longer exists.</p> : null}
     {!run ? null : <>
       <RunHeading run={run} now={now} />
-      {run.kind === "panel" ? <PanelFlow run={run} onThread={navigate.toThread} /> : <SwarmGrid run={run} onThread={navigate.toThread} />}
+      <RunOverview run={run} onThread={navigate.toThread} />
       <div className="ps-actions"><Button type="button" variant="ghost" size="sm" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: run.title, params: { runId } })}>View details</Button>
-        {run.status === "running" ? <StopRun threadId={threadId} runId={runId} refresh={refresh} /> : null}<code>{runId}</code>
+        {run.status === "running" ? <StopRun threadId={threadId} runId={runId} refresh={refresh} /> : null}
       </div>
     </>}
   </section>;
@@ -70,8 +70,7 @@ function ThreadBanner({ threadId }: { threadId: string }) {
   if (summary.runs === 0 && summary.open === 0 && state.refreshError === null) return null;
   return <div className="pstack"><div className="ps-banner">
     <span>{summary.runs} active {summary.runs === 1 ? "run" : "runs"} · {summary.open} open checklist {summary.open === 1 ? "step" : "steps"}</span>
-    {state.value.activeRuns.map((run) => <Button type="button" variant="ghost" size="sm" key={run.id} onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: run.title, params: { runId: run.id } })}>{run.title}</Button>)}
-    <Button type="button" variant="ghost" size="sm" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: "pstack" })}>Checklist and runs</Button>
+    <Button type="button" variant="ghost" size="sm" aria-label="Open runs and checklist" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: "pstack" })}>Open</Button>
   </div><LoadMessage state={state} /></div>;
 }
 
@@ -86,11 +85,12 @@ function RunInspector({ threadId, runId }: { threadId: string; runId: string }) 
   const now = useNow();
   return <><LoadMessage state={state} />{state.status === "ready" && state.value === null ? <p role="status" className="ps-message">This run does not belong to this thread, or it no longer exists.</p> : null}{state.status !== "ready" || state.value === null ? null : <>
     <RunHeading run={state.value} now={now} />
-    {state.value.kind === "swarm" ? <SwarmGrid run={state.value} onThread={navigate.toThread} /> : null}
-    <Timeline run={state.value} now={now} onThread={navigate.toThread} />
-    {state.value.kind !== "panel" ? null : <><Findings run={state.value} /><Agreement run={state.value} /></>}
-    <Workers run={state.value} onThread={navigate.toThread} />
     {state.value.status !== "running" ? null : <div className="ps-actions"><StopRun threadId={threadId} runId={runId} refresh={refresh} /></div>}
+    <RunOverview run={state.value} onThread={navigate.toThread} outcomes />
+    {state.value.kind !== "panel" ? null : <Findings run={state.value} />}
+    <Disclosure title="Timeline"><Timeline run={state.value} now={now} onThread={navigate.toThread} /></Disclosure>
+    {state.value.kind !== "panel" ? null : <><Disclosure title="Review flow"><PanelFlow run={state.value} onThread={navigate.toThread} /></Disclosure><Disclosure title="Reviewer agreement"><Agreement run={state.value} /></Disclosure></>}
+    <Disclosure title="Technical details"><p className="ps-run-id">Run <code>{state.value.id}</code> · {state.value.kind}</p><Workers run={state.value} onThread={navigate.toThread} /></Disclosure>
   </>}</>;
 }
 
