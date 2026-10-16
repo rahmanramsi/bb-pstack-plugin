@@ -1,4 +1,3 @@
-import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 /** Realtime channel. Payload is `{ threadId, revision }` only; every mount refetches through RPC. */
@@ -186,10 +185,4 @@ export const ThreadView = z.object({
   revision: z.number().int(),
   activeRuns: z.array(RunView.pick({ id: true, kind: true, title: true, status: true, jobs: true })),
   checklist: ChecklistView.nullable(),
-});
-
-export const rpcContract = defineRpcContract({
-  pstackThreadView: { input: z.object({ threadId: z.string() }), output: ThreadView },
-  pstackRunView: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: RunView.nullable() },
-  pstackStopRun: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: z.object({ stopped: z.boolean() }) },
 });

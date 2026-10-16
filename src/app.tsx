@@ -4,7 +4,7 @@ import {
   type PluginMessageDirectiveProps, type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import { Button } from "../components/ui/button.tsx";
-import type { rpcContract } from "./contract.ts";
+import type { rpcContract } from "./rpc.ts";
 import { bannerSummary, directiveRunId, panelRunId } from "./ui/layout.ts";
 import { useRunView, useThreadView } from "./ui/live.ts";
 import { Agreement, ChecklistPanel, Findings, LoadMessage, PanelFlow, RunHeading, SwarmGrid, Timeline, Workers } from "./ui/views.tsx";

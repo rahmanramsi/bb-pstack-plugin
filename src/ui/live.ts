@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
-import { STATE_CHANNEL, type rpcContract, type RunView } from "../contract.ts";
+import { STATE_CHANNEL, type RunView } from "../contract.ts";
+import type { rpcContract } from "../rpc.ts";
 import type { Thread } from "./layout.ts";
 
 export type LiveState<T> =
