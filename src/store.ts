@@ -81,6 +81,12 @@ export const MIGRATIONS: readonly string[] = [
      revivals INTEGER NOT NULL DEFAULT 0,
      stalled_at INTEGER
    )`,
+  `ALTER TABLE steps ADD COLUMN skip_policy TEXT NOT NULL DEFAULT 'agent' CHECK (skip_policy IN ('agent','user','never'))`,
+  `ALTER TABLE steps ADD COLUMN opened_at INTEGER`,
+  `UPDATE steps SET opened_at = (SELECT created_at FROM checklists WHERE checklists.thread_id = steps.thread_id)
+   WHERE status = 'open' AND (section = 'pr' OR id = (SELECT s.id FROM steps s WHERE s.thread_id = steps.thread_id AND s.section = 'playbook' AND s.status = 'open' ORDER BY s.position, s.id LIMIT 1))`,
+  `UPDATE steps SET skip_policy = CASE WHEN id = 4 THEN 'never' ELSE 'user' END
+   WHERE section = 'playbook' AND id IN (1,2,4) AND thread_id IN (SELECT thread_id FROM checklists WHERE playbook = 'feature')`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

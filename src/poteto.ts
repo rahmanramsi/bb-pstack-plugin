@@ -45,6 +45,16 @@ export function activatesPoteto(context: PotetoDispatch, pluginId: string): bool
     outsideCode(block.text).slice(start, end).trim().length > 0));
 }
 
+export type PotetoControl = { kind: "waive"; stepId: number; reason: string } | { kind: "invalid" };
+
+export function potetoControl(text: string): PotetoControl | null {
+  if (outsideCode(text) !== text) return null;
+  if (!/^\s*[/\u0024]poteto-mode\s+waive\b/.test(text)) return null;
+  const match = /^\s*[/\u0024]poteto-mode\s+waive\s+([1-9]\d*)\s+([^\r\n]+?)\s*$/.exec(text);
+  if (!match || !Number.isSafeInteger(Number(match[1])) || match[2].length > 500) return { kind: "invalid" };
+  return { kind: "waive", stepId: Number(match[1]), reason: match[2] };
+}
+
 export function revivalDecision(state: PotetoThread, idle: boolean, budget = 3): "deliver" | "revive" | "stall" | "none" {
   if (state.phase !== "activated") return "none";
   if (state.charterState === "pending") return "deliver";

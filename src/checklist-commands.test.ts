@@ -62,17 +62,21 @@ test("CLI gates reject feature step 4 alone, then distinguish pre-PR steps and a
   const { run, store, publications } = fixture(t);
   assert.equal((await run(["gate", "pr"])).exitCode, 1);
   await run(["checklist", "begin", "feature"]);
+  const outOfOrder = await run(["checklist", "done", "4", "--evidence", "path:src/checklist.ts"]);
+  assert.equal(outOfOrder.exitCode, 1);
+  assert.match(outOfOrder.stdout ?? "", /Close it before step 4/);
+  for (const step of [1, 2, 3]) await run(["checklist", "done", String(step), "--evidence", "path:src/checklist.ts"]);
   assert.equal((await run(["checklist", "done", "4", "--evidence", "path:src/checklist.ts", "--evidence", "commit:abcdef1"])).exitCode, 0);
   const beforeRepeat = publications.length;
   await run(["checklist", "done", "4", "--evidence", "path:src/checklist.ts", "--evidence", "commit:abcdef1"]);
   assert.equal(publications.length, beforeRepeat);
   const blocked = await run(["gate", "pr"]);
   assert.equal(blocked.exitCode, 1);
-  for (const id of [1, 2, 3]) assert.match(blocked.stdout ?? "", new RegExp(`\\n${id}\\. \\[playbook\\]`));
+  for (const id of [5, 6, 7]) assert.match(blocked.stdout ?? "", new RegExp(`\\n${id}\\. \\[playbook\\]`));
   const state = store.checklist("thr_test");
   assert.ok(state);
   for (const step of state.steps.filter((step) => !step.afterPr && step.resolution.kind === "open")) {
-    const args = step.id % 2 ? ["done", String(step.id), "--evidence", "path:src/checklist.ts"]
+    const args = step.id % 2 || step.skipPolicy !== "agent" ? ["done", String(step.id), "--evidence", "path:src/checklist.ts"]
       : ["skip", String(step.id), "--reason", "This step does not apply."];
     assert.equal((await run(["checklist", ...args])).exitCode, 0);
   }
@@ -150,7 +154,7 @@ test("instructions are bounded and concurrent idle handlers send one agent-only 
   const state = store.checklist("thr_test");
   assert.ok(state);
   for (const step of state.steps.filter((step) => step.resolution.kind === "open")) {
-    store.resolveStep("thr_test", step.id, { kind: "skipped", reason: "No remaining work." });
+    store.resolveStep("thr_test", step.id, { kind: "done", evidence: [{ kind: "path", path: "src" }] });
   }
   await feature.onIdle("thr_test");
   assert.equal(sends.length, 2);
@@ -158,7 +162,7 @@ test("instructions are bounded and concurrent idle handlers send one agent-only 
 
 test("a stale idle snapshot cannot consume the nudge for a newer revision", async (t) => {
   const { store, feature, sends } = fixture(t);
-  const state = { section: "playbook", afterPr: false, text: "Check recovery" } as const;
+  const state = { section: "playbook", skipPolicy: "agent", afterPr: false, text: "Check recovery" } as const;
   store.createChecklist("thr_test", "feature", [state], 1);
   const idle = feature.onIdle("thr_test");
   store.addStep("thr_test", "Check restart", 1);
@@ -229,4 +233,41 @@ test("charter retries failed sends, survives reopen, and bounded idle revivals b
   const cli = defineCli({ name: "pstack", summary: "checklists", commands: current.commands });
   await cli.run(["checklist", "begin", "feature"], { threadId: "thr_test" });
   assert.equal(store.poteto("thr_test")?.phase, "routed");
+});
+
+test("only a direct user control message can waive Feature steps 1 and 2, and step 4 cannot be waived", async (t) => {
+  const { feature, run, store, sends } = fixture(t);
+  await run(["checklist", "begin", "feature"]);
+  assert.equal((await run(["checklist", "skip", "1", "--reason", "already done"])).exitCode, 1);
+  const ctx = userDispatch("/poteto-mode waive 1 Existing design accepted.");
+  assert.deepEqual(feature.dispatch({ ...ctx, initiator: "agent" }), { action: "proceed" });
+  assert.equal(store.checklist("thr_test")?.steps[0].resolution.kind, "open");
+  assert.match(JSON.stringify(feature.dispatch(ctx)), /Step 1 waived/);
+  assert.match(JSON.stringify(feature.dispatch(ctx)), /Step 1 waived/);
+  assert.equal(store.checklist("thr_test")?.revision, 1);
+  assert.equal((await run(["checklist", "skip", "2", "--reason", "already done"])).exitCode, 1);
+  feature.dispatch(userDispatch("/poteto-mode waive 2 Existing architecture accepted."));
+  await run(["checklist", "done", "3", "--evidence", "path:plan.md"]);
+  assert.equal((await run(["checklist", "skip", "4", "--reason", "already done"])).exitCode, 1);
+  assert.match(JSON.stringify(feature.dispatch(userDispatch("/poteto-mode waive 4 No delegation."))), /cannot be skipped/);
+  assert.equal(store.checklist("thr_test")?.steps[3].resolution.kind, "open");
+  assert.equal(sends.length, 0);
+});
+
+test("CLI passes the step opening time to reject stale thread and run evidence with recovery instructions", async (t) => {
+  const { evidenceFreshnessError } = await import("./checklist.ts");
+  const { store } = fixture(t);
+  store.createChecklist("thr_test", "feature", [{ section: "playbook", text: "Verify", afterPr: false, skipPolicy: "agent" }], 200);
+  let createdAt = 100;
+  const feature = createChecklistFeature({ bb: {} as BbPluginApi, store, skillsDir, activeWork: async () => ({ activeRuns: 0, activeChildren: 0 }), publish: () => {},
+    evidenceError: async (evidence, _thread, openedAt) => evidenceFreshnessError(evidence, createdAt, openedAt) });
+  const cli = defineCli({ name: "pstack", summary: "checklist", commands: feature.commands });
+  for (const reference of ["thread:thr_old", "run:psr_12345678-1234-1234-1234-123456789abc"]) {
+    const result = await cli.run(["checklist", "done", "1", "--evidence", reference], { threadId: "thr_test" });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stdout ?? "", /predates this step.*Start fresh work/);
+  }
+  assert.equal(store.checklist("thr_test")?.steps[0].resolution.kind, "open");
+  createdAt = 200;
+  assert.equal((await cli.run(["checklist", "done", "1", "--evidence", "thread:thr_new"], { threadId: "thr_test" })).exitCode, 0);
 });
