@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Explore the codebase to answer "how does X work?" questions. Produce architectural explanations at the level of a senior engineer onboarding onto a subsystem, enough to build a working mental model, not so much that it reads like annotated source code.
 
-Every spawn is a Task subagent with `subagent_type: generalPurpose` and `readonly: true`. Explorers use the `how explorer` line in the `pstack-models.mdc` rule (default `grok-4.7-xhigh-fast`), and every explainer uses the `how explainer` line (default `claude-opus-5-5-xhigh`). Set `model` to that line's value, or to the default if the rule or the line is missing. Leave `model` unset when the value is `auto` or `inherit-parent`. If the Task tool rejects a slug, use the default and say so. If it rejects the default, use the closest valid slug of the same family from its error message. Pick each subagent's reasoning level and fast or standard speed for the job, per the Subagents section of the **poteto-mode** skill.
+Every spawn is a read-only child thread (no file edits, no commits, said in its prompt): `bb thread spawn --parent-self --project "$BB_PROJECT_ID" --environment "$BB_ENVIRONMENT_ID" --title "<short>" --prompt-file -`. Explorers use the `how explorer` line of the pstack `models` setting (default `codex/gpt-6.1-sol/xhigh`), and every explainer uses the `how explainer` line (default `claude-code/claude-opus-5-5/xhigh`). Pass that line's tuple as `--provider <id> --model <model> --reasoning-level <level>`, or the default if the line is missing (`bb pstack models` prints the effective table). Omit the three flags when the value is `inherit-parent`. If `bb thread spawn` rejects a tuple, use the default and say so. If it rejects the default, use the closest valid model of the same provider from `bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json`. Read each result with `bb thread output <id>`. Pick each subagent's reasoning level and fast or standard speed for the job, per the Subagents section of the **poteto-mode** skill.
 
 ## 1. Assess complexity
 
@@ -21,7 +21,9 @@ When in doubt, take the simple path.
 
 ## 2. Explore (complex only)
 
-Decompose the question into 2 to 4 angles, each a distinct slice of the subsystem. Spawn all explorers in a single message, each with `references/explorer-prompt.md` and its angle filled in.
+**Launch path.** Run `bb pstack workflow ready` before spawning anything. If it exits 0, launch the explorers and the explainer together as the bundled `pstack-panel` workflow (one seat per angle with its filled explorer prompt on the `how explorer` tuple, and the step 3 explainer as the `judge` on the `how explainer` tuple with `references/explainer-prompt.md` as its prompt, so step 3 is done when the run finishes) with `bb workflows run --script "$(bb pstack workflow source pstack-panel)" --args …`, collect the result as [`../swarm/references/bb-workflows.md`](../swarm/references/bb-workflows.md) describes, and skip the child-thread instructions below. If it exits 1, spawn child threads as below.
+
+Decompose the question into 2 to 4 angles, each a distinct slice of the subsystem. Spawn all explorers at once, each with `references/explorer-prompt.md` and its angle filled in.
 
 ## 3. Synthesize (complex only)
 

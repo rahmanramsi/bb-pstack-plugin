@@ -24,16 +24,18 @@ Before spawning reviewers, state the intent in one clear paragraph from the user
 
 ## Step 3, Spawn Reviewers
 
-Launch all reviewers in a single message with the Task tool, one per entry on the `interrogate reviewers` line in `~/.cursor/rules/pstack-models.mdc`, labeled Reviewer A, B, and so on to match the entry count. If the rule or that line is missing, use the table defaults.
+**Launch path.** Run `bb pstack workflow ready` before spawning anything. If it exits 0, launch the reviewers as the bundled `pstack-panel` workflow (one seat per entry of `bb pstack models --role "interrogate reviewers"`, labeled Reviewer A, B, and so on, every seat with the filled reviewer prompt below, and no `judge`, since Step 5's lead judgment is yours) with `bb workflows run --script "$(bb pstack workflow source pstack-panel)" --args …`, collect the result as [`../swarm/references/bb-workflows.md`](../swarm/references/bb-workflows.md) describes, and skip the child-thread instructions below. If it exits 1, spawn child threads as below.
 
-| Subagent | Default model |
+Launch all reviewers at once as child threads, one per entry on the `interrogate reviewers` line of the pstack `models` setting (`bb pstack models` prints the effective table), labeled Reviewer A, B, and so on to match the entry count. If that line is missing, use the table defaults.
+
+| Reviewer | Default tuple |
 |----------|---------------|
-| Reviewer A | `claude-opus-5-5-xhigh` |
-| Reviewer B | `grok-4.7-xhigh-fast` |
+| Reviewer A | `claude-code/claude-opus-5-5/xhigh` |
+| Reviewer B | `codex/gpt-6.1-sol/xhigh` |
 
-Each reviewer gets `subagent_type: generalPurpose`, `readonly: true`, and `model` set to its configured entry, or its table default when there is no configured line. Omit `model` for an `auto` or `inherit-parent` entry, so that reviewer runs on the parent model.
+Each reviewer is spawned with `bb thread spawn --parent-self --project "$BB_PROJECT_ID" --environment "$BB_ENVIRONMENT_ID" --title "Reviewer <label>" --prompt-file -`, is told in its prompt that it is read-only (no file edits, no commits), and gets `--provider <id> --model <model> --reasoning-level <level>` from its configured entry, or its table default when there is no configured line. Omit the three flags for an `inherit-parent` entry, so that reviewer runs on the parent thread's execution. Each child notifies you when it finishes. Read its findings with `bb thread output <id>`.
 
-If the Task tool rejects a configured entry, run that reviewer on its family's table default and say so. Families go by prefix: `claude-*`, and `grok-*` with `cursor-grok-*` and `composer-*`. A refused `composer-*` entry runs on Reviewer B's default. With no family match, use Reviewer A's default. If it rejects a table default, spawn with the closest equivalent from the valid slugs in its error message (prefer the same family and reasoning tier), and open a separate PR to update the default table. Do not block the review on the slug issue. Never treat an alias entry as a rejected slug or apply either fallback to it.
+If `bb thread spawn` rejects a configured entry, run that reviewer on its family's table default and say so. Families go by provider: `claude-code` or `codex`. With no family match, use Reviewer A's default. If it rejects a table default, spawn with the closest equivalent from `bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json` (prefer the same provider and reasoning level), and open a separate PR to update the default table. Do not block the review on the tuple issue. Never treat an alias entry as a rejected tuple or apply either fallback to it.
 
 Read `references/reviewer-prompt.md` and fill in the same template for every reviewer with the stated intent, the diff or file contents, the rubric from `references/rubric.md`, and the code-quality lens from `references/code-quality-review.md`. Pick each subagent's reasoning level and fast or standard speed for the job, per the Subagents section of the **poteto-mode** skill.
 

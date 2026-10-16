@@ -17,8 +17,8 @@ Load the external Benny configuration supplied by the automation. If the config,
 - Preflight the source parent before every source-thread post.
 - The coordinator is the only Slack poster.
 - Delegated analysis workers are read-only and return findings or media notes.
-- A fix-phase code worker may edit only when its environment provably excludes Slack credentials and every Slack write action. Otherwise the coordinator edits.
-- Every child prompt must explicitly forbid `SendSlackMessage`, `PostToSlack`, `chat.postMessage`, and all other Slack writes.
+- A fix-phase code worker may edit only when its environment provably excludes Slack credentials and every Slack write action. Otherwise the coordinator edits. A child bb thread on the same provider normally has the same Slack MCP tools, so treat its isolation as unproven unless setup verified otherwise.
+- Every child prompt must explicitly forbid every Slack MCP write tool, `chat.postMessage`, and all other Slack writes.
 - Never give a child a Slack token, posting instructions, source coordinates for posting, or permission to report externally.
 - If a child needs Slack write access to run, do not launch it.
 - Utility bots are evidence sources. They do not own the fix unless a person explicitly delegated the fix to them.
@@ -31,12 +31,24 @@ Load the external Benny configuration supplied by the automation. If the config,
 - Use pstack's `principle-guard-the-context-window` for delegated analysis.
 - Apply pstack's `principle-sequence-verifiable-units`, `principle-fix-root-causes`, and `principle-prove-it-works` through repro, fix, and verification.
 
-## 1. Freeze source coordinates
+## 1. Select one report and freeze source coordinates
+
+A bb automation starts this run on a schedule. There is no Slack event payload. Select the report yourself, and handle exactly one per run. Stay silent during selection.
+
+The ledger at `state.ledger_path` is a tab-separated file with one row per event: UTC time, automation (`triage` or `reproduce`), source channel ID, root thread timestamp, and status. Never rewrite or delete rows. Create the file with no rows when it is missing.
+
+1. Through the configured Slack read action, list top-level messages in the configured source channel posted within `schedule.lookback_hours`, oldest first.
+2. Skip a message with any `reproduce` row in the ledger.
+3. Read each remaining thread and look for a triage verdict that passes the checks in step 2 below.
+4. No verdict yet: if the root is younger than `budgets.verdict_wait_minutes`, leave it for a later run. Otherwise append a `reproduce` row with status `no-verdict`.
+5. An `other` marker, an untrusted author, or conflicting markers: append a `reproduce` row with status `skipped`.
+6. Select the oldest message with a trusted `bug` or `performance` verdict. If none remains, stop with no posts.
+7. Append a `reproduce` row with status `claimed`. Read the ledger again. If an earlier `reproduce` row exists for the same thread, another run owns it. Stop.
 
 Before making a work list or delegating:
 
-1. Require the trigger channel to equal the configured source channel.
-2. Set `SOURCE_THREAD_TS` to `trigger.thread_ts` when present. Otherwise use `trigger.ts`.
+1. Require the selected message's channel to equal the configured source channel.
+2. Set `SOURCE_THREAD_TS` to the selected message's `thread_ts` when present. Otherwise use its `ts`.
 3. Require a nonempty `SOURCE_THREAD_TS`.
 4. Store `SOURCE_CHANNEL_ID` and `SOURCE_THREAD_TS` as immutable values.
 5. Read the source thread and verify its root has those exact coordinates.
@@ -53,9 +65,9 @@ Before every source-channel post:
 
 If any check fails, post nothing. Never retry at the root or in a fallback channel.
 
-## 2. Wait for the triage contract
+## 2. Check the triage contract
 
-Watch the source thread for the configured verdict budget. Stay silent while waiting.
+Waiting for the verdict happens across scheduled runs: step 1 leaves a report without a verdict for a later run until `budgets.verdict_wait_minutes` passes. Re-read the selected thread now and stay silent.
 
 Accept a verdict only when:
 
@@ -73,7 +85,7 @@ Public marker forms:
 [benny:other]
 ```
 
-Proceed only for `bug` or `performance`. Capture the optional tracker URL. Stop silently for `other`, a missing verdict, an untrusted author, conflicting markers, or a timeout.
+Proceed only for `bug` or `performance`. Capture the optional tracker URL. Stop silently for `other`, a missing verdict, an untrusted author, conflicting markers, or a timeout, and record the reason in the ledger.
 
 This marker replaces private bot identities and free-form verdict matching.
 
@@ -119,7 +131,7 @@ Use the configured plain Unicode status strings. Keep status text short:
 - Draft pull request opened
 - Fix did not land
 
-Prefer configured Cursor Slack actions. Use `BENNY_SLACK_BOT_TOKEN` only when the user configured it for a narrow missing capability such as editing this one status message. Never expose the token to a worker.
+Prefer the configured Slack MCP tools. Use `BENNY_SLACK_BOT_TOKEN` only when the user configured it for a narrow missing capability such as editing this one status message. Never expose the token to a worker.
 
 If no operations channel is configured, keep detailed status in the automation run output. Do not substitute a source-channel root message.
 
@@ -308,3 +320,5 @@ Watch the configured operations thread for one follow-up window.
 - Stop when asked.
 
 Always call the control adapter's cleanup capability. Keep artifacts only as long as the configured retention policy allows.
+
+Before the run ends, append one `reproduce` row for this thread whose status names the outcome: `could-not-reproduce`, `blocked`, `reproduced`, `verified-existing-fix`, `draft-pr-opened`, `fix-did-not-land`, or `stopped`.

@@ -1,0 +1,48 @@
+{
+  "name": "bb-plugin-pstack",
+  "version": "0.15.25",
+  "type": "module",
+  "description": "if you want to go fast, go deep first. pstack helps you write less, but higher quality code. rigorous agent workflows you can parallelize with confidence.",
+  "license": "MIT",
+  "author": "Lauren Tan",
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.37"
+  },
+  "bb": {
+    "name": "pstack",
+    "description": "Rigorous agent workflows: poteto-mode playbooks, multi-model review panels, and engineering principles as skills.",
+    "branding": {
+      "icon": "Layers",
+      "logo": {
+        "light": "./assets/logo.png"
+      }
+    },
+    "server": "./src/server.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "keywords": [
+    "bb-plugin",
+    "pstack",
+    "poteto-mode",
+    "workflow",
+    "principles",
+    "subagents",
+    "unslop"
+  ],
+  "scripts": {
+    "test": "node --test src/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bb plugin build"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

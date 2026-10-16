@@ -3,6 +3,18 @@ schema_version: 1
 automations:
   triage_name: "benny-triage"
   reproduce_name: "benny-reproduce"
+  bb_project_id: "BB_PROJECT_ID"
+  triage_prompt_path: ".bb/benny/triage-prompt.md"
+  reproduce_prompt_path: ".bb/benny/reproduce-prompt.md"
+
+schedule:
+  timezone: "America/New_York"
+  triage_cron: "*/5 * * * *"
+  reproduce_cron: "*/20 * * * *"
+  lookback_hours: 24
+
+state:
+  ledger_path: "/absolute/path/outside/the/repository/benny-ledger.tsv"
 
 slack:
   source_channel_id: "SOURCE_CHANNEL_ID"
@@ -12,7 +24,7 @@ slack:
   thread_post_action: "configured-slack-thread-post-action"
   file_download_action: "configured-slack-file-download-action"
   operations_edit_action: "configured-slack-edit-action"
-  prefer_cursor_actions: true
+  prefer_mcp_tools: true
   optional_bot_token_env: "BENNY_SLACK_BOT_TOKEN"
   allow_source_root_posts: false
   allow_worker_slack_writes: false
@@ -39,14 +51,14 @@ tracker:
   require_compensation_action: true
 
 routing:
-  map_path: ".cursor/benny/routing.md"
+  map_path: ".bb/benny/routing.md"
   owner_pings_default: false
   allow_feature_owner_ping: false
   allow_confirmed_regression_author_ping: false
 
 control:
   skill_name: "control-target-app"
-  feature_map_path: ".cursor/benny/feature-map.md"
+  feature_map_path: ".bb/benny/feature-map.md"
   environment: "safe-test-environment-placeholder"
   artifact_directory: "/tmp/benny-artifacts"
   artifact_retention_hours: 24
@@ -78,7 +90,7 @@ budgets:
   operations_follow_up_minutes: 45
 
 models:
-  triage: "choose-an-available-public-model-slug"
-  reproduce: "choose-an-available-public-model-slug"
-  code: "choose-an-available-public-model-slug"
-  media_review: "choose-an-available-public-model-slug"
+  triage: "provider/model/level-listed-by-bb-provider-models"
+  reproduce: "provider/model/level-listed-by-bb-provider-models"
+  code: "provider/model/level-listed-by-bb-provider-models"
+  media_review: "provider/model/level-listed-by-bb-provider-models"

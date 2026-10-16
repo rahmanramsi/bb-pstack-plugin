@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only worktree prune audit. Classifies every git worktree by size, merge
-# state, uncommitted work, remote/PR state, and the most recent chat that
-# operated in it. Emits a table sorted by size with a suggested bucket. Never
+# state, uncommitted work, remote/PR state, and the most recent bb thread whose
+# environment is it. Emits a table sorted by size with a suggested bucket. Never
 # deletes anything; deletion stays a human-gated step in the playbook.
 #
 # Usage: worktree-audit.sh [-b|--base <ref>] [repo-path]
@@ -61,9 +61,12 @@ elif raw=$(gh pr list --author "@me" --state all --limit 1000 \
 fi
 [ -s "$prs" ] || echo "[]" > "$prs"
 
-# Transcripts dir: ~/.cursor/projects/<slugified-repo-path>/agent-transcripts.
-slug=$(printf '%s' "$main_wt" | sed 's#^/##; s#/#-#g')
-transcripts="$HOME/.cursor/projects/$slug/agent-transcripts"
+# bb threads across all projects, fetched once. Archived threads are left out,
+# hidden ones kept. Empty when bb is unavailable.
+threads=$(mktemp)
+bb thread list --include-hidden --json > "$threads" 2>/dev/null \
+	|| echo "warn: bb thread list failed; LAST_CHAT is empty" >&2
+jq -e 'type == "array"' "$threads" >/dev/null 2>&1 || echo "[]" > "$threads"
 now=$(date +%s)
 
 echo "# base: $base"
@@ -100,15 +103,13 @@ git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt;
 		'.[] | select(.head==$b) | "#\(.number)/\(.state)"' "$prs" 2>/dev/null | head -1)
 	[ -z "$pr" ] && pr="-"
 
-	# Most recent chat whose transcript operated in this worktree. Match path
-	# followed by "/" or a quote so glint-482 does not match glint-482-r37.
-	last="-"; last_ts=0
-	if [ -d "$transcripts" ]; then
-		f=$(rg -l -e "${wt}/" -e "${wt}\"" "$transcripts" 2>/dev/null \
-			| xargs stat -f '%m %N' 2>/dev/null | sort -rn | head -1)
-		if [ -n "$f" ]; then last_ts=$(echo "$f" | awk '{print $1}')
-			last=$(date -r "$last_ts" '+%Y-%m-%d' 2>/dev/null); fi
-	fi
+	# Most recent bb thread whose environment is this worktree. Exact path match
+	# so glint-482 does not match glint-482-r37.
+	last="-"; last_ts=$(jq -r --arg p "$wt" \
+		'[.[] | select(.environmentPath == $p) | .updatedAt] | max // 0 | . / 1000 | floor' \
+		"$threads" 2>/dev/null)
+	[ -n "$last_ts" ] || last_ts=0
+	[ "$last_ts" -gt 0 ] 2>/dev/null && last=$(date -r "$last_ts" '+%Y-%m-%d' 2>/dev/null)
 	recent=$([ "$last_ts" -gt 0 ] 2>/dev/null && [ $(( (now - last_ts) / 86400 )) -le 4 ] && echo yes || echo no)
 
 	case "$dirty" in wip:*) bucket=hold-wip ;; *)
@@ -123,4 +124,4 @@ git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt;
 		"$size" "$age" "$merged" "$dirty" "$remote" "$pr" "$last" "$bucket" "$wt"
 done | sort -t$'\t' -k1,1 -rh
 
-rm -f "$prs"
+rm -f "$prs" "$threads"

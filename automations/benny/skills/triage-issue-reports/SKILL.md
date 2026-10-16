@@ -20,20 +20,31 @@ Load the external Benny configuration supplied by the automation. If the config 
 - Post one substantive verdict. Do not narrate progress.
 - The coordinator is the only Slack poster.
 - Delegated workers return findings only. They must be read-only and receive no Slack credentials or write actions.
-- Every child prompt must forbid `SendSlackMessage`, `PostToSlack`, `chat.postMessage`, and every other Slack write.
-- If worker isolation cannot enforce those limits, do the work in the coordinator.
+- Every child prompt must forbid every Slack MCP write tool, `chat.postMessage`, and every other Slack write.
+- If worker isolation cannot enforce those limits, do the work in the coordinator. A child bb thread on the same provider normally has the same Slack MCP tools, so treat its isolation as unproven unless setup verified otherwise.
 - Never create an issue that cannot link back to the source thread.
 - Prefer no ticket over a guessed or duplicate ticket.
 - Apply pstack's `principle-separate-before-serializing-shared-state` to source coordinates.
 - Apply pstack's `principle-minimize-reader-load` and `unslop` skills to the final verdict.
 
-## 1. Freeze source coordinates
+## 1. Select one report and freeze source coordinates
+
+A bb automation starts this run on a schedule. There is no Slack event payload. Select the report yourself, and handle exactly one per run.
+
+The ledger at `state.ledger_path` is a tab-separated file with one row per event: UTC time, automation (`triage` or `reproduce`), source channel ID, root thread timestamp, and status. Never rewrite or delete rows. Create the file with no rows when it is missing.
+
+1. Through the configured Slack read action, list top-level messages in the configured source channel posted within `schedule.lookback_hours`, oldest first.
+2. Skip a message posted by the triage identity.
+3. Skip a message whose thread already has a reply from the triage identity.
+4. Skip a message with any `triage` row in the ledger.
+5. Select the oldest remaining message. If none remains, stop with no posts, no tracker writes, and no ledger row.
+6. Append a `triage` row with status `claimed`. Read the ledger again. If an earlier `triage` row exists for the same thread, another run owns it. Stop.
 
 Before making a work list or delegating:
 
-1. Read `source_channel_id` from the trigger.
+1. Read `source_channel_id` from the selected message.
 2. Require it to equal the configured source channel.
-3. Set `SOURCE_THREAD_TS` to `trigger.thread_ts` when present. Otherwise use `trigger.ts`.
+3. Set `SOURCE_THREAD_TS` to the selected message's `thread_ts` when present. Otherwise use its `ts`.
 4. Require a nonempty `SOURCE_THREAD_TS`.
 5. Store `SOURCE_CHANNEL_ID` and `SOURCE_THREAD_TS` as immutable values.
 6. Read the thread and verify that its root has exactly those coordinates.
@@ -237,4 +248,6 @@ Watch the source thread for the configured follow-up window, then stop.
 - Stay out of human coordination and side chatter.
 - Stop early if someone asks the automation to stop.
 
-Do not extend the window more than once. A new report should start a new run.
+Do not extend the window more than once. A new report waits for a later run.
+
+Before the run ends, append one `triage` row for this thread whose status is the posted marker, `stopped`, or `failed`. A run that stops after claiming still records why in its output.
