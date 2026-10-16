@@ -228,6 +228,17 @@ const PLAN_CASES: PlanCase[] = [
     expect: ["spawn:verify-1"],
   },
   {
+    name: "a round that releases a verifier holds spawns so the verifier takes the next free slot",
+    snapshot: (() => {
+      const slices = Array.from({ length: 10 }, (_, index) => `p${index + 1}`);
+      const states: Record<string, Partial<JobSnapshot>> = {};
+      for (let index = 2; index <= 8; index++) states[`slice-${index}`] = { state: "running", attempts: [attached(`thr_${index}`)] };
+      states["slice-1"] = { state: "succeeded", attempts: [finished(1)] };
+      return run(compiled({ ...SWARM, slices }), states);
+    })(),
+    expect: ["release:verify-1"],
+  },
+  {
     name: "a transient provider failure retries after 1 s",
     snapshot: run(compiled(SWARM), { "slice-1": { state: "failed", error: "Provider overloaded (HTTP 529)", attempts: [finished(1)] }, "slice-2": { state: "running", attempts: [attached("thr_2")] } }),
     expect: ["retry:slice-1"],

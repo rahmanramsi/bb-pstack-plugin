@@ -275,10 +275,12 @@ export function plan(run: RunSnapshot, now: number): Action[] {
     }
   }
 
+  // A job released this round competes for slots next round, so a fresh verifier is not outrun by a slice.
+  const releasing = actions.some((action) => action.type === "release");
   const active = run.jobs.filter((job) => LIVE.has(job.state)).length;
   const order = (job: JobSnapshot) => (job.kind === "verifier" ? 0 : 1);
   const ranked = due.map((job, index) => ({ job, index })).sort((a, b) => order(a.job) - order(b.job) || a.index - b.index);
-  for (const { job } of ranked.slice(0, Math.max(0, CONCURRENCY - active))) {
+  for (const { job } of releasing ? [] : ranked.slice(0, Math.max(0, CONCURRENCY - active))) {
     actions.push({ type: "spawn", job: job.key, ordinal: job.attempts.length + 1 });
   }
 
