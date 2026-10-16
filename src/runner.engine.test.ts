@@ -32,7 +32,7 @@ function harness() {
   const sent: Record<string, any>[] = [];
   const stopped: string[] = [];
   let next = 0;
-  const failures = { spawn: [] as { error: Error; create: boolean }[], send: [] as Error[] };
+  const failures = { spawn: [] as { error: Error; create: boolean }[], send: [] as Error[], stop: [] as Error[] };
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
 
   const sdk = {
@@ -65,6 +65,8 @@ function harness() {
         return {};
       },
       async stop({ threadId }: { threadId: string }) {
+        const failure = failures.stop.shift();
+        if (failure) throw failure;
         stopped.push(threadId);
         return {};
       },
@@ -90,10 +92,11 @@ function harness() {
   const clock = { now: 1_000_000 };
   const store = openRunStore(db, () => clock.now);
   const runner = createRunner(bb, store, resolveRole, () => clock.now);
+  const restart = () => createRunner(bb, openRunStore(db, () => clock.now), resolveRole, () => clock.now);
   const worker = (index: number) => `thr_w${index}`;
   const toWorker = (threadId: string) => sent.filter((message) => message.threadId === threadId);
   const toOrigin = () => sent.filter((message) => message.threadId === "thr_origin");
-  return { bb, threads, spawned, sent, stopped, failures, store, runner, clock, worker, toWorker, toOrigin };
+  return { bb, threads, spawned, sent, stopped, failures, store, runner, restart, clock, worker, toWorker, toOrigin };
 }
 
 const PANEL_INPUT = {
@@ -217,6 +220,25 @@ test("a text job succeeds with the worker's final message and rejects pstack_res
   assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => [job.state, job.value]), [["succeeded", "X works like this."]]);
 });
 
+test("a text job whose worker idles with no final message is corrected, then fails, never succeeds empty", async () => {
+  const h = harness();
+  const plan = RunPlan.parse({ kind: "panel", title: "Explain", seats: [{ label: "Explainer", model: { tuple: "codex/gpt-6.1-sol/high" }, prompt: "Explain X." }] });
+  const { runId } = await h.runner.start(plan, "thr_origin");
+  await h.runner.onIdle(h.worker(1), null);
+  assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.state, "running");
+  const [correction] = h.toWorker(h.worker(1));
+  assert.match(correction!.input[0].text, /final message/);
+  assert.doesNotMatch(correction!.input[0].text, /pstack_result/, "a text job has no result tool");
+  h.clock.now += 30_000;
+  await h.runner.onIdle(h.worker(1), "  \n ");
+  assert.equal(h.toWorker(h.worker(1)).length, 2);
+  h.clock.now += 30_000;
+  await h.runner.onIdle(h.worker(1), null);
+  const [job] = h.runner.results(runId, "thr_origin");
+  assert.deepEqual([job!.state, job!.value], ["failed", null]);
+  assert.equal(h.runner.view(runId, "thr_origin").status, "failed");
+});
+
 test("a transient provider failure retries on a fresh thread after the backoff", async () => {
   const h = harness();
   const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
@@ -242,12 +264,6 @@ test("a spawn that fails after creating its thread adopts that thread instead of
   assert.equal(h.spawned.length, 1);
   assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.threadId, h.worker(1));
 
-  const other = harness();
-  other.failures.spawn.push({ error: new Error("socket hang up"), create: false });
-  const second = await other.runner.start(SWARM(["a"]), "thr_origin");
-  const job = other.runner.view(second.runId, "thr_origin").jobs[0]!;
-  assert.deepEqual([job.state, job.error], ["queued", "could not start the worker: socket hang up"]);
-
   const blind = harness();
   blind.failures.spawn.push({ error: new Error("socket hang up"), create: true });
   (blind.bb.sdk.threads as { list: unknown }).list = async () => {
@@ -257,6 +273,54 @@ test("a spawn that fails after creating its thread adopts that thread instead of
   assert.equal(blind.runner.view(third.runId, "thr_origin").jobs[0]!.state, "uncertain", "an unverifiable spawn is never repeated");
   await blind.runner.tick(third.runId);
   assert.equal(blind.spawned.length, 1);
+});
+
+test("a spawn error with no thread found leaves the job uncertain until its thread turns up, never spawning again", async () => {
+  const h = harness();
+  h.failures.spawn.push({ error: new Error("HTTP 400: invalid model"), create: false });
+  const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
+  const job = h.runner.view(runId, "thr_origin").jobs[0]!;
+  assert.deepEqual([job.state, job.error], ["uncertain", "the worker may not have started: HTTP 400: invalid model"]);
+  h.clock.now += 60_000;
+  await h.runner.tick(runId);
+  assert.equal(h.spawned.length, 1);
+
+  const metadata = h.spawned[0]!.pluginMetadata;
+  h.threads.set("thr_late", { id: "thr_late", status: "idle", archivedAt: null, deletedAt: null, output: null, metadata, originPluginId: "pstack" });
+  await h.runner.onIdle("thr_late", JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] }));
+  const adopted = h.runner.view(runId, "thr_origin");
+  assert.deepEqual([adopted.status, adopted.jobs[0]!.threadId, adopted.jobs[0]!.error], ["succeeded", "thr_late", null]);
+  assert.equal(h.spawned.length, 1);
+});
+
+test("a tick adopts an uncertain spawn's thread when its events are missed", async () => {
+  const h = harness();
+  h.failures.spawn.push({ error: new Error("socket hang up"), create: false });
+  const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
+  const metadata = h.spawned[0]!.pluginMetadata;
+  const output = JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] });
+  h.threads.set("thr_late", { id: "thr_late", status: "idle", archivedAt: null, deletedAt: null, output, metadata, originPluginId: "pstack" });
+  await h.runner.tick(runId);
+  assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => job.state), ["succeeded"]);
+  assert.equal(h.spawned.length, 1);
+});
+
+test("a thread that turns up after its attempt is no longer live is stopped, not run hidden", async () => {
+  const h = harness();
+  h.failures.spawn.push({ error: new Error("socket hang up"), create: false });
+  const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
+  h.clock.now += 4 * 60 * 60 * 1_000;
+  await h.runner.tick(runId);
+  assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.state, "failed");
+
+  const metadata = h.spawned[0]!.pluginMetadata;
+  h.threads.set("thr_late", { id: "thr_late", status: "active", archivedAt: null, deletedAt: null, output: null, metadata, originPluginId: "pstack" });
+  h.failures.stop.push(new Error("bb is restarting"));
+  await h.runner.onIdle("thr_late", "anything");
+  assert.deepEqual(h.stopped, []);
+  await h.runner.tick(runId);
+  assert.deepEqual(h.stopped, ["thr_late"], "a failed stop of a late thread is retried");
+  assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => job.state), ["failed"]);
 });
 
 test("the swarm engine keeps at most 8 workers running and releases each verifier with its own slice", async () => {
@@ -272,18 +336,46 @@ test("the swarm engine keeps at most 8 workers running and releases each verifie
   assert.deepEqual(view.jobs.filter((job) => job.slice === "p1").map((job) => [job.kind, job.state]), [["slice", "succeeded"], ["verifier", "running"]]);
 });
 
+test("a report or verdict for another slice is rejected, by the tool and in the final message", async () => {
+  const h = harness();
+  const { runId } = await h.runner.start(SWARM(["a"], true), "thr_origin");
+  const report = (slice: string) => ({ slice, status: "PASS", summary: "ok", evidence: [], issues: [] });
+  const submitted = await h.runner.submit(h.worker(1), report("other"));
+  assert.equal(submitted.ok, false);
+  assert.match((submitted as { error: string }).error, /"other"[\s\S]*"a"/);
+  await h.runner.onIdle(h.worker(1), JSON.stringify(report("other")));
+  assert.equal(h.toWorker(h.worker(1)).length, 1, "a wrong slice in the final message spends a corrective turn");
+  assert.equal(h.spawned.length, 1, "the verifier is not released on another slice's report");
+
+  assert.deepEqual(await h.runner.submit(h.worker(1), report("a")), { ok: true });
+  const verdict = (slice: string) => ({ slice, verdict: "VERIFIED", notes: "" });
+  assert.equal((await h.runner.submit(h.worker(2), verdict("other"))).ok, false);
+  assert.deepEqual(await h.runner.submit(h.worker(2), verdict("a")), { ok: true });
+  assert.equal(h.runner.view(runId, "thr_origin").status, "succeeded");
+});
+
 test("restart: an issued attempt is adopted through its metadata, or marked uncertain and never spawned again", async () => {
   const h = harness();
-  const plan = SWARM(["a", "b"]);
+  const plan = SWARM(["a", "b", "c"]);
   const origin = { threadId: "thr_origin", projectId: "prj_1", environmentId: "env_1", providerId: "claude-code", model: "m", reasoningLevel: "high", permissionMode: "auto" };
   const compiled = compile(plan, resolveRole, origin);
   assert.ok(compiled.ok);
   const runId = "psr_33333333-3333-3333-3333-333333333333" as RunId;
   h.store.createRun({ id: runId, origin, requestKey: null, planHash: "h", kind: "swarm", title: "check.sh", deadline: h.clock.now + 60_000, jobs: compiled.jobs });
-  for (const key of ["slice-1", "slice-2"]) {
+  for (const key of ["slice-1", "slice-2", "slice-3"]) {
     h.store.transitionJobAndAttempt(runId, key, "queued", "running");
     h.store.claimAttempt(runId, key, 1, h.clock.now);
   }
+  h.store.transitionJobAndAttempt(runId, "slice-3", "running", "failed", { error: "the worker thread failed" });
+  h.threads.set("thr_stray", {
+    id: "thr_stray",
+    status: "active",
+    archivedAt: null,
+    deletedAt: null,
+    output: null,
+    metadata: { pstackWorker: 1, runId, job: "slice-3", ordinal: 1, originThreadId: "thr_origin" },
+    originPluginId: "pstack",
+  });
   h.threads.set("thr_lost", {
     id: "thr_lost",
     status: "idle",
@@ -301,11 +393,13 @@ test("restart: an issued attempt is adopted through its metadata, or marked unce
   assert.deepEqual(jobs.map((job) => [job.key, job.state, job.threadId]), [
     ["slice-1", "running", "thr_lost"],
     ["slice-2", "uncertain", null],
+    ["slice-3", "failed", "thr_stray"],
   ]);
+  assert.deepEqual(h.stopped, ["thr_stray"], "a thread for an attempt that already failed is stopped");
 
   await h.runner.tick(runId);
   jobs = h.runner.view(runId, "thr_origin").jobs;
-  assert.deepEqual(jobs.map((job) => job.state), ["succeeded", "uncertain"], "the tick polls the adopted worker");
+  assert.deepEqual(jobs.map((job) => job.state), ["succeeded", "uncertain", "failed"], "the tick polls the adopted worker");
   assert.equal(h.spawned.length, 0);
 
   h.clock.now += 60_000;
@@ -337,6 +431,40 @@ test("stop cancels open jobs, stops their workers, and reports the cancelled run
   assert.deepEqual([view.status, ...view.jobs.map((job) => job.state)], ["cancelled", "cancelled", "cancelled", "cancelled"]);
   assert.match(h.toOrigin()[0]!.input[0].text, /finished: cancelled/);
   assert.throws(() => h.runner.view(runId, "thr_other"), { code: "run_not_found" });
+});
+
+test("a worker whose stop fails after cancel is stopped again by later ticks, across a restart, until it is confirmed", async () => {
+  const h = harness();
+  const { runId } = await h.runner.start(SWARM(["a", "b"]), "thr_origin");
+  h.failures.stop.push(new Error("bb is restarting"), new Error("bb is restarting"));
+  assert.equal(await h.runner.stop(runId, "thr_origin"), true);
+  const view = h.runner.view(runId, "thr_origin");
+  assert.deepEqual([view.status, ...view.jobs.map((job) => job.state)], ["cancelled", "cancelled", "cancelled"]);
+  assert.deepEqual(h.stopped, []);
+  assert.ok(h.store.dueRuns(h.clock.now).includes(runId), "a cancelled run with live workers stays due");
+
+  const restarted = h.restart();
+  await restarted.tick(runId);
+  assert.deepEqual(h.stopped.sort(), [h.worker(1), h.worker(2)]);
+  await restarted.tick(runId);
+  assert.equal(h.stopped.length, 2, "a confirmed stop is not repeated");
+  assert.ok(!h.store.dueRuns(h.clock.now).includes(runId));
+});
+
+test("a deadline failure and an accepted final message both stop their worker, retrying a failed stop", async () => {
+  const h = harness();
+  const plan = RunPlan.parse({ kind: "panel", title: "Explain", seats: ["A", "B"].map((label) => ({ label, model: { tuple: "codex/gpt-6.1-sol/high" }, prompt: "Explain X." })) });
+  const { runId } = await h.runner.start(plan, "thr_origin");
+  await h.runner.onIdle(h.worker(1), "X works like this.");
+  assert.deepEqual(h.stopped, [h.worker(1)]);
+
+  h.failures.stop.push(new Error("bb is restarting"));
+  h.clock.now += 4 * 60 * 60 * 1_000;
+  await h.runner.tick(runId);
+  assert.deepEqual(h.runner.view(runId, "thr_origin").jobs.map((job) => job.state), ["succeeded", "failed"]);
+  assert.deepEqual(h.stopped, [h.worker(1)]);
+  await h.runner.tick(runId);
+  assert.deepEqual(h.stopped, [h.worker(1), h.worker(2)]);
 });
 
 test("completion delivery retries with backoff, and is abandoned when the origin is archived", async () => {

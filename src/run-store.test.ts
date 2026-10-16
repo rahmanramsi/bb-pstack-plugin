@@ -118,6 +118,36 @@ test("a finished run stays due until its completion message is settled", () => {
   assert.equal(store.info(RUN)!.status, "succeeded");
 });
 
+test("cancelRun cancels the run, its open jobs and their attempts together, and their workers stay due until cleaned", () => {
+  const { store, create } = setup();
+  create();
+  store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
+  store.claimAttempt(RUN, "seat-1", 1, 5);
+  store.attachAttempt(RUN, "seat-1", 1, "thr_w1");
+  assert.deepEqual(store.pendingCleanup(RUN), [], "a live attempt is not cleaned up");
+
+  assert.equal(store.cancelRun(RUN, 2_000), true);
+  assert.equal(store.cancelRun(RUN, 2_001), false);
+  const snapshot = store.snapshot(RUN)!;
+  assert.deepEqual([snapshot.status, ...snapshot.jobs.map((job) => job.state)], ["cancelled", "cancelled", "cancelled"]);
+  assert.deepEqual(snapshot.jobs[0]!.attempts.map((attempt) => [attempt.state, attempt.finishedAt]), [["finished", 2_000]]);
+
+  store.settleNotification(RUN, "sent");
+  assert.deepEqual(store.pendingCleanup(RUN), ["thr_w1"]);
+  assert.deepEqual(store.dueRuns(2_000), [RUN]);
+  store.markCleaned("thr_w1");
+  assert.deepEqual(store.pendingCleanup(RUN), []);
+  assert.deepEqual(store.dueRuns(2_000), []);
+});
+
+test("cancelRun leaves a finished run alone", () => {
+  const { store, create } = setup();
+  create();
+  store.finishRun(RUN, "failed", 2_000);
+  assert.equal(store.cancelRun(RUN, 2_001), false);
+  assert.deepEqual(store.snapshot(RUN)!.jobs.map((job) => job.state), ["queued", "blocked"]);
+});
+
 test("revision moves on every change and not on a no-op", () => {
   const { store, create } = setup();
   const before = store.revision("thr_origin");

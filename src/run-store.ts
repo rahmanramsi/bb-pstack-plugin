@@ -1,5 +1,5 @@
 import type { Db } from "./store.ts";
-import { LIVE, type AttemptSnapshot, type JobDraft, type JobSnapshot, type JobState, type Origin, type RunId, type RunSnapshot } from "./runner.ts";
+import { LIVE, TERMINAL, type AttemptSnapshot, type JobDraft, type JobSnapshot, type JobState, type Origin, type RunId, type RunSnapshot } from "./runner.ts";
 
 type FinalStatus = Exclude<RunSnapshot["status"], "running">;
 type NotifyState = "pending" | "sent" | "abandoned";
@@ -34,8 +34,15 @@ export type RunStore = {
   transitionJobAndAttempt(runId: RunId, key: string, from: JobState, to: JobState, patch?: JobPatch): boolean;
   claimAttempt(runId: RunId, key: string, ordinal: number, now: number): boolean;
   attachAttempt(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
+  /** Records a thread that turned up after its attempt finished without one, with cleanup pending. */
+  recordLateThread(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
   attemptByThread(threadId: string): { runId: RunId; key: string; ordinal: number } | null;
   finishRun(runId: RunId, status: FinalStatus, now: number): boolean;
+  /** Cancels a running run, its open jobs and their attempts in one transaction. */
+  cancelRun(runId: RunId, now: number): boolean;
+  /** Threads of finished attempts that have not been confirmed stopped. A finished attempt's cleanup stays `pending` until markCleaned. */
+  pendingCleanup(runId: RunId): string[];
+  markCleaned(threadId: string): void;
   settleNotification(runId: RunId, outcome: Exclude<NotifyState, "pending">): boolean;
   deferNotification(runId: RunId, nextAt: number): void;
   /** Monotonic revision of everything this store owns for a thread, for realtime invalidation. */
@@ -118,6 +125,14 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
     return true;
   });
 
+  const cancelRun = db.transaction((runId: RunId, now: number): boolean => {
+    if (db.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'running'").run(now, runId).changes === 0) return false;
+    const terminal = [...TERMINAL];
+    db.prepare(`UPDATE jobs SET state = 'cancelled' WHERE run_id = ? AND state NOT IN (${terminal.map(() => "?").join(", ")})`).run(runId, ...terminal);
+    db.prepare("UPDATE attempts SET state = 'finished', finished_at = ? WHERE run_id = ? AND state != 'finished'").run(now, runId);
+    return true;
+  });
+
   function readRun(runId: RunId): RunRow | undefined {
     return db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as RunRow | undefined;
   }
@@ -183,6 +198,7 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
         .prepare(
           `SELECT id FROM runs WHERE status = 'running'
              OR (notify_state = 'pending' AND (notify_next_at IS NULL OR notify_next_at <= ?))
+             OR EXISTS (SELECT 1 FROM attempts WHERE run_id = runs.id AND state = 'finished' AND cleanup = 'pending' AND thread_id IS NOT NULL)
            ORDER BY created_at, id`,
         )
         .all(now) as { id: RunId }[];
@@ -213,6 +229,21 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
       }
     },
 
+    recordLateThread(runId, key, ordinal, threadId) {
+      try {
+        const changes = db
+          .prepare(
+            `UPDATE attempts SET thread_id = ?, cleanup = 'pending'
+             WHERE run_id = ? AND job_key = ? AND ordinal = ? AND state = 'finished' AND thread_id IS NULL`,
+          )
+          .run(threadId, runId, key, ordinal).changes;
+        return changes === 1;
+      } catch (error) {
+        if ((error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") return false;
+        throw error;
+      }
+    },
+
     attemptByThread(threadId) {
       const row = db.prepare("SELECT run_id, job_key, ordinal FROM attempts WHERE thread_id = ?").get(threadId) as
         | { run_id: RunId; job_key: string; ordinal: number }
@@ -223,6 +254,19 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
     finishRun(runId, status, now) {
       const changes = db.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE id = ? AND status = 'running'").run(status, now, runId).changes;
       return bump(changes === 1);
+    },
+
+    cancelRun: (runId, now) => bump(cancelRun(runId, now)),
+
+    pendingCleanup(runId) {
+      const rows = db
+        .prepare("SELECT thread_id FROM attempts WHERE run_id = ? AND state = 'finished' AND cleanup = 'pending' AND thread_id IS NOT NULL ORDER BY job_key, ordinal")
+        .all(runId) as { thread_id: string }[];
+      return rows.map((row) => row.thread_id);
+    },
+
+    markCleaned(threadId) {
+      db.prepare("UPDATE attempts SET cleanup = 'done' WHERE thread_id = ? AND state = 'finished'").run(threadId);
     },
 
     settleNotification(runId, outcome) {
