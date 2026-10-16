@@ -31,6 +31,8 @@ export function createChecklistFeature(deps: {
   activeWork(threadId: string): Promise<{ activeRuns: number; activeChildren: number }>;
   /** Called after every committed change so the UI refetches. */
   publish(threadId: string): void;
+  /** Rejects a thread or run reference that does not exist; returns an error message or null. */
+  verifyEvidence(evidence: Evidence): Promise<string | null>;
 }): ChecklistFeature {
   const { bb, store, publish } = deps;
   const sources = playbookSources(deps.skillsDir);
@@ -117,12 +119,16 @@ export function createChecklistFeature(deps: {
       summary: "Close a step with one or more evidence references",
       options: { thread: threadOption, evidence: { type: "string", repeatable: true, required: true, description: "thread:, run:, commit:, path:, or pr: reference" } },
       positionals: [{ name: "id", description: "Step id", required: true }],
-      run(input, ctx) {
+      async run(input, ctx) {
         const id = threadId(input.options.thread, ctx.threadId);
         const references = input.options.evidence.map(parseEvidence);
         const invalid = references.find((reference) => "error" in reference);
         if (invalid && "error" in invalid) return output(id, invalid.error, 1);
         const evidence = references.filter((reference): reference is Evidence => !("error" in reference));
+        for (const reference of evidence) {
+          const problem = await deps.verifyEvidence(reference);
+          if (problem) return output(id, problem, 1);
+        }
         const [first, ...rest] = evidence;
         if (!first) return output(id, "At least one evidence reference is required.", 1);
         return resolve(id, input.positionals.id, { kind: "done", evidence: [first, ...rest] });

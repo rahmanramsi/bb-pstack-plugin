@@ -20,7 +20,11 @@ function fixture(t: TestContext) {
   const publications: string[] = [];
   const work = { activeRuns: 0, activeChildren: 0 };
   const bb = { sdk: { threads: { async send(input: SendInput) { sends.push(input); } } } } as unknown as BbPluginApi;
-  const feature = createChecklistFeature({ bb, store, skillsDir, activeWork: async () => work, publish: (id) => publications.push(id) });
+  const missing = new Set<string>();
+  const feature = createChecklistFeature({
+    bb, store, skillsDir, activeWork: async () => work, publish: (id) => publications.push(id),
+    verifyEvidence: async (evidence) => evidence.kind === "thread" && missing.has(evidence.id) ? `Thread ${evidence.id} does not exist.` : null,
+  });
   const cli = defineCli({ name: "pstack", summary: "Playbook checklists", commands: feature.commands });
   async function run(argv: string[], id = "thr_test") {
     const result = await cli.run(argv, { threadId: id });
@@ -28,7 +32,7 @@ function fixture(t: TestContext) {
     if (result.stdout) assert.ok(result.stdout.endsWith(feature.footer(override < 0 ? id : argv[override + 1])));
     return result;
   }
-  return { db, store, feature, cli, run, sends, publications, work };
+  return { db, store, feature, cli, run, sends, publications, work, missing };
 }
 
 test("every begin command snapshots source steps and appends Opening a PR exactly once", async (t) => {
@@ -155,4 +159,14 @@ test("a stale idle snapshot cannot consume the nudge for a newer revision", asyn
   assert.equal(store.checklist("thr_test")?.nudgedAtRevision, null);
   await feature.onIdle("thr_test");
   assert.equal(sends.length, 1);
+});
+
+test("done rejects a thread reference that does not exist and leaves the step open", async (t) => {
+  const { run, store, missing } = fixture(t);
+  await run(["checklist", "begin", "feature"]);
+  missing.add("thr_gone");
+  const result = await run(["checklist", "done", "1", "--evidence", "thread:thr_gone"]);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout ?? "", /Thread thr_gone does not exist\./);
+  assert.equal(store.checklist("thr_test")?.steps.find((step) => step.id === 1)?.resolution.kind, "open");
 });
