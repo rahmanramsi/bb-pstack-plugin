@@ -132,3 +132,20 @@ test("nudges happen once per revision and rendering respects every bound", () =>
   assert.match(renderOpenSteps(state, 1500), /more open steps/);
   assert.equal(renderOpenSteps(null, 1500), "");
 });
+
+test("a playbook step that runs Opening a PR is an after-PR step, so gate pr does not demand it", () => {
+  const sources = playbookSources(skillsDir);
+  let found = 0;
+  for (const [name, source] of sources) {
+    if (source.extractor !== "numbered") continue;
+    for (const step of extractSteps(readFileSync(source.file, "utf8"), source.extractor, "playbook")) {
+      if (/Run \*\*Opening a PR\*\*/.test(step.text)) {
+        found += 1;
+        assert.equal(step.afterPr, true, `${name}: ${step.text.slice(0, 60)}`);
+      }
+    }
+  }
+  assert.ok(found >= 5);
+  const feature = extractSteps(readFileSync(sources.get("feature" as never)!.file, "utf8"), "numbered", "playbook");
+  assert.deepEqual(feature.filter((step) => step.afterPr).map((step) => step.text.slice(0, 2)), ["8."]);
+});

@@ -45,7 +45,7 @@ test("every begin command snapshots source steps and appends Opening a PR exactl
     assert.equal(state.playbook, name);
     assert.ok(state.steps.length > 0);
     assert.equal(state.steps.filter((step) => step.text.startsWith("**Worktree.**")).length, 1);
-    assert.equal(state.steps.filter((step) => step.afterPr).length, 1);
+    assert.equal(state.steps.filter((step) => step.afterPr && step.section === "pr").length, 1);
     assert.equal(state.steps.every((step) => step.section === "pr"), name === "opening-a-pr");
     assert.equal((await run(["checklist", "begin", "feature"], id)).exitCode, 0);
     assert.deepEqual(store.checklist(id), state);
@@ -73,9 +73,12 @@ test("CLI gates reject feature step 4 alone, then distinguish pre-PR steps and a
   }
   assert.equal((await run(["gate", "pr"])).exitCode, 0);
   assert.equal((await run(["gate", "done"])).exitCode, 1);
-  const afterPr = state.steps.find((step) => step.afterPr);
-  assert.ok(afterPr);
-  await run(["checklist", "done", String(afterPr.id), "--evidence", "pr:https://github.com/get-bb/bb/pull/1"]);
+  const afterPr = state.steps.filter((step) => step.afterPr);
+  assert.deepEqual(afterPr.map((step) => step.text.slice(0, 15)), ["8. Run **Openin", "**Readiness.** "]);
+  for (const step of afterPr) {
+    assert.equal((await run(["gate", "done"])).exitCode, 1);
+    await run(["checklist", "done", String(step.id), "--evidence", "pr:https://github.com/get-bb/bb/pull/1"]);
+  }
   assert.equal((await run(["gate", "done"])).exitCode, 0);
   const shown = await run(["checklist", "show"]);
   assert.match(shown.stdout ?? "", /Evidence: path:src\/checklist.ts, commit:abcdef1/);

@@ -123,13 +123,13 @@ export default async function plugin(bb: BbPluginApi) {
       return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
     },
     publish: (threadId) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: Date.now() }),
-    evidenceError: async (evidence) => {
+    evidenceError: async (evidence, threadId) => {
       if (evidence.kind === "thread") {
         const found = await bb.sdk.threads.get({ threadId: evidence.id }).then(() => true, () => false);
         return found ? null : `Thread ${evidence.id} does not exist.`;
       }
       if (evidence.kind === "run") {
-        return runStore.snapshot(evidence.id as RunId) ? null : `Run ${evidence.id} does not exist.`;
+        return runStore.info(evidence.id as RunId)?.origin.threadId === threadId ? null : `Run ${evidence.id} is not a run started from this thread.`;
       }
       return null;
     },

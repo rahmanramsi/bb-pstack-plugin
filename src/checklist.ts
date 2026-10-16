@@ -16,6 +16,9 @@ export type StepSection = "playbook" | "pr";
 /** Opening a PR paragraphs that can only be done once the PR exists. `gate pr` ignores them; `gate done` does not. A test fails if a label disappears from the source. */
 export const AFTER_PR_LEADS = ["Readiness"] as const;
 
+/** A playbook step that runs Opening a PR creates the PR, so it can only close once the PR exists. */
+export const RUNS_OPENING_A_PR = /\bRun \*\*Opening a PR\*\*/;
+
 /** A step as extracted from source, before it is stored. `text` is the source Markdown, verbatim. */
 export type StepDraft = { section: StepSection; text: string; afterPr: boolean };
 
@@ -73,7 +76,8 @@ export function extractSteps(markdown: string, extractor: Extractor, section: St
   function flush() {
     if (current.length > 0) {
       while (current.at(-1)?.trim() === "") current.pop();
-      steps.push({ section, text: current.join("\n"), afterPr });
+      const text = current.join("\n");
+      steps.push({ section, text, afterPr: afterPr || (extractor === "numbered" && RUNS_OPENING_A_PR.test(text)) });
       current = [];
     }
   }
