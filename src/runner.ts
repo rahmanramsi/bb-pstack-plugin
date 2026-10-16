@@ -343,8 +343,16 @@ export function deriveStatus(jobs: readonly JobSnapshot[]): RunSnapshot["status"
 function finalStatus(jobs: readonly JobSnapshot[]): Exclude<RunSnapshot["status"], "running"> {
   if (jobs.some((job) => job.state === "cancelled")) return "cancelled";
   const succeeded = jobs.filter((job) => job.state === "succeeded").length;
-  if (succeeded === jobs.length) return "succeeded";
+  if (succeeded === jobs.length) return jobs.some(weakOutcome) ? "partial" : "succeeded";
   return succeeded === 0 ? "failed" : "partial";
+}
+
+/** A swarm job that ran fine but did not establish its slice: a BLOCKED report or any verdict short of VERIFIED. */
+function weakOutcome(job: JobSnapshot): boolean {
+  const value = job.value as { status?: unknown; verdict?: unknown } | null;
+  if (job.kind === "slice") return value?.status === "BLOCKED";
+  if (job.kind === "verifier") return value?.verdict !== "VERIFIED";
+  return false;
 }
 
 const TRANSIENT_PATTERNS = [

@@ -336,6 +336,17 @@ test("deriveStatus", () => {
   assert.equal(deriveStatus(jobs("cancelled", "running")), "cancelled");
 });
 
+test("deriveStatus marks a swarm partial when a verifier rejects a report or a slice is blocked", () => {
+  const snapshot = (values: Record<string, unknown>) =>
+    run(compiled(SWARM), Object.fromEntries(compiled(SWARM).map((job) => [job.key, { state: "succeeded", value: values[job.key] ?? (job.kind === "verifier" ? { verdict: "VERIFIED" } : { status: "PASS" }) }]))).jobs;
+  const verifierKey = compiled(SWARM).find((job) => job.kind === "verifier")!.key;
+  const sliceKey = compiled(SWARM).find((job) => job.kind === "slice")!.key;
+  assert.equal(deriveStatus(snapshot({})), "succeeded");
+  assert.equal(deriveStatus(snapshot({ [verifierKey]: { verdict: "NOT_VERIFIED" } })), "partial");
+  assert.equal(deriveStatus(snapshot({ [sliceKey]: { status: "BLOCKED" } })), "partial");
+  assert.equal(deriveStatus(snapshot({ [sliceKey]: { status: "ISSUES" } })), "succeeded");
+});
+
 test("classifyFailure", () => {
   for (const error of ["Provider overloaded", "HTTP 503 from upstream", "rate limit exceeded", "read ECONNRESET", "socket hang up", "api error 529"]) {
     assert.equal(classifyFailure(error), "transient", error);
