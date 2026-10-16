@@ -87,6 +87,20 @@ export const MIGRATIONS: readonly string[] = [
    WHERE status = 'open' AND (section = 'pr' OR id = (SELECT s.id FROM steps s WHERE s.thread_id = steps.thread_id AND s.section = 'playbook' AND s.status = 'open' ORDER BY s.position, s.id LIMIT 1))`,
   `UPDATE steps SET skip_policy = CASE WHEN id = 4 THEN 'never' ELSE 'user' END
    WHERE section = 'playbook' AND id IN (1,2,4) AND thread_id IN (SELECT thread_id FROM checklists WHERE playbook = 'feature')`,
+  `ALTER TABLE checklists ADD COLUMN pr_gate_passed_at INTEGER`,
+  `ALTER TABLE poteto_threads ADD COLUMN audit_cursor TEXT`,
+  `CREATE TABLE poteto_violations (
+     thread_id TEXT NOT NULL,
+     key TEXT NOT NULL,
+     kind TEXT NOT NULL CHECK (kind IN ('pr-before-gate','work-before-checklist','audit-unreadable')),
+     detail TEXT NOT NULL,
+     observed_at INTEGER NOT NULL,
+     acknowledged_at INTEGER,
+     notified_at INTEGER,
+     notify_attempts INTEGER NOT NULL DEFAULT 0,
+     notify_next_at INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (thread_id, key)
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

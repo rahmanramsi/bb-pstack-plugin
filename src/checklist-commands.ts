@@ -8,11 +8,14 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { activatesPoteto, isPotetoUser, potetoControl, potetoCharter, revivalDecision, type PotetoDispatch } from "./poteto.ts";
+import { auditPage } from "./poteto-audit.ts";
 import {
   extractSteps, gate, parseEvidence, parseReason, playbookSources, renderOpenSteps, shouldNudge,
   closeStep, type Evidence, type Resolution,
 } from "./checklist.ts";
 import type { ChecklistStore } from "./checklist-store.ts";
+
+const AUDIT_PAGE_SIZE = 100;
 
 export type ChecklistFeature = {
   /** `checklist begin <playbook>`, `checklist show`, `checklist done <id> --evidence …`, `checklist skip <id> --reason …`, `checklist add <text> [--after <id>]`, `gate pr`, `gate done`. */
@@ -46,6 +49,31 @@ export function createChecklistFeature(deps: {
   const charter = potetoCharter(join(deps.skillsDir, "poteto-mode", "SKILL.md"));
   const reconciling = new Set<string>();
   const pendingPublications = new Set<string>();
+  const auditing = new Map<string, Promise<boolean>>();
+  function audit(id: string): Promise<boolean> {
+    const current = auditing.get(id);
+    if (current) return current;
+    const work = (async () => {
+      for (let page = 0; page < 20; page++) {
+        const state = store.poteto(id);
+        if (!state) return true;
+        const rows = await bb.sdk.threads.events.list({ threadId: id, afterSeq: state.auditCursor ?? "0", order: "asc", limit: String(AUDIT_PAGE_SIZE) });
+        const checklist = store.checklist(id);
+        const result = auditPage(rows, { activatedAt: state.activatedAt, checklistAt: checklist?.createdAt ?? null, prGateAt: checklist?.prGatePassedAt ?? null }, clock());
+        if (!store.recordAudit(id, state.auditCursor, result.cursor, result.violations)) continue;
+        if (result.violations.length > 0) publish(id);
+        if (rows.length < AUDIT_PAGE_SIZE) return true;
+        if (result.cursor === null || result.cursor === state.auditCursor) return false;
+      }
+      return false;
+    })().finally(() => auditing.delete(id));
+    auditing.set(id, work);
+    return work;
+  }
+  function violationStatus(id: string): string {
+    const violations = store.violations(id).filter((violation) => violation.acknowledgedAt === null);
+    return violations.length ? `Poteto violations (${violations.length}) hold gate done.\n${violations.map((violation) => `${violation.key}: ${violation.detail}\nUser acknowledgement: /poteto-mode ack ${violation.key}`).join("\n")}` : "";
+  }
   function potetoStatus(id: string): string {
     const state = store.poteto(id);
     if (!state) return "";
@@ -63,13 +91,21 @@ export function createChecklistFeature(deps: {
       const decision = revivalDecision(state, idle);
       if (decision === "stall") {
         if (store.stall(id, clock())) publish(id);
-        return;
       }
-      if (decision === "revive" && !store.queueRevival(id, state.revivals)) return;
+      if (decision === "revive") store.queueRevival(id, state.revivals);
       const attempt = store.claimCharter(id, clock());
-      if (attempt === null) return;
-      await bb.sdk.threads.send({ threadId: id, mode: "steer-if-active", input: [{ type: "text", text: charter, mentions: [], visibility: "agent-only" }] });
-      if (store.charterSent(id, attempt)) publish(id);
+      if (attempt !== null) {
+        await bb.sdk.threads.send({ threadId: id, mode: "steer-if-active", input: [{ type: "text", text: charter, mentions: [], visibility: "agent-only" }] });
+        if (store.charterSent(id, attempt)) publish(id);
+      }
+      await audit(id);
+      for (const violation of store.violations(id)) {
+        const attempt = store.claimViolation(id, violation.key, clock());
+        if (attempt === null) continue;
+        await bb.sdk.threads.send({ threadId: id, mode: "steer-if-active", input: [{ type: "text", visibility: "agent-only", mentions: [],
+          text: `Poteto violation ${violation.key}. ${violation.detail} Gate done is held. Only the user can acknowledge it with /poteto-mode ack ${violation.key}.` }] });
+        store.violationNotified(id, violation.key, attempt, clock());
+      }
     } finally { reconciling.delete(id); }
   }
   const threadOption = { type: "string", description: "Thread to use instead of the invoking thread" } as const;
@@ -91,7 +127,7 @@ export function createChecklistFeature(deps: {
     }
   }
   function footer(id: string): string {
-    const text = [potetoStatus(id), renderOpenSteps(store.checklist(id), 3600)].filter(Boolean).join("\n");
+    const text = [potetoStatus(id), violationStatus(id).slice(0, 1400), renderOpenSteps(store.checklist(id), 2400)].filter(Boolean).join("\n");
     return text ? `${text}\n` : "";
   }
   function output(id: string, text: string, exitCode = 0) {
@@ -206,9 +242,19 @@ export function createChecklistFeature(deps: {
     commands[`gate ${kind}`] = cliCommand({
       summary: `Check that the ${kind} gate has no open steps`,
       options: { thread: threadOption },
-      run(input, ctx) {
+      async run(input, ctx) {
         const id = threadId(input.options.thread, ctx.threadId);
-        const result = gate(kind, store.checklist(id));
+        try {
+          if (!await audit(id)) return output(id, "The poteto timeline audit is still catching up. Run this gate again before continuing.", 1);
+        } catch (error) {
+          return output(id, `The poteto timeline audit failed. Retry this gate before continuing. ${error instanceof Error ? error.message : String(error)}`, 1);
+        }
+        const state = store.checklist(id);
+        const result = gate(kind, state, store.violations(id));
+        if (result.pass && state) {
+          if (!store.passGate(id, kind, state.revision, clock())) return output(id, "The checklist changed during the gate. Run this gate again.", 1);
+          publish(id);
+        }
         return result.pass ? output(id, `${kind} gate passed.`)
           : output(id, `${result.reason}\n${result.open.map((step) => `${step.id}. [${step.section}] ${step.text}`).join("\n\n")}`, 1);
       },
@@ -220,7 +266,12 @@ export function createChecklistFeature(deps: {
       if (!isPotetoUser(context, bb.pluginId)) return { action: "proceed" };
       const control = potetoControl(context.input.text);
       if (control) {
-        if (control.kind === "invalid") return { action: "reject", message: "Use /poteto-mode waive <step> <reason>, with a reason of 1 to 500 characters." };
+        if (control.kind === "invalid") return { action: "reject", message: "Use /poteto-mode waive <step> <reason> or /poteto-mode ack <key>. A waiver reason needs 1 to 500 characters." };
+        if (control.kind === "ack") {
+          const found = store.acknowledge(context.thread.id, control.key, clock());
+          if (found) pendingPublications.add(context.thread.id);
+          return { action: "reject", message: found ? `Acknowledged ${control.key}. Run bb pstack gate done again after closing the remaining steps.` : `Unknown violation ${control.key}. Run bb pstack checklist show to see this thread's violations.` };
+        }
         const result = store.resolveStep(context.thread.id, control.stepId, { kind: "skipped", reason: control.reason }, "user");
         if (!("error" in result) && result.changed) pendingPublications.add(context.thread.id);
         return { action: "reject", message: "error" in result ? result.error : `Step ${control.stepId} waived. Run bb pstack checklist show to see the next step.` };
@@ -246,7 +297,8 @@ export function createChecklistFeature(deps: {
       const checklist = store.checklist(id);
       if (!checklist) return store.poteto(id) ? `${potetoStatus(id)}\n${charter}` : null;
       const prefix = "Close each playbook step with evidence or a skip reason. Run bb pstack gate pr before creating a PR and bb pstack gate done before the final reply.\n";
-      return prefix + renderOpenSteps(checklist, 1500 - prefix.length);
+      const status = violationStatus(id).slice(0, 700);
+      return `${status}${status ? "\n" : ""}${prefix}${renderOpenSteps(checklist, 1500 - prefix.length - status.length - 1)}`;
     },
     async onIdle(id) {
       if (store.poteto(id)) await reconcile(id, true);

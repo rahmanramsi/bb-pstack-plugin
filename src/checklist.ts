@@ -1,6 +1,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import type { PotetoViolation } from "./poteto-audit.ts";
 
 /**
  * Playbook checklists: pure domain. The plugin, not the agent, copies a playbook's steps from the
@@ -45,6 +46,8 @@ export type Checklist = {
   revision: number;
   /** The revision at which the one idle nudge was sent, or null. */
   nudgedAtRevision: number | null;
+  createdAt: number;
+  prGatePassedAt: number | null;
 };
 
 /** Where each playbook's steps come from and how to extract them. One table, no branching elsewhere. */
@@ -114,7 +117,9 @@ export function extractSteps(markdown: string, extractor: Extractor, section: St
 
 export function parseSkipPolicy(source: string): { text: string; skipPolicy: SkipPolicy } {
   let skipPolicy: SkipPolicy = "agent";
+  let markers = 0;
   const text = source.replace(/<!--\s*pstack:\s*skip=([^>]*?)\s*-->/g, (_marker, value: string) => {
+    if (++markers > 1) throw new Error("A step can declare only one pstack skip policy.");
     if (value !== "agent" && value !== "user" && value !== "never") throw new Error(`Unknown pstack skip policy "${value}".`);
     skipPolicy = value;
     return "";
@@ -216,9 +221,11 @@ export type GateResult = { pass: true } | { pass: false; open: readonly Step[]; 
  * `bb pstack gate pr` (before creating the PR): fails with no checklist or any open step except `afterPr` ones.
  * `bb pstack gate done` (before the final reply): fails with any open step at all.
  */
-export function gate(kind: "pr" | "done", checklist: Checklist | null): GateResult {
+export function gate(kind: "pr" | "done", checklist: Checklist | null, violations: readonly PotetoViolation[] = []): GateResult {
+  const open = checklist?.steps.filter((step) => step.resolution.kind === "open" && (kind === "done" || !step.afterPr)) ?? [];
+  const unacknowledged = violations.filter((violation) => violation.acknowledgedAt === null);
+  if (kind === "done" && unacknowledged.length > 0) return { pass: false, open, reason: `${checklist ? `${open.length} open steps.` : "Begin a playbook checklist first."} Unacknowledged poteto violations block the done gate.\n${unacknowledged.map((violation) => `${violation.key}: ${violation.detail}\nThe user must send /poteto-mode ack ${violation.key}`).join("\n")}` };
   if (!checklist) return { pass: false, open: [], reason: "Begin a playbook checklist first." };
-  const open = checklist.steps.filter((step) => step.resolution.kind === "open" && (kind === "done" || !step.afterPr));
   return open.length === 0 ? { pass: true } : { pass: false, open, reason: `${open.length} open steps block the ${kind} gate.` };
 }
 

@@ -110,3 +110,45 @@ test("a step opens only after its prerequisite closes and inserted current steps
   assert.equal(store.checklist("thr_order")?.steps[1].openedAt, 300);
   assert.ok("error" in store.resolveStep("thr_order", 2, done));
 });
+
+test("audit commits cursor and append-only violations together and preserves acknowledgements on replay", (t) => {
+  const { db, store } = fixture(t);
+  store.activate("thr_test", "activation", 100);
+  const violation = { key: "pr-before-gate:cmd", kind: "pr-before-gate", detail: "PR created too early.", observedAt: 200 } as const;
+  assert.equal(store.recordAudit("thr_test", null, "2", [violation]), true);
+  assert.equal(store.recordAudit("thr_test", null, "3", [{ ...violation, key: "work-before-checklist:write", kind: "work-before-checklist" }]), false);
+  assert.equal(store.violations("thr_test").length, 1);
+  assert.equal(store.poteto("thr_test")?.auditCursor, "2");
+  assert.equal(store.claimViolation("thr_test", violation.key, 300), 1);
+  assert.equal(store.claimViolation("thr_test", violation.key, 301), null);
+  const restarted = openChecklistStore(db);
+  assert.equal(restarted.claimViolation("thr_test", violation.key, 30_300), 2);
+  restarted.violationNotified("thr_test", violation.key, 1, 30_301);
+  assert.equal(restarted.violations("thr_test")[0].notifiedAt, null);
+  restarted.violationNotified("thr_test", violation.key, 2, 30_302);
+  assert.equal(restarted.claimViolation("thr_test", violation.key, 70_000), null);
+  assert.equal(store.acknowledge("thr_other", violation.key, 400), false);
+  assert.equal(store.acknowledge("thr_test", violation.key, 400), true);
+  const acknowledged = store.violations("thr_test");
+  store.recordAudit("thr_test", "2", "3", [violation]);
+  store.acknowledge("thr_test", violation.key, 500);
+  assert.deepEqual(restarted.violations("thr_test"), acknowledged);
+});
+
+test("gate writes reject stale checklist revisions and record the first PR pass only", (t) => {
+  const { store } = fixture(t);
+  store.activate("thr_test", "activation", 100);
+  store.createChecklist("thr_test", "feature", drafts, 100);
+  assert.equal(store.passGate("thr_test", "pr", 0, 200), false);
+  store.resolveStep("thr_test", 1, done);
+  assert.equal(store.passGate("thr_test", "pr", 0, 200), false);
+  assert.equal(store.passGate("thr_test", "pr", 1, 200), true);
+  assert.equal(store.passGate("thr_test", "pr", 1, 300), true);
+  assert.equal(store.checklist("thr_test")?.prGatePassedAt, 200);
+  store.resolveStep("thr_test", 2, done);
+  assert.equal(store.passGate("thr_test", "done", 2, 400), true);
+  assert.equal(store.poteto("thr_test")?.phase, "complete");
+  store.recordAudit("thr_test", null, "1", [{ key: "audit-unreadable", kind: "audit-unreadable", detail: "Unknown timeline shape.", observedAt: 300 }]);
+  assert.equal(store.poteto("thr_test")?.phase, "routed");
+  assert.equal(store.passGate("thr_test", "done", 2, 500), false);
+});

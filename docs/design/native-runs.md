@@ -2,7 +2,7 @@
 
 ## Problem
 
-pstack's review panels (`interrogate`, `architect`, `arena`, `how`, `why`, `reflect`) and `swarm` need several models to work in parallel and report back. pstack must run these itself instead of depending on another plugin. `/poteto-mode` also asks the agent to copy a playbook's steps into a todo list and close each one, but nothing checks that it does. Agents skip steps without saying so.
+pstack's review panels (`interrogate`, `architect`, `arena`, `how`, `why`, `reflect`) and `swarm` need several models to work in parallel and report back. pstack must run these itself instead of depending on another plugin. `/poteto-mode` also needs durable activation, ordered checklist closure, and a verdict that preserves detected violations when an agent runs gates late.
 
 The bb Plugin SDK sets the limits:
 
@@ -85,9 +85,20 @@ An issued attempt is never spawned again, because a late spawn would duplicate a
 
 **Checklists** (`src/checklist.ts`).
 - The plugin extracts the steps from the skill files: the numbered steps of a playbook, the phases of figure-it-out, and the bold-lead paragraphs of Opening a PR. Opening a PR is appended to every playbook.
-- Text is copied verbatim and snapshotted, so a later edit to a skill does not change an open checklist.
+- Text is snapshotted with HTML policy markers removed. A later skill edit does not change an open checklist.
 - A step closes only as `done` with evidence (`thread:`, `run:`, `commit:`, `path:`, `pr:`) or `skipped` with a reason. A SQLite `CHECK` enforces the same rule.
-- Both gates are pure functions of the stored state.
+- Playbook steps close in order. Each step records when it became current. A `thread:` or `run:` reference must have been created at or after that time. PR-section steps remain unordered.
+- A `<!-- pstack: skip=user -->` marker requires a direct user waiver. `skip=never` forbids skipping. Unmarked steps allow agent skips. Feature steps 1 and 2 require user waivers, and step 4 cannot be skipped.
+- Gate decisions are pure functions. The CLI audits the timeline before evaluating a gate and conditionally records a successful PR gate or completion.
+
+**Poteto activation and audit** (`src/poteto.ts`, `src/poteto-audit.ts`, `src/checklist-commands.ts`).
+- `message.dispatch` accepts user invocations anywhere outside code spans and fences, including skill mentions. It ignores agent traffic and pstack workers. The hook only reads local state and commits activation or user controls. It performs no thread or network I/O.
+- One `poteto_threads` row owns each thread's phase. Activation is idempotent. Checklist begin moves `activated` or `stalled` to `routed`. A passing done gate moves `routed` to `complete`. A later discovered violation reopens that verdict.
+- A pending charter is delivered outside the hook through `steer-if-active` with agent-only visibility. It is marked sent only after success. Failures retry after 30 seconds, including after a restart. The `pstack-poteto` service polls every 15 seconds, alongside the native runner's service. Active and idle events use the same reconciler.
+- Idle without a checklist allows three charter revivals. Further idle marks the thread `stalled`, visible in the composer and CLI footer. Beginning a checklist resumes it.
+- The auditor reads raw `threads.events.list` pages in sequence order from a durable cursor. `item/completed` events with `commandExecution` and `fileChange` carry the evidence. Malformed timeline envelopes, unreadable pages, and command or file-change items with unreadable commands or paths create one `audit-unreadable` violation. Unknown event and completed-item types are ignored.
+- A file change after activation but before checklist creation records `work-before-checklist:<item-id>`. A shell `gh pr create` or `origin pr create` before the first passing PR gate records `pr-before-gate:<item-id>`. Event timestamps preserve these rules when the auditor catches up later.
+- Cursor advancement and insertion of violations share one transaction. Violation keys are unique per thread. Records are retained after acknowledgement. Notifications retry until sent, then stay sent. The done gate fails until the user acknowledges each outstanding violation with `/poteto-mode ack <key>`.
 
 **Where open steps reach the agent.**
 - The session instructions list them for new and resumed sessions.
@@ -121,7 +132,10 @@ This design came from two candidate sketches and a cross-judge.
 
 - We accept a possible `uncertain` gap after a crash during a spawn, in exchange for never running a duplicate seat or judge.
 - We accept at-least-once completion messages, in exchange for honest delivery semantics.
-- We accept that open steps reach the agent at session start, on every command and in one nudge, not on every turn, because the SDK cannot do more.
+- We accept asynchronous charter delivery and at-least-once notifications. A crash after a send but before its receipt is stored can repeat the message.
+- We accept detection after a shell operation completes. The SDK cannot veto shell commands or a final reply before the charter is read.
+- Send-now and edited-message replay bypass the dispatch hook. MCP and built-in PR tools are not classified. The shell classifier recognizes direct PR-create commands and does not interpret arbitrary programs, aliases, or generated shell code.
+- Evidence timestamps establish freshness. They do not prove that a report is correct, a test covers the requirement, or a path or commit reference is truthful.
 - We accept a 15 s poll of running workers, in exchange for never stranding a run on a missed event.
 
 ## Alternatives considered

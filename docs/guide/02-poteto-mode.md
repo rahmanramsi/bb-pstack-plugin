@@ -1,6 +1,6 @@
 # Route work through `/poteto-mode`
 
-`/poteto-mode` is the front door. You give it a goal, it matches one of twenty-three playbooks, copies that playbook's steps into the todo list, and calls the other skills as the steps need them. In this page you learn what a good prompt looks like, and how little of one you actually need.
+`/poteto-mode` is the front door. You give it a goal. The plugin records activation and sends the agent a charter. The agent reads the skill, selects a playbook, and starts its checklist before working. In this page you learn what a good prompt looks like, and how little of one you actually need.
 
 ![A dispatcher pulls a switch lever to route robots on rail handcars toward lit gates, under a /poteto-mode departure board listing BUG FIX, FEATURE, and INVESTIGATION.](./images/router.jpg)
 
@@ -36,6 +36,34 @@ You don't write a spec. You say what's wrong or what you want, plus anything you
 ```
 
 That's a Bug fix prompt. "repro first" is a real constraint, not politeness, and the playbook honors it. Watch the todo list fill with the Bug fix steps. A skipped step stays visible with `skip: <reason>`.
+
+## Follow the checklist and resolve holds
+
+The invocation can appear at the start, in the middle, or at the end of your message. `$poteto-mode` and skill mentions also activate it. Tokens inside code examples and messages from agents do not activate it.
+
+The thread banner shows the mode and open steps. If the thread idles without starting a checklist, pstack retries the charter. After three revivals, the banner shows `stalled`. Ask the agent to run `bb pstack checklist begin <playbook>` to continue.
+
+Playbook steps close in order. Evidence from a thread or run must come from work started at or after the step opened. Steps under Opening a PR can close in any order.
+
+Most steps allow the agent to skip them with a reason. Feature steps 1 and 2 require your waiver. Send the waiver as its own user message, for example:
+
+```text
+/poteto-mode waive 1 Accept the existing subsystem analysis.
+```
+
+Feature step 4 cannot be skipped, even with a user waiver. Control messages show a confirmation and do not start an agent turn.
+
+The agent must pass `bb pstack gate pr` before creating a PR. It must pass `bb pstack gate done` before its final reply. A file change before checklist begin or a shell PR-create command before a passing PR gate leaves a violation. Running the gate later does not remove it. Malformed timeline envelopes, unreadable pages, and command or file-change items with unreadable commands or paths also create a hold. Unknown event and completed-item types are ignored. Open the thread panel to read the details.
+
+Review a violation before acknowledging it. Send its exact key as a separate user message:
+
+```text
+/poteto-mode ack pr-before-gate:command-id
+```
+
+Acknowledgement releases that hold while retaining the record. The done gate still requires every checklist step to close. Agents cannot acknowledge violations or grant user waivers.
+
+These checks record and audit behavior. An agent can still run shell commands or reply before reading the charter. Send-now and edited-message replay bypass activation checks. PRs created through MCP or built-in tools are outside the shell auditor's coverage.
 
 ## What goes in a prompt
 
@@ -92,7 +120,7 @@ A long thread accumulates context from the last task. When you change subjects, 
 /poteto-mode new task. figure out why the cache entry survives logout. don't change any code yet.
 ```
 
-"new task" tells `/poteto-mode` to re-match rather than continue the prior playbook. "don't change any code yet" pins this one to Investigation. Without those two phrases, a mode mid-Feature tends to treat your question as the next feature step.
+"new task" tells the agent to re-match rather than continue the prior playbook. A thread retains its first checklist. Start a fresh thread when the new task needs a different checklist. "don't change any code yet" pins this one to Investigation. Without those two phrases, a mode mid-Feature tends to treat your question as the next feature step.
 
 ## Give parallel work its own machine
 
