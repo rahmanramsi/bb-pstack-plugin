@@ -4,7 +4,6 @@ import { LIVE, type AttemptSnapshot, type JobDraft, type JobSnapshot, type JobSt
 type FinalStatus = Exclude<RunSnapshot["status"], "running">;
 type NotifyState = "pending" | "sent" | "abandoned";
 
-/** Everything about a run that is not a job: who started it, what it is, and whether its completion message went out. */
 export type RunInfo = {
   id: RunId;
   origin: Origin;
@@ -31,16 +30,12 @@ export type RunStore = {
   snapshot(runId: RunId): RunSnapshot | null;
   info(runId: RunId): RunInfo | null;
   runsForThread(originThreadId: string, active: boolean): RunId[];
-  /** Running runs, plus finished runs whose completion message is due. */
   dueRuns(now: number): RunId[];
-  /** CAS: moves a job only when its current state is `from`. Returns whether this call won. Leaving the live states finishes the job's open attempt. */
-  transitionJob(runId: RunId, key: string, from: JobState, to: JobState, patch?: JobPatch): boolean;
-  /** INSERT OR IGNORE of attempt (run, job, ordinal) as `issued`, only while the job is running. Only the caller whose insert lands may spawn. */
+  transitionJobAndAttempt(runId: RunId, key: string, from: JobState, to: JobState, patch?: JobPatch): boolean;
   claimAttempt(runId: RunId, key: string, ordinal: number, now: number): boolean;
   attachAttempt(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
   attemptByThread(threadId: string): { runId: RunId; key: string; ordinal: number } | null;
   finishRun(runId: RunId, status: FinalStatus, now: number): boolean;
-  /** CAS from `pending` on a finished run. */
   settleNotification(runId: RunId, outcome: Exclude<NotifyState, "pending">): boolean;
   deferNotification(runId: RunId, nextAt: number): void;
   /** Monotonic revision of everything this store owns for a thread, for realtime invalidation. */
@@ -85,7 +80,6 @@ const PATCH_COLUMNS: Record<keyof JobPatch, string> = {
 };
 
 export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
-  // A wall-clock seed keeps the revision increasing across restarts without a stored counter.
   let revision = clock();
   const bump = <T>(changed: T): T => {
     if (changed) revision += 1;
@@ -111,7 +105,7 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
     return { id: input.id, existing: false };
   });
 
-  const transitionJob = db.transaction((runId: RunId, key: string, from: JobState, to: JobState, patch: JobPatch): boolean => {
+  const transitionJobAndAttempt = db.transaction((runId: RunId, key: string, from: JobState, to: JobState, patch: JobPatch): boolean => {
     const entries = Object.entries(patch) as [keyof JobPatch, unknown][];
     const sets = ["state = ?", ...entries.map(([field]) => `${PATCH_COLUMNS[field]} = ?`)].join(", ");
     const changed = db
@@ -195,7 +189,7 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
       return rows.map((row) => row.id);
     },
 
-    transitionJob: (runId, key, from, to, patch = {}) => bump(transitionJob(runId, key, from, to, patch)),
+    transitionJobAndAttempt: (runId, key, from, to, patch = {}) => bump(transitionJobAndAttempt(runId, key, from, to, patch)),
 
     claimAttempt(runId, key, ordinal, now) {
       const changes = db

@@ -49,11 +49,11 @@ test("createRun with the same request key returns the existing run, and a differ
   assert.deepEqual(create({ id: "psr_22222222-2222-2222-2222-222222222222" as RunId, planHash: "h2" }), { conflict: true });
 });
 
-test("transitionJob is a compare-and-set, and releasing stores the materialized prompt", () => {
+test("transitionJobAndAttempt is a compare-and-set, and releasing stores the materialized prompt", () => {
   const { store, create } = setup();
   create();
-  assert.equal(store.transitionJob(RUN, "judge", "blocked", "queued", { releasedPrompt: "judge it with inputs" }), true);
-  assert.equal(store.transitionJob(RUN, "judge", "blocked", "queued", { releasedPrompt: "again" }), false);
+  assert.equal(store.transitionJobAndAttempt(RUN, "judge", "blocked", "queued", { releasedPrompt: "judge it with inputs" }), true);
+  assert.equal(store.transitionJobAndAttempt(RUN, "judge", "blocked", "queued", { releasedPrompt: "again" }), false);
   assert.equal(store.snapshot(RUN)!.jobs[1]!.prompt, "judge it with inputs");
 });
 
@@ -61,7 +61,7 @@ test("an attempt is claimed once per ordinal, only while its job runs, and attac
   const { store, create } = setup();
   create();
   assert.equal(store.claimAttempt(RUN, "seat-1", 1, 5), false, "queued job cannot claim");
-  store.transitionJob(RUN, "seat-1", "queued", "running");
+  store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
   assert.equal(store.claimAttempt(RUN, "seat-1", 1, 5), true);
   assert.equal(store.claimAttempt(RUN, "seat-1", 1, 6), false);
   assert.deepEqual(store.snapshot(RUN)!.jobs[0]!.attempts, [{ ordinal: 1, state: "issued", threadId: null, issuedAt: 5, finishedAt: null }]);
@@ -75,12 +75,12 @@ test("an attempt is claimed once per ordinal, only while its job runs, and attac
 test("leaving the live states finishes the open attempt; uncertain keeps it open", () => {
   const { store, create, tick } = setup();
   create();
-  store.transitionJob(RUN, "seat-1", "queued", "running");
+  store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
   store.claimAttempt(RUN, "seat-1", 1, 5);
-  store.transitionJob(RUN, "seat-1", "running", "uncertain");
+  store.transitionJobAndAttempt(RUN, "seat-1", "running", "uncertain");
   assert.equal(store.snapshot(RUN)!.jobs[0]!.attempts[0]!.state, "issued");
   tick(500);
-  store.transitionJob(RUN, "seat-1", "uncertain", "failed", { error: "the run deadline passed" });
+  store.transitionJobAndAttempt(RUN, "seat-1", "uncertain", "failed", { error: "the run deadline passed" });
   const job = store.snapshot(RUN)!.jobs[0]!;
   assert.deepEqual([job.state, job.error, job.attempts[0]!.state, job.attempts[0]!.finishedAt], ["failed", "the run deadline passed", "finished", 1_500]);
 });
@@ -88,11 +88,11 @@ test("leaving the live states finishes the open attempt; uncertain keeps it open
 test("one thread cannot be attached to two attempts", () => {
   const { store, create } = setup();
   create();
-  store.transitionJob(RUN, "seat-1", "queued", "running");
+  store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
   store.claimAttempt(RUN, "seat-1", 1, 5);
   store.attachAttempt(RUN, "seat-1", 1, "thr_w1");
-  store.transitionJob(RUN, "seat-1", "running", "queued", { providerRetries: 1 });
-  store.transitionJob(RUN, "seat-1", "queued", "running");
+  store.transitionJobAndAttempt(RUN, "seat-1", "running", "queued", { providerRetries: 1 });
+  store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
   store.claimAttempt(RUN, "seat-1", 2, 6);
   assert.equal(store.attachAttempt(RUN, "seat-1", 2, "thr_w1"), false);
 });
@@ -124,8 +124,8 @@ test("revision moves on every change and not on a no-op", () => {
   create();
   const created = store.revision("thr_origin");
   assert.ok(created > before);
-  store.transitionJob(RUN, "judge", "running", "succeeded");
+  store.transitionJobAndAttempt(RUN, "judge", "running", "succeeded");
   assert.equal(store.revision("thr_origin"), created);
-  store.transitionJob(RUN, "seat-1", "queued", "running");
+  store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
   assert.ok(store.revision("thr_origin") > created);
 });

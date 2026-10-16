@@ -23,7 +23,7 @@ function fixture(t: TestContext) {
   const missing = new Set<string>();
   const feature = createChecklistFeature({
     bb, store, skillsDir, activeWork: async () => work, publish: (id) => publications.push(id),
-    verifyEvidence: async (evidence) => evidence.kind === "thread" && missing.has(evidence.id) ? `Thread ${evidence.id} does not exist.` : null,
+    evidenceError: async (evidence) => evidence.kind === "thread" && missing.has(evidence.id) ? `Thread ${evidence.id} does not exist.` : null,
   });
   const cli = defineCli({ name: "pstack", summary: "Playbook checklists", commands: feature.commands });
   async function run(argv: string[], id = "thr_test") {

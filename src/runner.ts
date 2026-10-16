@@ -205,7 +205,6 @@ export type Action =
   | { type: "finish"; status: Exclude<RunSnapshot["status"], "running"> };
 
 const TERMINAL: ReadonlySet<JobState> = new Set(["succeeded", "failed", "skipped", "cancelled"]);
-/** States in which a job's latest attempt may own a live worker thread. */
 export const LIVE: ReadonlySet<JobState> = new Set(["running", "repairing", "uncertain"]);
 
 function retryable(job: JobSnapshot): boolean {
@@ -221,7 +220,6 @@ function settled(job: JobSnapshot): boolean {
   return TERMINAL.has(job.state) && !retryable(job);
 }
 
-/** The attempt that may own a worker right now, or null while a running job still has to claim one. */
 export function liveAttempt(job: JobSnapshot): AttemptSnapshot | null {
   const latest = job.attempts.at(-1);
   return LIVE.has(job.state) && latest && latest.state !== "finished" ? latest : null;
@@ -276,12 +274,11 @@ export function plan(run: RunSnapshot, now: number): Action[] {
     }
   }
 
-  // A job released this round competes for slots next round, so a fresh verifier is not outrun by a slice.
-  const releasing = actions.some((action) => action.type === "release");
+  const holdSpawnsWhileReleasing = actions.some((action) => action.type === "release");
   const active = run.jobs.filter((job) => LIVE.has(job.state)).length;
   const order = (job: JobSnapshot) => (job.kind === "verifier" ? 0 : 1);
   const ranked = due.map((job, index) => ({ job, index })).sort((a, b) => order(a.job) - order(b.job) || a.index - b.index);
-  for (const { job } of releasing ? [] : ranked.slice(0, Math.max(0, CONCURRENCY - active))) {
+  for (const { job } of holdSpawnsWhileReleasing ? [] : ranked.slice(0, Math.max(0, CONCURRENCY - active))) {
     actions.push({ type: "spawn", job: job.key, ordinal: job.attempts.length + 1 });
   }
 
@@ -347,7 +344,6 @@ function finalStatus(jobs: readonly JobSnapshot[]): Exclude<RunSnapshot["status"
   return succeeded === 0 ? "failed" : "partial";
 }
 
-/** A swarm job that ran fine but did not establish its slice: a BLOCKED report or any verdict short of VERIFIED. */
 function weakOutcome(job: JobSnapshot): boolean {
   const value = job.value as { status?: unknown; verdict?: unknown } | null;
   if (job.kind === "slice") return value?.status === "BLOCKED";
@@ -405,7 +401,6 @@ function findingsOf(jobs: readonly JobSnapshot[]): RefFinding[] {
   });
 }
 
-/** Pure: every grouping ref names a seat finding, and no ref appears in two groups. */
 export function checkGrouping(grouping: ResultValueOf<"grouping">, refs: ReadonlySet<string>): string | null {
   const seen = new Set<string>();
   for (const group of grouping.groups) {
@@ -510,12 +505,10 @@ function resultSchema(kind: ResultKind): Record<string, unknown> {
   return schema;
 }
 
-/** The parameters `pstack_result` advertises to one worker: `{ value }` narrowed to its contract. */
 export function resultToolParameters(kind: ResultKind): Record<string, unknown> {
   return { type: "object", properties: { value: resultSchema(kind) }, required: ["value"], additionalProperties: false };
 }
 
-/** The prompt a worker receives: its job prompt, then the result contract, which wins over any format the prompt describes. */
 export function workerPrompt(job: Pick<JobDraft, "prompt" | "result" | "slice">): string {
   if (job.result === "text") {
     return `${job.prompt}\n\n## Result\n\nYour final message is the result. It goes back to the thread that started this run exactly as you write it.`;
@@ -532,7 +525,6 @@ export function workerPrompt(job: Pick<JobDraft, "prompt" | "result" | "slice">)
 
 const COMPLETION_MAX_CHARS = 16_000;
 
-/** Pure: the agent-only message the origin thread receives when a run finishes, bounded. */
 export function completionMessage(run: RunSnapshot, meta: { kind: "panel" | "swarm"; title: string }): string {
   const letters = seatLetters(run.jobs);
   const budget = Math.floor((COMPLETION_MAX_CHARS - 1_000) / run.jobs.length);
@@ -570,16 +562,13 @@ export type Runner = {
   /** Worker side: `pstack_result({ value })`, identity from the tool's thread id. */
   submit(workerThreadId: string, value: unknown): Promise<{ ok: true } | { ok: false; error: string }>;
   view(runId: RunId, originThreadId: string): RunView;
-  /** Every job's validated value, for `run status`. */
   results(runId: RunId, originThreadId: string): JobResult[];
   activeRuns(originThreadId: string): RunId[];
-  /** The result contract of the job a thread works on, from its attempt or its spawn metadata; null for any other thread. Synchronous for `bb.agents.configure`. */
   workerResult(threadId: string, pluginMetadata: unknown): ResultKind | null;
   /** Lifecycle hooks; each only records the observation and calls tick. */
   onIdle(threadId: string, lastAssistantText: string | null): Promise<void>;
   onFailed(threadId: string, error: string | null): Promise<void>;
   onGone(threadId: string): Promise<void>;
-  /** Applies plan() until the run settles, polling its running workers, then delivers a due completion message. */
   tick(runId: RunId): Promise<void>;
   /** Background service body: recover, then tick due runs every 15 s until the signal aborts. */
   serve(signal: AbortSignal): Promise<void>;
@@ -596,7 +585,6 @@ const WorkerMetadata = z.object({
 type AttemptRef = { runId: RunId; key: string; ordinal: number };
 
 const POLL_INTERVAL_MS = 15_000;
-/** After a corrective turn, the worker may still read as idle for a moment; the poll waits this long before trusting it. */
 const REPAIR_POLL_GRACE_MS = 30_000;
 const NOTIFY_RETRY_BASE_MS = 1_000;
 const NOTIFY_RETRY_MAX_MS = 60 * 60 * 1_000;
@@ -669,16 +657,15 @@ export function createRunner(
   function observeIdle(ref: AttemptRef, text: string | null): void {
     const current = currentJob(ref);
     if (!current || current.job.state !== "running") return;
-    // Inside the grace window after a corrective turn, an idle may still describe the turn being corrected.
     if ((current.job.nextActionAt ?? 0) > clock()) return;
     const accepted = accept(current.job, current.snapshot, text ?? "");
-    if (accepted.ok) store.transitionJob(ref.runId, ref.key, "running", "succeeded", { valueJson: JSON.stringify(accepted.value), error: null });
-    else store.transitionJob(ref.runId, ref.key, "running", "repairing", { error: accepted.error });
+    if (accepted.ok) store.transitionJobAndAttempt(ref.runId, ref.key, "running", "succeeded", { valueJson: JSON.stringify(accepted.value), error: null });
+    else store.transitionJobAndAttempt(ref.runId, ref.key, "running", "repairing", { error: accepted.error });
   }
 
   function observeFailed(ref: AttemptRef, error: string): void {
     const current = currentJob(ref);
-    if (current) store.transitionJob(ref.runId, ref.key, current.job.state, "failed", { error });
+    if (current) store.transitionJobAndAttempt(ref.runId, ref.key, current.job.state, "failed", { error });
   }
 
   async function workerThreads(visit: (threadId: string, metadata: z.infer<typeof WorkerMetadata>) => void): Promise<void> {
@@ -694,12 +681,11 @@ export function createRunner(
     }
   }
 
-  /** Attaches a worker found by its spawn metadata to its still-issued attempt. */
   function adoptInto(threadId: string, ref: AttemptRef): AttemptRef | null {
     const job = store.snapshot(ref.runId)?.jobs.find((candidate) => candidate.key === ref.key);
     if (!job || liveAttempt(job)?.ordinal !== ref.ordinal) return null;
     if (store.attachAttempt(ref.runId, ref.key, ref.ordinal, threadId) && job.state === "uncertain") {
-      store.transitionJob(ref.runId, ref.key, "uncertain", "running");
+      store.transitionJobAndAttempt(ref.runId, ref.key, "uncertain", "running");
     }
     return store.attemptByThread(threadId);
   }
@@ -730,7 +716,7 @@ export function createRunner(
   }
 
   async function spawn(runId: RunId, job: JobSnapshot, ordinal: number): Promise<boolean> {
-    store.transitionJob(runId, job.key, "queued", "running", { error: null, nextActionAt: null });
+    store.transitionJobAndAttempt(runId, job.key, "queued", "running", { error: null, nextActionAt: null });
     if (!store.claimAttempt(runId, job.key, ordinal, clock())) return false;
     const info = store.info(runId)!;
     const origin = info.origin;
@@ -762,11 +748,11 @@ export function createRunner(
             if (attemptId(metadata.runId, metadata.job, metadata.ordinal) === id) threadId = candidate;
           });
         } catch {
-          store.transitionJob(runId, job.key, "running", "uncertain");
+          store.transitionJobAndAttempt(runId, job.key, "running", "uncertain");
           return true;
         }
         if (threadId === null) {
-          store.transitionJob(runId, job.key, "running", "failed", { error: `could not start the worker: ${message(error)}` });
+          store.transitionJobAndAttempt(runId, job.key, "running", "failed", { error: `could not start the worker: ${message(error)}` });
           return true;
         }
       }
@@ -791,25 +777,25 @@ export function createRunner(
     const job = snapshot.jobs.find((candidate) => candidate.key === action.job)!;
     switch (action.type) {
       case "release":
-        return store.transitionJob(runId, job.key, "blocked", "queued", { releasedPrompt: action.prompt });
+        return store.transitionJobAndAttempt(runId, job.key, "blocked", "queued", { releasedPrompt: action.prompt });
       case "skip":
-        return store.transitionJob(runId, job.key, "blocked", "skipped", { error: action.reason });
+        return store.transitionJobAndAttempt(runId, job.key, "blocked", "skipped", { error: action.reason });
       case "spawn":
         return spawn(runId, job, action.ordinal);
       case "retry": {
-        const moved = store.transitionJob(runId, job.key, "failed", "queued", { nextActionAt: action.at, providerRetries: job.providerRetries + 1 });
+        const moved = store.transitionJobAndAttempt(runId, job.key, "failed", "queued", { nextActionAt: action.at, providerRetries: job.providerRetries + 1 });
         if (moved) wakeAt(runId, action.at);
         return moved;
       }
       case "fail": {
-        const moved = store.transitionJob(runId, job.key, job.state, "failed", { error: action.error });
+        const moved = store.transitionJobAndAttempt(runId, job.key, job.state, "failed", { error: action.error });
         if (moved) await stopWorker(liveAttempt(job)?.threadId);
         return moved;
       }
       case "repair": {
         const threadId = liveAttempt(job)?.threadId;
-        if (!threadId) return store.transitionJob(runId, job.key, "repairing", "failed", { error: "the worker thread is unknown" });
-        const moved = store.transitionJob(runId, job.key, "repairing", "running", {
+        if (!threadId) return store.transitionJobAndAttempt(runId, job.key, "repairing", "failed", { error: "the worker thread is unknown" });
+        const moved = store.transitionJobAndAttempt(runId, job.key, "repairing", "running", {
           repairs: job.repairs + 1,
           error: null,
           nextActionAt: clock() + REPAIR_POLL_GRACE_MS,
@@ -818,7 +804,7 @@ export function createRunner(
         try {
           await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: action.message, mentions: [] }] });
         } catch (error) {
-          store.transitionJob(runId, job.key, "running", "failed", { error: `could not send the corrective turn: ${message(error)}` });
+          store.transitionJobAndAttempt(runId, job.key, "running", "failed", { error: `could not send the corrective turn: ${message(error)}` });
         }
         return true;
       }
@@ -897,7 +883,7 @@ export function createRunner(
     if (!snapshot || !store.finishRun(runId, "cancelled", clock())) return false;
     const live = snapshot.jobs.map((job) => liveAttempt(job)?.threadId);
     for (const job of snapshot.jobs) {
-      if (!["succeeded", "failed", "skipped", "cancelled"].includes(job.state)) store.transitionJob(runId, job.key, job.state, "cancelled");
+      if (!["succeeded", "failed", "skipped", "cancelled"].includes(job.state)) store.transitionJobAndAttempt(runId, job.key, job.state, "cancelled");
     }
     await Promise.all(live.map(stopWorker));
     publish(store.info(runId)!.origin.threadId);
@@ -924,7 +910,7 @@ export function createRunner(
     for (const [id, attempt] of issued) {
       const threadId = found.get(id);
       if (threadId) adoptInto(threadId, attempt);
-      else if (attempt.state === "running") store.transitionJob(attempt.runId, attempt.key, "running", "uncertain");
+      else if (attempt.state === "running") store.transitionJobAndAttempt(attempt.runId, attempt.key, "running", "uncertain");
     }
   }
 
@@ -996,7 +982,7 @@ export function createRunner(
         return { ok: false, error: "This worker's job is no longer running." };
       }
       if (!accepted.ok) return accepted;
-      if (!store.transitionJob(ref.runId, job.key, job.state, "succeeded", { valueJson: JSON.stringify(accepted.value), error: null })) {
+      if (!store.transitionJobAndAttempt(ref.runId, job.key, job.state, "succeeded", { valueJson: JSON.stringify(accepted.value), error: null })) {
         return { ok: false, error: "This worker's job changed state before the result was recorded." };
       }
       await stopWorker(workerThreadId);

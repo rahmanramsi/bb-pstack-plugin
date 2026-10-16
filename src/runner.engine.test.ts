@@ -281,7 +281,7 @@ test("restart: an issued attempt is adopted through its metadata, or marked unce
   const runId = "psr_33333333-3333-3333-3333-333333333333" as RunId;
   h.store.createRun({ id: runId, origin, requestKey: null, planHash: "h", kind: "swarm", title: "check.sh", deadline: h.clock.now + 60_000, jobs: compiled.jobs });
   for (const key of ["slice-1", "slice-2"]) {
-    h.store.transitionJob(runId, key, "queued", "running");
+    h.store.transitionJobAndAttempt(runId, key, "queued", "running");
     h.store.claimAttempt(runId, key, 1, h.clock.now);
   }
   h.threads.set("thr_lost", {

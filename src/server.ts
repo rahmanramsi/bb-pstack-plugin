@@ -123,7 +123,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
     },
     publish: (threadId) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: Date.now() }),
-    verifyEvidence: async (evidence) => {
+    evidenceError: async (evidence) => {
       if (evidence.kind === "thread") {
         const found = await bb.sdk.threads.get({ threadId: evidence.id }).then(() => true, () => false);
         return found ? null : `Thread ${evidence.id} does not exist.`;
