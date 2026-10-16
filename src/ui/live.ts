@@ -89,5 +89,5 @@ export function useThreadView(threadId: string) {
 export function useRunView(threadId: string, runId: string) {
   const rpc = useRpc<typeof rpcContract>();
   const load = useCallback(() => rpc.call("pstackRunView", { threadId, runId }), [rpc, threadId, runId]);
-  return useLiveView<RunView>(threadId, load);
+  return useLiveView<RunView | null>(threadId, load);
 }

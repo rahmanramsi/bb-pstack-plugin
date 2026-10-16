@@ -5,7 +5,7 @@ import { openChecklistStore } from "./checklist-store.ts";
 import { STATE_CHANNEL, rpcContract } from "./contract.ts";
 import { createRunFeature } from "./run-commands.ts";
 import { openRunStore } from "./run-store.ts";
-import { createRunner, type RunId } from "./runner.ts";
+import { RunnerError, createRunner, type RunId } from "./runner.ts";
 import { openDatabase } from "./store.ts";
 import {
   PluginCliError,
@@ -171,7 +171,14 @@ export default async function plugin(bb: BbPluginApi) {
         },
       };
     },
-    pstackRunView: async ({ threadId, runId }) => runner.view(runId as RunId, threadId),
+    pstackRunView: async ({ threadId, runId }) => {
+      try {
+        return runner.view(runId as RunId, threadId);
+      } catch (error) {
+        if (error instanceof RunnerError && error.code === "run_not_found") return null;
+        throw error;
+      }
+    },
     pstackStopRun: async ({ threadId, runId }) => ({ stopped: await runner.stop(runId as RunId, threadId) }),
   });
 

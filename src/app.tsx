@@ -42,13 +42,15 @@ function RunCard({ threadId, runId }: { threadId: string; runId: string }) {
   const { state, refresh } = useRunView(threadId, runId);
   const navigate = useBbNavigate();
   const now = useNow();
+  const run = state.status === "ready" ? state.value : undefined;
   return <section className="pstack ps-card" aria-label="pstack run">
     <LoadMessage state={state} />
-    {state.status !== "ready" ? null : <>
-      <RunHeading run={state.value} now={now} />
-      {state.value.kind === "panel" ? <PanelFlow run={state.value} onThread={navigate.toThread} /> : <SwarmGrid run={state.value} onThread={navigate.toThread} />}
-      <div className="ps-actions"><Button type="button" variant="ghost" size="sm" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: state.value.title, params: { runId } })}>View details</Button>
-        {state.value.status === "running" ? <StopRun threadId={threadId} runId={runId} refresh={refresh} /> : null}<code>{runId}</code>
+    {run === null ? <p role="status" className="ps-message">This run does not belong to this thread, or it no longer exists.</p> : null}
+    {!run ? null : <>
+      <RunHeading run={run} now={now} />
+      {run.kind === "panel" ? <PanelFlow run={run} onThread={navigate.toThread} /> : <SwarmGrid run={run} onThread={navigate.toThread} />}
+      <div className="ps-actions"><Button type="button" variant="ghost" size="sm" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: run.title, params: { runId } })}>View details</Button>
+        {run.status === "running" ? <StopRun threadId={threadId} runId={runId} refresh={refresh} /> : null}<code>{runId}</code>
       </div>
     </>}
   </section>;
@@ -82,7 +84,7 @@ function RunInspector({ threadId, runId }: { threadId: string; runId: string }) 
   const { state, refresh } = useRunView(threadId, runId);
   const navigate = useBbNavigate();
   const now = useNow();
-  return <><LoadMessage state={state} />{state.status !== "ready" ? null : <>
+  return <><LoadMessage state={state} />{state.status === "ready" && state.value === null ? <p role="status" className="ps-message">This run does not belong to this thread, or it no longer exists.</p> : null}{state.status !== "ready" || state.value === null ? null : <>
     <RunHeading run={state.value} now={now} />
     {state.value.kind === "swarm" ? <SwarmGrid run={state.value} onThread={navigate.toThread} /> : null}
     <Timeline run={state.value} now={now} onThread={navigate.toThread} />

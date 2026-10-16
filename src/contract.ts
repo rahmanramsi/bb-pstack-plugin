@@ -190,6 +190,6 @@ export const ThreadView = z.object({
 
 export const rpcContract = defineRpcContract({
   pstackThreadView: { input: z.object({ threadId: z.string() }), output: ThreadView },
-  pstackRunView: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: RunView },
+  pstackRunView: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: RunView.nullable() },
   pstackStopRun: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: z.object({ stopped: z.boolean() }) },
 });
