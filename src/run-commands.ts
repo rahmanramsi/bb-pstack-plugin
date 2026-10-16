@@ -85,6 +85,7 @@ export function createRunFeature(deps: {
     const footer = deps.footer(threadId);
     return { exitCode: 0, stdout: `${text}\n${footer ? `${footer}\n` : ""}` };
   };
+  const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
 
   async function readPlanFile(path: string, threadId: string, ctx: PluginCliContext): Promise<string> {
     const absolute = isAbsolute(path) ? path : ctx.cwd ? join(ctx.cwd, path) : null;
@@ -125,8 +126,7 @@ export function createRunFeature(deps: {
         const started = await runner.start(plan, threadId).catch(cliError);
         const view = runner.view(started.runId, threadId);
         if (input.options.json) {
-          const json = { runId: started.runId, existing: started.existing, status: view.status, directive: runDirective(started.runId) };
-          return output(threadId, JSON.stringify(json, null, 2));
+          return json({ runId: started.runId, existing: started.existing, status: view.status, directive: runDirective(started.runId) });
         }
         const summary = started.existing
           ? `Already started: ${describe(view)}, ${view.status}.`
@@ -144,7 +144,7 @@ export function createRunFeature(deps: {
         try {
           const view = runner.view(id, threadId);
           const results = runner.results(id, threadId);
-          return output(threadId, input.options.json ? JSON.stringify({ ...view, results }, null, 2) : formatStatus(view, results));
+          return input.options.json ? json({ ...view, results }) : output(threadId, formatStatus(view, results));
         } catch (error) {
           cliError(error);
         }

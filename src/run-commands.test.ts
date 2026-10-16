@@ -109,7 +109,7 @@ test("run start --plan-json prints the run id, a summary, the directive on its o
   assert.deepEqual(h.started[0]!.plan, { ...PLAN, model: { role: "swarm workers" } });
 
   const json = await h.run(["run", "start", "--plan-json", JSON.stringify(PLAN), "--json"]);
-  const parsed = JSON.parse(json.stdout!.slice(0, json.stdout!.lastIndexOf("}") + 1));
+  const parsed = JSON.parse(json.stdout!);
   assert.deepEqual(parsed, { runId: RUN, existing: false, status: "running", directive: `::pstack-run{run="${RUN}"}` });
 });
 
@@ -153,7 +153,7 @@ test("run status prints jobs and results, or JSON with both", async () => {
   assert.match(text.stdout!, /^psr_\S+ swarm "check\.sh": running\n  packages\/api\s+succeeded\s+codex\/gpt-6\.1-sol\/high\s+thr_w1\s+PASS/);
   assert.match(text.stdout!, /## packages\/api\n\n\{\n {2}"status": "PASS"\n\}/);
   const json = await h.run(["run", "status", RUN, "--json"]);
-  const parsed = JSON.parse(json.stdout!.slice(0, json.stdout!.lastIndexOf("}") + 1));
+  const parsed = JSON.parse(json.stdout!);
   assert.equal(parsed.jobs.length, 2);
   assert.deepEqual(parsed.results[0].value, { status: "PASS" });
 
