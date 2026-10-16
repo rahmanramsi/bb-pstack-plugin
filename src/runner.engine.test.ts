@@ -264,12 +264,6 @@ test("a spawn that fails after creating its thread adopts that thread instead of
   assert.equal(h.spawned.length, 1);
   assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.threadId, h.worker(1));
 
-  const other = harness();
-  other.failures.spawn.push({ error: new Error("socket hang up"), create: false });
-  const second = await other.runner.start(SWARM(["a"]), "thr_origin");
-  const job = other.runner.view(second.runId, "thr_origin").jobs[0]!;
-  assert.deepEqual([job.state, job.error], ["queued", "could not start the worker: socket hang up"]);
-
   const blind = harness();
   blind.failures.spawn.push({ error: new Error("socket hang up"), create: true });
   (blind.bb.sdk.threads as { list: unknown }).list = async () => {
@@ -279,6 +273,54 @@ test("a spawn that fails after creating its thread adopts that thread instead of
   assert.equal(blind.runner.view(third.runId, "thr_origin").jobs[0]!.state, "uncertain", "an unverifiable spawn is never repeated");
   await blind.runner.tick(third.runId);
   assert.equal(blind.spawned.length, 1);
+});
+
+test("a spawn error with no thread found leaves the job uncertain until its thread turns up, never spawning again", async () => {
+  const h = harness();
+  h.failures.spawn.push({ error: new Error("HTTP 400: invalid model"), create: false });
+  const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
+  const job = h.runner.view(runId, "thr_origin").jobs[0]!;
+  assert.deepEqual([job.state, job.error], ["uncertain", "the worker may not have started: HTTP 400: invalid model"]);
+  h.clock.now += 60_000;
+  await h.runner.tick(runId);
+  assert.equal(h.spawned.length, 1);
+
+  const metadata = h.spawned[0]!.pluginMetadata;
+  h.threads.set("thr_late", { id: "thr_late", status: "idle", archivedAt: null, deletedAt: null, output: null, metadata, originPluginId: "pstack" });
+  await h.runner.onIdle("thr_late", JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] }));
+  const adopted = h.runner.view(runId, "thr_origin");
+  assert.deepEqual([adopted.status, adopted.jobs[0]!.threadId, adopted.jobs[0]!.error], ["succeeded", "thr_late", null]);
+  assert.equal(h.spawned.length, 1);
+});
+
+test("a tick adopts an uncertain spawn's thread when its events are missed", async () => {
+  const h = harness();
+  h.failures.spawn.push({ error: new Error("socket hang up"), create: false });
+  const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
+  const metadata = h.spawned[0]!.pluginMetadata;
+  const output = JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] });
+  h.threads.set("thr_late", { id: "thr_late", status: "idle", archivedAt: null, deletedAt: null, output, metadata, originPluginId: "pstack" });
+  await h.runner.tick(runId);
+  assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => job.state), ["succeeded"]);
+  assert.equal(h.spawned.length, 1);
+});
+
+test("a thread that turns up after its attempt is no longer live is stopped, not run hidden", async () => {
+  const h = harness();
+  h.failures.spawn.push({ error: new Error("socket hang up"), create: false });
+  const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
+  h.clock.now += 4 * 60 * 60 * 1_000;
+  await h.runner.tick(runId);
+  assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.state, "failed");
+
+  const metadata = h.spawned[0]!.pluginMetadata;
+  h.threads.set("thr_late", { id: "thr_late", status: "active", archivedAt: null, deletedAt: null, output: null, metadata, originPluginId: "pstack" });
+  h.failures.stop.push(new Error("bb is restarting"));
+  await h.runner.onIdle("thr_late", "anything");
+  assert.deepEqual(h.stopped, []);
+  await h.runner.tick(runId);
+  assert.deepEqual(h.stopped, ["thr_late"], "a failed stop of a late thread is retried");
+  assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => job.state), ["failed"]);
 });
 
 test("the swarm engine keeps at most 8 workers running and releases each verifier with its own slice", async () => {
@@ -314,16 +356,26 @@ test("a report or verdict for another slice is rejected, by the tool and in the 
 
 test("restart: an issued attempt is adopted through its metadata, or marked uncertain and never spawned again", async () => {
   const h = harness();
-  const plan = SWARM(["a", "b"]);
+  const plan = SWARM(["a", "b", "c"]);
   const origin = { threadId: "thr_origin", projectId: "prj_1", environmentId: "env_1", providerId: "claude-code", model: "m", reasoningLevel: "high", permissionMode: "auto" };
   const compiled = compile(plan, resolveRole, origin);
   assert.ok(compiled.ok);
   const runId = "psr_33333333-3333-3333-3333-333333333333" as RunId;
   h.store.createRun({ id: runId, origin, requestKey: null, planHash: "h", kind: "swarm", title: "check.sh", deadline: h.clock.now + 60_000, jobs: compiled.jobs });
-  for (const key of ["slice-1", "slice-2"]) {
+  for (const key of ["slice-1", "slice-2", "slice-3"]) {
     h.store.transitionJobAndAttempt(runId, key, "queued", "running");
     h.store.claimAttempt(runId, key, 1, h.clock.now);
   }
+  h.store.transitionJobAndAttempt(runId, "slice-3", "running", "failed", { error: "the worker thread failed" });
+  h.threads.set("thr_stray", {
+    id: "thr_stray",
+    status: "active",
+    archivedAt: null,
+    deletedAt: null,
+    output: null,
+    metadata: { pstackWorker: 1, runId, job: "slice-3", ordinal: 1, originThreadId: "thr_origin" },
+    originPluginId: "pstack",
+  });
   h.threads.set("thr_lost", {
     id: "thr_lost",
     status: "idle",
@@ -341,11 +393,13 @@ test("restart: an issued attempt is adopted through its metadata, or marked unce
   assert.deepEqual(jobs.map((job) => [job.key, job.state, job.threadId]), [
     ["slice-1", "running", "thr_lost"],
     ["slice-2", "uncertain", null],
+    ["slice-3", "failed", "thr_stray"],
   ]);
+  assert.deepEqual(h.stopped, ["thr_stray"], "a thread for an attempt that already failed is stopped");
 
   await h.runner.tick(runId);
   jobs = h.runner.view(runId, "thr_origin").jobs;
-  assert.deepEqual(jobs.map((job) => job.state), ["succeeded", "uncertain"], "the tick polls the adopted worker");
+  assert.deepEqual(jobs.map((job) => job.state), ["succeeded", "uncertain", "failed"], "the tick polls the adopted worker");
   assert.equal(h.spawned.length, 0);
 
   h.clock.now += 60_000;

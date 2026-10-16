@@ -34,6 +34,8 @@ export type RunStore = {
   transitionJobAndAttempt(runId: RunId, key: string, from: JobState, to: JobState, patch?: JobPatch): boolean;
   claimAttempt(runId: RunId, key: string, ordinal: number, now: number): boolean;
   attachAttempt(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
+  /** Records a thread that turned up after its attempt finished without one, with cleanup pending. */
+  recordLateThread(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
   attemptByThread(threadId: string): { runId: RunId; key: string; ordinal: number } | null;
   finishRun(runId: RunId, status: FinalStatus, now: number): boolean;
   /** Cancels a running run, its open jobs and their attempts in one transaction. */
@@ -221,6 +223,21 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
           .prepare("UPDATE attempts SET state = 'attached', thread_id = ? WHERE run_id = ? AND job_key = ? AND ordinal = ? AND state = 'issued'")
           .run(threadId, runId, key, ordinal).changes;
         return bump(changes === 1);
+      } catch (error) {
+        if ((error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") return false;
+        throw error;
+      }
+    },
+
+    recordLateThread(runId, key, ordinal, threadId) {
+      try {
+        const changes = db
+          .prepare(
+            `UPDATE attempts SET thread_id = ?, cleanup = 'pending'
+             WHERE run_id = ? AND job_key = ? AND ordinal = ? AND state = 'finished' AND thread_id IS NULL`,
+          )
+          .run(threadId, runId, key, ordinal).changes;
+        return changes === 1;
       } catch (error) {
         if ((error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") return false;
         throw error;
