@@ -11,6 +11,11 @@ import { MIGRATIONS } from "./store.ts";
 const skillsDir = fileURLToPath(new URL("../skills", import.meta.url));
 type SendInput = Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0];
 
+function userDispatch(text: string) {
+  return { thread: { id: "thr_test", originPluginId: null }, initiator: "user" as const, senderThreadId: null, originPluginId: null,
+    input: { text, blocks: [{ type: "text" as const, text, mentions: [] }] } };
+}
+
 function fixture(t: TestContext) {
   const db = new Database(":memory:");
   t.after(() => db.close());
@@ -172,4 +177,56 @@ test("done rejects a thread reference that does not exist and leaves the step op
   assert.equal(result.exitCode, 1);
   assert.match(result.stdout ?? "", /Thread thr_gone does not exist\./);
   assert.equal(store.checklist("thr_test")?.steps.find((step) => step.id === 1)?.resolution.kind, "open");
+});
+
+test("first and later user dispatches activate idempotently without any SDK I/O", async (t) => {
+  const { feature, store, sends } = fixture(t);
+  for (const prefix of ["first", "later"]) {
+    for (const text of ["build this /poteto-mode", "build /poteto-mode this"]) {
+      const ctx = userDispatch(text);
+      ctx.thread.id = `thr_${prefix}_${text.length}`;
+      if (prefix === "later") feature.dispatch({ ...ctx, input: { text: "hello", blocks: [] } });
+      assert.deepEqual(feature.dispatch(ctx), { action: "proceed" });
+      const first = store.poteto(ctx.thread.id);
+      assert.ok(first);
+      assert.deepEqual(feature.dispatch(ctx), { action: "proceed" });
+      assert.deepEqual(store.poteto(ctx.thread.id), first);
+    }
+  }
+  assert.equal(sends.length, 0);
+});
+
+test("charter retries failed sends, survives reopen, and bounded idle revivals become visibly stalled", async (t) => {
+  const { db, store } = fixture(t);
+  let now = 100;
+  let fail = true;
+  const sends: SendInput[] = [];
+  const bb = { pluginId: "pstack", sdk: { threads: { async send(input: SendInput) {
+    if (fail) throw new Error("offline");
+    sends.push(input);
+  } } } } as unknown as BbPluginApi;
+  function feature() {
+    return createChecklistFeature({ bb, store: openChecklistStore(db), skillsDir, clock: () => now,
+      activeWork: async () => ({ activeRuns: 0, activeChildren: 0 }), publish: () => {}, evidenceError: async () => null });
+  }
+  let current = feature();
+  current.dispatch(userDispatch("build this /poteto-mode"));
+  assert.match(current.instructions("thr_test") ?? "", /checklist begin <playbook> before any other work/);
+  await assert.rejects(current.reconcile("thr_test"), /offline/);
+  assert.equal(store.poteto("thr_test")?.charterState, "pending");
+  fail = false;
+  now += 30_000;
+  current = feature();
+  await Promise.all(Array.from({ length: 8 }, () => current.reconcile("thr_test")));
+  assert.equal(store.poteto("thr_test")?.charterState, "sent");
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].mode, "steer-if-active");
+  assert.equal(sends[0].input?.[0].visibility, "agent-only");
+  for (let index = 0; index < 4; index++) { now += 30_000; await current.onIdle("thr_test"); }
+  assert.equal(sends.length, 4);
+  assert.equal(store.poteto("thr_test")?.phase, "stalled");
+  assert.match(current.footer("thr_test"), /stalled/);
+  const cli = defineCli({ name: "pstack", summary: "checklists", commands: current.commands });
+  await cli.run(["checklist", "begin", "feature"], { threadId: "thr_test" });
+  assert.equal(store.poteto("thr_test")?.phase, "routed");
 });

@@ -147,6 +147,13 @@ export default async function plugin(bb: BbPluginApi) {
   const runs = createRunFeature({ bb, runner, footer: checklist.footer, skills: skillNames() });
   runs.register();
 
+  bb.experimental_hooks.on("message.dispatch", checklist.dispatch);
+  bb.background.service("pstack-poteto", { start: (signal) => checklist.serve(signal) });
+  bb.events.on("thread.active", ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) return;
+    return checklist.reconcile(thread.id).catch((error) => bb.log.error(`pstack poteto: ${String(error)}`));
+  });
+
   bb.events.on("thread.idle", ({ thread }) => {
     if (thread.originPluginId === bb.pluginId) return;
     return checklist.onIdle(thread.id).catch((error) => bb.log.error(`pstack nudge: ${error instanceof Error ? error.message : String(error)}`));
@@ -162,6 +169,7 @@ export default async function plugin(bb: BbPluginApi) {
       const state = checklistStore.checklist(threadId);
       return {
         revision: runStore.revision(threadId) + (state?.revision ?? 0),
+        poteto: checklistStore.poteto(threadId)?.phase ?? null,
         activeRuns: runner.activeRuns(threadId).map((id) => {
           const view = runner.view(id, threadId);
           return { id: view.id, kind: view.kind, title: view.title, status: view.status, jobs: view.jobs };

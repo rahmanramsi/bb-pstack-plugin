@@ -70,6 +70,17 @@ export const MIGRATIONS: readonly string[] = [
      CHECK (status = 'open' OR (status = 'done' AND evidence_json IS NOT NULL) OR (status = 'skipped' AND length(trim(reason)) > 0)),
      PRIMARY KEY (thread_id, id)
    )`,
+  `CREATE TABLE poteto_threads (
+     thread_id TEXT PRIMARY KEY,
+     activated_at INTEGER NOT NULL,
+     activation_seq_key TEXT NOT NULL UNIQUE,
+     phase TEXT NOT NULL DEFAULT 'activated' CHECK (phase IN ('activated','routed','stalled','complete')),
+     charter_state TEXT NOT NULL DEFAULT 'pending' CHECK (charter_state IN ('pending','sent')),
+     charter_attempts INTEGER NOT NULL DEFAULT 0,
+     charter_next_at INTEGER NOT NULL DEFAULT 0,
+     revivals INTEGER NOT NULL DEFAULT 0,
+     stalled_at INTEGER
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

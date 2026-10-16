@@ -2,9 +2,12 @@
  * The checklist's shell: CLI commands, the session-instruction block, the footer every pstack command
  * prints, and the idle nudge. Pure decisions come from checklist.ts; state from checklist-store.ts.
  */
-import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
+import type { BbPluginApi, PluginCliCommand, MessageDispatchHookDecision } from "@get-bb/plugin-sdk";
 import { cliCommand, PluginCliError } from "@get-bb/plugin-sdk";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { activatesPoteto, potetoCharter, revivalDecision, type PotetoDispatch } from "./poteto.ts";
 import {
   extractSteps, gate, parseEvidence, parseReason, playbookSources, renderOpenSteps, shouldNudge,
   type Evidence, type Resolution,
@@ -20,6 +23,9 @@ export type ChecklistFeature = {
   instructions(threadId: string): string | null;
   /** thread.idle handler for origin threads: sends at most one agent-only nudge per checklist revision. */
   onIdle(threadId: string): Promise<void>;
+  dispatch(context: PotetoDispatch): MessageDispatchHookDecision;
+  reconcile(threadId: string, idle?: boolean): Promise<void>;
+  serve(signal: AbortSignal): Promise<void>;
 };
 
 export function createChecklistFeature(deps: {
@@ -32,9 +38,38 @@ export function createChecklistFeature(deps: {
   /** Called after every committed change so the UI refetches. */
   publish(threadId: string): void;
   evidenceError(evidence: Evidence, threadId: string): Promise<string | null>;
+  clock?: () => number;
 }): ChecklistFeature {
   const { bb, store, publish } = deps;
   const sources = playbookSources(deps.skillsDir);
+  const clock = deps.clock ?? Date.now;
+  const charter = potetoCharter(join(deps.skillsDir, "poteto-mode", "SKILL.md"));
+  const reconciling = new Set<string>();
+  function potetoStatus(id: string): string {
+    const state = store.poteto(id);
+    if (!state) return "";
+    return state.phase === "stalled"
+      ? "Poteto-mode stalled. Begin a checklist with bb pstack checklist begin <playbook> to continue."
+      : `Poteto-mode ${state.phase}.`;
+  }
+  async function reconcile(id: string, idle = false): Promise<void> {
+    if (reconciling.has(id)) return;
+    reconciling.add(id);
+    try {
+      const state = store.poteto(id);
+      if (!state) return;
+      const decision = revivalDecision(state, idle);
+      if (decision === "stall") {
+        if (store.stall(id, clock())) publish(id);
+        return;
+      }
+      if (decision === "revive" && !store.queueRevival(id, state.revivals)) return;
+      const attempt = store.claimCharter(id, clock());
+      if (attempt === null) return;
+      await bb.sdk.threads.send({ threadId: id, mode: "steer-if-active", input: [{ type: "text", text: charter, mentions: [], visibility: "agent-only" }] });
+      if (store.charterSent(id, attempt)) publish(id);
+    } finally { reconciling.delete(id); }
+  }
   const threadOption = { type: "string", description: "Thread to use instead of the invoking thread" } as const;
   function threadId(override: string | undefined, current: string | undefined): string {
     const id = override ?? current;
@@ -54,7 +89,7 @@ export function createChecklistFeature(deps: {
     }
   }
   function footer(id: string): string {
-    const text = renderOpenSteps(store.checklist(id), 4000);
+    const text = [potetoStatus(id), renderOpenSteps(store.checklist(id), 3600)].filter(Boolean).join("\n");
     return text ? `${text}\n` : "";
   }
   function output(id: string, text: string, exitCode = 0) {
@@ -90,7 +125,7 @@ export function createChecklistFeature(deps: {
             if (prSteps.length === 0) return output(id, `No steps found in ${prSource.file}.`, 1);
             steps.push(...prSteps);
           }
-          const result = store.createChecklist(id, name, steps, Date.now());
+          const result = store.createChecklist(id, name, steps, clock());
           if (result.created) publish(id);
           return output(id, result.created ? `Checklist begun with ${steps.length} steps.` : "Checklist already exists.");
         } catch (error) {
@@ -169,14 +204,32 @@ export function createChecklistFeature(deps: {
     });
   }
   return {
-    commands, footer,
+    commands, footer, reconcile,
+    dispatch(context) {
+      if (activatesPoteto(context, bb.pluginId)) store.activate(context.thread.id, `poteto:${context.thread.id}`, clock());
+      return { action: "proceed" };
+    },
+    async serve(signal) {
+      while (!signal.aborted) {
+        for (const id of store.potetoThreads()) {
+          if (signal.aborted) break;
+          try {
+            const thread = await bb.sdk.threads.get({ threadId: id });
+            if (thread.archivedAt !== null || thread.deletedAt !== null || !["active", "starting", "idle", "pending"].includes(thread.status)) continue;
+            await reconcile(id, thread.status === "idle");
+          } catch (error) { bb.log.error(`pstack poteto ${id}: ${error instanceof Error ? error.message : String(error)}`); }
+        }
+        await sleep(15_000, undefined, { signal }).catch(() => undefined);
+      }
+    },
     instructions(id) {
       const checklist = store.checklist(id);
-      if (!checklist) return null;
+      if (!checklist) return store.poteto(id) ? `${potetoStatus(id)}\n${charter}` : null;
       const prefix = "Close each playbook step with evidence or a skip reason. Run bb pstack gate pr before creating a PR and bb pstack gate done before the final reply.\n";
       return prefix + renderOpenSteps(checklist, 1500 - prefix.length);
     },
     async onIdle(id) {
+      if (store.poteto(id)) await reconcile(id, true);
       const checklist = store.checklist(id);
       if (!checklist || !shouldNudge(checklist, await deps.activeWork(id))) return;
       if (!store.markNudged(id, checklist.revision)) return;

@@ -67,9 +67,10 @@ function ThreadBanner({ threadId }: { threadId: string }) {
   if (state.status === "loading") return null;
   if (state.status === "error") return <div className="pstack"><LoadMessage state={state} /></div>;
   const summary = bannerSummary(state.value);
-  if (summary.runs === 0 && summary.open === 0 && state.refreshError === null) return null;
+  if (summary.runs === 0 && summary.open === 0 && !state.value.poteto && state.refreshError === null) return null;
   return <div className="pstack"><div className="ps-banner">
     <span>{summary.runs} active {summary.runs === 1 ? "run" : "runs"} · {summary.open} open checklist {summary.open === 1 ? "step" : "steps"}</span>
+    {state.value.poteto ? <span role="status">Poteto-mode {state.value.poteto}{state.value.poteto === "stalled" ? ". Begin a playbook checklist to continue." : "."}</span> : null}
     <Button type="button" variant="ghost" size="sm" className="ps-action" aria-label="Open runs and checklist" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: "pstack" })}>Open</Button>
   </div><LoadMessage state={state} /></div>;
 }
