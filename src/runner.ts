@@ -287,9 +287,11 @@ export function plan(run: RunSnapshot, now: number): Action[] {
 }
 
 function repairMessage(job: JobSnapshot): string {
+  const turn = `Corrective turn ${job.repairs + 1} of ${MAX_REPAIRS}.`;
+  if (job.result === "text") return `Your final message is your result, and ${job.error}. Reply with your result as your final message. ${turn}`;
   return [
     `Your result does not match the \`${job.result}\` contract: ${job.error}`,
-    `Call \`pstack_result\` exactly once with \`{ "value": ... }\` matching the contract. Corrective turn ${job.repairs + 1} of ${MAX_REPAIRS}.`,
+    `Call \`pstack_result\` exactly once with \`{ "value": ... }\` matching the contract. ${turn}`,
   ].join("\n\n");
 }
 
@@ -379,6 +381,7 @@ function parseJsonText(text: string): { ok: true; value: unknown } | { ok: false
 
 /** Pure: parse a worker's final text or submitted value against its contract. */
 export function acceptResult(kind: ResultKind, value: unknown): { ok: true; value: unknown } | { ok: false; error: string } {
+  if (kind === "text" && (typeof value !== "string" || value.trim() === "")) return { ok: false, error: "it was empty" };
   let candidate = value;
   if (kind !== "text" && typeof value === "string") {
     const parsed = parseJsonText(value);

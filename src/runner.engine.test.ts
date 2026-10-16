@@ -217,6 +217,25 @@ test("a text job succeeds with the worker's final message and rejects pstack_res
   assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => [job.state, job.value]), [["succeeded", "X works like this."]]);
 });
 
+test("a text job whose worker idles with no final message is corrected, then fails, never succeeds empty", async () => {
+  const h = harness();
+  const plan = RunPlan.parse({ kind: "panel", title: "Explain", seats: [{ label: "Explainer", model: { tuple: "codex/gpt-6.1-sol/high" }, prompt: "Explain X." }] });
+  const { runId } = await h.runner.start(plan, "thr_origin");
+  await h.runner.onIdle(h.worker(1), null);
+  assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.state, "running");
+  const [correction] = h.toWorker(h.worker(1));
+  assert.match(correction!.input[0].text, /final message/);
+  assert.doesNotMatch(correction!.input[0].text, /pstack_result/, "a text job has no result tool");
+  h.clock.now += 30_000;
+  await h.runner.onIdle(h.worker(1), "  \n ");
+  assert.equal(h.toWorker(h.worker(1)).length, 2);
+  h.clock.now += 30_000;
+  await h.runner.onIdle(h.worker(1), null);
+  const [job] = h.runner.results(runId, "thr_origin");
+  assert.deepEqual([job!.state, job!.value], ["failed", null]);
+  assert.equal(h.runner.view(runId, "thr_origin").status, "failed");
+});
+
 test("a transient provider failure retries on a fresh thread after the backoff", async () => {
   const h = harness();
   const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
