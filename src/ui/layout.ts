@@ -10,7 +10,8 @@ export const severityOrder: readonly Severity[] = ["critical", "warning", "nit"]
 const severityRank: Record<Severity, number> = { critical: 0, warning: 1, nit: 2 };
 
 export function directiveRunId(attributes: Readonly<Record<string, string>>): string | null {
-  return Object.keys(attributes).length === 1 && RUN_ID.test(attributes.run ?? "") ? attributes.run! : null;
+  const runId = attributes.run;
+  return Object.keys(attributes).length === 1 && typeof runId === "string" && RUN_ID.test(runId) ? runId : null;
 }
 
 export function panelRunId(params: unknown): string | null | undefined {
