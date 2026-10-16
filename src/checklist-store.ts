@@ -2,8 +2,16 @@ import type { Db } from "./store.ts";
 import type { Checklist, Resolution, StepDraft } from "./checklist.ts";
 import { addStep, closeStep, type PlaybookName } from "./checklist.ts";
 import { z } from "zod";
+import type { PotetoThread } from "./poteto.ts";
 
 export type ChecklistStore = {
+  activate(threadId: string, dispatchKey: string, now: number): boolean;
+  poteto(threadId: string): PotetoThread | null;
+  potetoThreads(): string[];
+  queueRevival(threadId: string, revivals: number): boolean;
+  stall(threadId: string, now: number): boolean;
+  claimCharter(threadId: string, now: number): number | null;
+  charterSent(threadId: string, attempt: number): boolean;
   /** Idempotent: a thread keeps its first checklist; beginning again returns it unchanged. */
   createChecklist(threadId: string, playbook: string, steps: readonly StepDraft[], now: number): { created: boolean };
   checklist(threadId: string): Checklist | null;
@@ -15,6 +23,10 @@ export type ChecklistStore = {
 };
 
 export function openChecklistStore(db: Db): ChecklistStore {
+  const potetoSchema = z.object({
+    thread_id: z.string(), activated_at: z.number(), phase: z.enum(["activated", "routed", "stalled", "complete"]),
+    charter_state: z.enum(["pending", "sent"]), charter_attempts: z.number(), charter_next_at: z.number(), revivals: z.number(),
+  });
   const evidence = z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("thread"), id: z.string() }),
     z.object({ kind: z.literal("run"), id: z.string() }),
@@ -49,6 +61,37 @@ export function openChecklistStore(db: Db): ChecklistStore {
     return { threadId, playbook: row.playbook as PlaybookName, revision: row.revision, nudgedAtRevision: row.nudged_at_revision, steps };
   });
   return {
+    activate(threadId, dispatchKey, now) {
+      return db.prepare(`INSERT OR IGNORE INTO poteto_threads (thread_id, activation_seq_key, activated_at, phase)
+        VALUES (?, ?, ?, CASE WHEN EXISTS (SELECT 1 FROM checklists WHERE thread_id = ?) THEN 'routed' ELSE 'activated' END)`)
+        .run(threadId, dispatchKey, now, threadId).changes === 1;
+    },
+    poteto(threadId) {
+      const raw = db.prepare("SELECT * FROM poteto_threads WHERE thread_id = ?").get(threadId);
+      if (!raw) return null;
+      const row = potetoSchema.parse(raw);
+      return { threadId, activatedAt: row.activated_at, phase: row.phase, charterState: row.charter_state,
+        charterAttempts: row.charter_attempts, charterNextAt: row.charter_next_at, revivals: row.revivals };
+    },
+    potetoThreads: () => db.prepare("SELECT thread_id FROM poteto_threads WHERE phase != 'complete'").all().map((row) => z.object({ thread_id: z.string() }).parse(row).thread_id),
+    queueRevival(threadId, revivals) {
+      return db.prepare("UPDATE poteto_threads SET charter_state = 'pending', charter_next_at = 0, revivals = revivals + 1 WHERE thread_id = ? AND phase = 'activated' AND charter_state = 'sent' AND revivals = ?")
+        .run(threadId, revivals).changes === 1;
+    },
+    stall(threadId, now) {
+      return db.prepare("UPDATE poteto_threads SET phase = 'stalled', stalled_at = ? WHERE thread_id = ? AND phase = 'activated' AND charter_state = 'sent'")
+        .run(now, threadId).changes === 1;
+    },
+    claimCharter(threadId, now) {
+      const row = db.prepare(`UPDATE poteto_threads SET charter_attempts = charter_attempts + 1, charter_next_at = ?
+        WHERE thread_id = ? AND phase != 'stalled' AND charter_state = 'pending' AND charter_next_at <= ? RETURNING charter_attempts`)
+        .get(now + 30_000, threadId, now);
+      return row ? z.object({ charter_attempts: z.number() }).parse(row).charter_attempts : null;
+    },
+    charterSent(threadId, attempt) {
+      return db.prepare("UPDATE poteto_threads SET charter_state = 'sent' WHERE thread_id = ? AND charter_state = 'pending' AND charter_attempts = ?")
+        .run(threadId, attempt).changes === 1;
+    },
     checklist: read,
     createChecklist: db.transaction((threadId: string, playbook: string, steps: readonly StepDraft[], now: number) => {
       const created = db.prepare("INSERT OR IGNORE INTO checklists (thread_id, playbook, created_at) VALUES (?, ?, ?)")
@@ -56,6 +99,7 @@ export function openChecklistStore(db: Db): ChecklistStore {
       if (created) {
         const insert = db.prepare("INSERT INTO steps (thread_id, id, position, section, after_pr, text) VALUES (?, ?, ?, ?, ?, ?)");
         for (const [index, step] of steps.entries()) insert.run(threadId, index + 1, index, step.section, Number(step.afterPr), step.text);
+        db.prepare("UPDATE poteto_threads SET phase = 'routed', stalled_at = NULL WHERE thread_id = ? AND phase IN ('activated','stalled')").run(threadId);
       }
       return { created };
     }).immediate,

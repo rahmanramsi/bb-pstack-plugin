@@ -63,5 +63,5 @@ test("checklist retains status, evidence and skip reason within its original sec
   assert.deepEqual(groups.map((group) => [group.section, group.steps.map((step) => step.id)]), [["playbook", ["1", "2"]], ["pr", ["3"]]]);
   assert.deepEqual(groups[0]!.steps[1]!.evidence, ["commit:abc"]);
   assert.equal(groups[1]!.steps[0]!.reason, "Local only");
-  assert.deepEqual(bannerSummary({ revision: 1, activeRuns: [], checklist }), { runs: 0, open: 1 });
+  assert.deepEqual(bannerSummary({ poteto: null, revision: 1, activeRuns: [], checklist }), { runs: 0, open: 1 });
 });

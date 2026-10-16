@@ -195,6 +195,7 @@ export const ChecklistView = z.object({
 });
 
 export const ThreadView = z.object({
+  poteto: z.enum(["activated", "routed", "stalled", "complete"]).nullable().default(null),
   revision: z.number().int(),
   activeRuns: z.array(RunView.pick({ id: true, kind: true, title: true, status: true, jobs: true })),
   checklist: ChecklistView.nullable(),
