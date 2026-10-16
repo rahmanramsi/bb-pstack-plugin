@@ -10,6 +10,9 @@
  * thread id is attached, recovery adopts a hidden plugin-owned thread whose metadata names the attempt, and
  * otherwise marks the job `uncertain` until the run deadline. It never spawns again for an issued attempt,
  * because the SDK spawn has no idempotency key and a late success would duplicate the seat or judge.
+ *
+ * Cleanup rule: once an attempt finishes (accepted, failed, past the deadline or cancelled), its worker is
+ * stopped by every tick of its run, finished or not, until a stop succeeds or the thread is gone.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -204,7 +207,7 @@ export type Action =
   | { type: "fail"; job: string; error: string }
   | { type: "finish"; status: Exclude<RunSnapshot["status"], "running"> };
 
-const TERMINAL: ReadonlySet<JobState> = new Set(["succeeded", "failed", "skipped", "cancelled"]);
+export const TERMINAL: ReadonlySet<JobState> = new Set(["succeeded", "failed", "skipped", "cancelled"]);
 export const LIVE: ReadonlySet<JobState> = new Set(["running", "repairing", "uncertain"]);
 
 function retryable(job: JobSnapshot): boolean {
@@ -633,13 +636,24 @@ export function createRunner(
     timers.add(timer);
   }
 
-  async function stopWorker(threadId: string | null | undefined): Promise<void> {
-    if (!threadId) return;
+  async function stopWorker(threadId: string): Promise<boolean> {
     try {
       await bb.sdk.threads.stop({ threadId });
+      return true;
     } catch (error) {
-      if (!isMissingThread(error)) bb.log.warn(`Could not stop pstack worker ${threadId}: ${message(error)}`);
+      if (isMissingThread(error)) return true;
+      bb.log.warn(`Could not stop pstack worker ${threadId}: ${message(error)}`);
+      return false;
     }
+  }
+
+  /** Stops every worker whose attempt finished, and records each confirmed stop so a failed one is retried by the next tick. */
+  async function cleanUp(runId: RunId): Promise<void> {
+    await Promise.all(
+      store.pendingCleanup(runId).map(async (threadId) => {
+        if (await stopWorker(threadId)) store.markCleaned(threadId);
+      }),
+    );
   }
 
   function currentJob(ref: AttemptRef): { snapshot: RunSnapshot; job: JobSnapshot } | null {
@@ -795,11 +809,8 @@ export function createRunner(
         if (moved) wakeAt(runId, action.at);
         return moved;
       }
-      case "fail": {
-        const moved = store.transitionJobAndAttempt(runId, job.key, job.state, "failed", { error: action.error });
-        if (moved) await stopWorker(liveAttempt(job)?.threadId);
-        return moved;
-      }
+      case "fail":
+        return store.transitionJobAndAttempt(runId, job.key, job.state, "failed", { error: action.error });
       case "repair": {
         const threadId = liveAttempt(job)?.threadId;
         if (!threadId) return store.transitionJobAndAttempt(runId, job.key, "repairing", "failed", { error: "the worker thread is unknown" });
@@ -842,6 +853,7 @@ export function createRunner(
         if (!changed.some(Boolean)) break;
       }
     }
+    await cleanUp(runId);
     publish(info.origin.threadId);
     await notify(runId);
   }
@@ -887,13 +899,8 @@ export function createRunner(
   }
 
   async function cancel(runId: RunId): Promise<boolean> {
-    const snapshot = store.snapshot(runId);
-    if (!snapshot || !store.finishRun(runId, "cancelled", clock())) return false;
-    const live = snapshot.jobs.map((job) => liveAttempt(job)?.threadId);
-    for (const job of snapshot.jobs) {
-      if (!["succeeded", "failed", "skipped", "cancelled"].includes(job.state)) store.transitionJobAndAttempt(runId, job.key, job.state, "cancelled");
-    }
-    await Promise.all(live.map(stopWorker));
+    if (!store.cancelRun(runId, clock())) return false;
+    await cleanUp(runId);
     publish(store.info(runId)!.origin.threadId);
     return true;
   }
@@ -993,7 +1000,6 @@ export function createRunner(
       if (!store.transitionJobAndAttempt(ref.runId, job.key, job.state, "succeeded", { valueJson: JSON.stringify(accepted.value), error: null })) {
         return { ok: false, error: "This worker's job changed state before the result was recorded." };
       }
-      await stopWorker(workerThreadId);
       await reconcile(ref.runId);
       return { ok: true };
     },
