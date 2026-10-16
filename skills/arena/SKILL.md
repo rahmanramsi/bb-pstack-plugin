@@ -19,7 +19,7 @@ Every candidate gets the same prompt, so the prompt is the contract.
 
 ## Phase B: Fan out
 
-**Launch path.** When candidates only write to their own `/tmp/arena-<slug>/candidate-<n>/` paths (no worktree needed), run `bb pstack workflow ready`. If it exits 0, launch the fan-out as the bundled `pstack-panel` workflow with one seat per runner tuple, each seat's prompt naming its own output path, and the Phase C cross-judge as the `judge` with the rubric in its prompt, so Phase C is done when the run finishes. Collect the result as [`../swarm/references/bb-workflows.md`](../swarm/references/bb-workflows.md) describes. Otherwise spawn child threads as below.
+**Launch path.** When candidates only write to their own `/tmp/arena-<slug>/candidate-<n>/` paths, launch the fan-out and the Phase C cross-judge as one pstack run ([`../poteto-mode/references/pstack-runs.md`](../poteto-mode/references/pstack-runs.md)): a `panel` with one seat per runner, each seat's prompt naming its own output path, and the cross-judge as its `judge` on `{ "role": "arena cross-judge pool" }`, which picks a provider that differs from this thread's. Phase C is then done when the run finishes. When candidates need their own checkout, spawn child threads as below.
 
 Spawn all N candidates at once as child threads (`bb thread spawn --parent-self --project "$BB_PROJECT_ID" --title "arena candidate <n>" --prompt-file -` plus the runner's model flags), each with the task, the path to the shared grounding, its own output path, and instructions to produce the artifact and a short rationale naming the alternatives it considered and what it rejected.
 

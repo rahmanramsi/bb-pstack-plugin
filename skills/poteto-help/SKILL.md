@@ -25,7 +25,8 @@ Infer the need from the message and the conversation. A named situation, such as
 Check the state that changes the answer, and mention it only when it does:
 
 - When `bb pstack models` marks every role `(default)`, `/setup-pstack` hasn't run for this user, so every role uses its default model.
-- A `FAIL` line from `bb pstack doctor` means a role points at a model this machine doesn't have, or the bundled workflows aren't readable. A `workflows plugin` line that isn't ok means panels run as child threads instead of one bb workflow. Mention it when the question is about a broken or slow run.
+- A `FAIL` line from `bb pstack doctor` means a role points at a model this machine doesn't have. Mention it when the question is about a broken or slow run.
+- `bb pstack checklist show` lists the thread's open playbook steps. Mention them when the user asks why a run stopped short or why `bb pstack gate pr` fails.
 - No `verify-*` skill or other app harness in the project means agents have no scripted way to drive the app. Mention `/create-verification-skill` when the question is about proving a change works.
 
 When the model configuration is missing and it matters, ask whether the user wants to pick a model for each role and a reasoning budget now. It matters when the user is new, the question is about setup or cost, or the answer depends on which models run. Ask at most once per chat. If the need is also unclear, ask both questions together. Offer two choices:
@@ -47,7 +48,7 @@ pstack is built for bb. Its skills use the Agent Skills format, so other tools c
 
 ## Start a task with `/poteto-mode`
 
-`/poteto-mode` matches the task to a playbook, copies the playbook's steps into the todo list, and runs the other skills as the steps need them. A step it skips stays in the list as `skip: <reason>`. A good prompt states the goal and how to tell it's done. It doesn't list skills, because a hand-written sequence tends to drop or reorder steps the playbook would keep. Read [`references/prompting.md`](references/prompting.md) before you help word one. [Guide page 2](../../docs/guide/02-poteto-mode.md) has examples.
+`/poteto-mode` matches the task to a playbook, has the plugin copy the playbook's steps into the thread's checklist, and runs the other skills as the steps need them. A step it skips is closed with a reason, and `bb pstack gate pr` fails while any step is open. A good prompt states the goal and how to tell it's done. It doesn't list skills, because a hand-written sequence tends to drop or reorder steps the playbook would keep. Read [`references/prompting.md`](references/prompting.md) before you help word one. [Guide page 2](../../docs/guide/02-poteto-mode.md) has examples.
 
 Whether `/poteto-mode` stays on depends on how the user starts it:
 

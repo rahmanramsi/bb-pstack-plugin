@@ -31,12 +31,11 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 | command | what it does |
 |---|---|
 | `bb pstack models [--role <role>] [--json]` | the model each role uses, configured values merged over the defaults. |
-| `bb pstack doctor` | checks every role against the live provider catalog and whether bb workflows are ready. run it after setup. |
-| `bb pstack workflow ready` | exits 0 when bb workflows can run pstack's bundled workflows. skills check it before choosing between a workflow and child threads. |
-| `bb pstack workflow list` | the bb workflows pstack bundles: `pstack-panel` and `pstack-swarm`. |
-| `bb pstack workflow source <name>` | prints a bundled workflow for `bb workflows run --script` or the `bb_workflow_run` tool. |
-
-enable bb's `workflows` plugin (`bb plugin enable workflows`) to get the most out of pstack. with it, review panels and fan-outs run as one durable bb workflow with a live progress card, retries, and validated results, instead of a pile of child threads.
+| `bb pstack doctor` | checks every role against the live provider catalog. run it after setup. |
+| `bb pstack run start --file <plan.json>` | runs a review panel or a swarm on hidden worker threads, with a live card in the chat. skills write the plan for you. |
+| `bb pstack run status <id>` / `run stop <id>` | a run's progress and results, or stop it. |
+| `bb pstack checklist begin <playbook>` | copies a playbook's steps into the thread's checklist. `checklist done <id> --evidence …`, `checklist skip <id> --reason …` and `checklist add` close and extend it. |
+| `bb pstack gate pr` / `gate done` | exit 1 while checklist steps are open. `/poteto-mode` runs them before it opens a PR and before its final reply. |
 
 ## get started
 
@@ -220,7 +219,11 @@ delegates are child bb threads (`bb thread spawn --parent-self`), each on the pr
 
 a delegate spawned during a run is a **poteto delegate**: its prompt starts with the [poteto delegate preamble](./skills/poteto-mode/references/poteto-agent.md), which makes it load `poteto-mode` in full, including its inline principles index, before doing any work. a plain thread skips that read and drifts. do not spawn a poteto delegate to run the playbook itself.
 
-panels and fan-outs (`arena`, `swarm`, `interrogate`, `architect`, `how`, `why`, `reflect`) run as pstack's bundled bb workflows when bb's `workflows` plugin is running: `pstack-panel` puts one prompt in front of several models and can hand every answer to a judge or synthesizer, and `pstack-swarm` runs one brief across many slices with a structured report and an optional verifier per slice. without the workflows plugin, and for writers that need their own worktree, they spawn one child thread per worker. see [`swarm/references/bb-workflows.md`](./skills/swarm/references/bb-workflows.md).
+panels and fan-outs (`arena`, `swarm`, `interrogate`, `architect`, `how`, `why`, `reflect`) run as one pstack run: a panel puts several models in front of the same task and can hand every answer to a judge or synthesizer, and a swarm runs one brief across many slices with a structured report and an optional verifier per slice. workers are hidden threads you reach from the run's card. writers that need their own checkout stay child threads. see [`pstack-runs.md`](./skills/poteto-mode/references/pstack-runs.md).
+
+## the checklist
+
+`/poteto-mode` doesn't ask the agent to copy a playbook into its own todo list. the plugin copies the steps, verbatim, and the agent closes each one with evidence (a thread, a run, a commit, a path, a pr) or a one-line reason for skipping it. the open steps show in the thread and at the end of every `bb pstack` command. `bb pstack gate pr` fails while steps are open, so a skipped `how` or `architect` can't slide into a pr unnoticed.
 
 pstack also ships [Comment Sicko](./skills/no-comments/references/comment-sicko.md), a comment reviewer that only deletes comments. usually invoke it through [`/no-comments`](./skills/no-comments/SKILL.md), not directly.
 

@@ -28,7 +28,7 @@ Skip Phase A only when the work is genuinely greenfield with no surrounding syst
 
 Run the **arena** skill with the design-sketch task and the Phase A grounding artifacts. Pass `references/runner-prompt.md` as each runner's prompt.
 
-Take the runners from the `architect runners` line of the pstack `models` setting (`bb pstack models` prints the effective table), in place of the `arena runners` line. If that line is missing, use `claude-code/claude-opus-5-5/xhigh` and `codex/gpt-6.1-sol/xhigh`. Alias and rejected entries follow the runner rules in the **arena** skill's Phase A. Runners only sketch, so the arena's launch path applies: when `bb pstack workflow ready` exits 0, they run as the bundled `pstack-panel` workflow, one seat per runner. See [`../swarm/references/bb-workflows.md`](../swarm/references/bb-workflows.md).
+Take the runners from the `architect runners` line of the pstack `models` setting (`bb pstack models` prints the effective table), in place of the `arena runners` line. If that line is missing, use `claude-code/claude-opus-5-5/xhigh` and `codex/gpt-6.1-sol/xhigh`. Alias and rejected entries follow the runner rules in the **arena** skill's Phase A. Runners only sketch, each into its own directory, so they run as one pstack run per the arena's launch path, with a seat on `{ "role": "architect runners" }` that expands into one runner per configured entry. See [`../poteto-mode/references/pstack-runs.md`](../poteto-mode/references/pstack-runs.md).
 
 Design it twice. Require at least two structurally distinct candidates before synthesis, even when the first looks sufficient. This is the **exhaust-the-design-space** principle skill made concrete. Whole-shape alternatives, not point fixes inside one shape.
 

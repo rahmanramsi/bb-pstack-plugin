@@ -8,9 +8,9 @@ disable-model-invocation: true
 
 Investigate the motivation and intent behind code. The companion `how` skill answers what the code does and how it works. `why` answers what forces led to its shape.
 
-Each spawn below names a role line of the pstack `models` setting and a default (`bb pstack models` prints the effective table). Pass that line's tuple as `--provider <id> --model <model> --reasoning-level <level>`, or the default if the line is missing. Omit the three flags when the value is `inherit-parent`. If `bb thread spawn` rejects a tuple, use the default and say so. If it rejects the default, use the closest valid model of the same provider from `bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json`. Pick each subagent's reasoning level and fast or standard speed for the job, per the Subagents section of the **poteto-mode** skill.
+Investigators and the synthesizer run together as one pstack run ([`../poteto-mode/references/pstack-runs.md`](../poteto-mode/references/pstack-runs.md)). Each names a role line of the pstack `models` setting with a default (`bb pstack models` prints the effective table). If `bb pstack run start` rejects a tuple, use the default as an explicit `{ "tuple": … }` and say so. If it rejects the default, use the closest valid model of the same provider from `bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json`. Pick each worker's reasoning level for the job, per the Subagents section of the **poteto-mode** skill.
 
-Every spawn is a plain child thread: `bb thread spawn --parent-self --project "$BB_PROJECT_ID" --environment "$BB_ENVIRONMENT_ID" --title "<short>" --prompt-file -`. It keeps MCP access, which the MCP-backed investigators and the synthesizer's citation spot-checks need. Investigators still shouldn't write anything. Say so in each prompt. Read each result with `bb thread output <id>`.
+Run workers are ordinary threads on their provider, so they keep its MCP access, which the MCP-backed investigators and the synthesizer's citation spot-checks need. Investigators still shouldn't write anything. Say so in each prompt.
 
 ## Operating Posture
 
@@ -46,9 +46,7 @@ Map each available MCP to one evidence category:
 
 Source control is always available through git and `gh`. For the other six, classify using the MCP name, server instructions, tool names, and resource descriptors. If an MCP could fit more than one category, choose the one matching its primary evidence. Record ambiguous cases in the coverage map.
 
-**Launch path.** Run `bb pstack workflow ready` before spawning anything. If it exits 0, launch the investigators and the synthesizer together as the bundled `pstack-panel` workflow (one seat per investigator with its own filled prompt on the `why investigators` tuple, and the Step 4 synthesizer as the `judge` on the `why synthesizer` tuple. Workflow workers are ordinary threads on their provider, so they keep its MCP access) with `bb workflows run --script "$(bb pstack workflow source pstack-panel)" --args …`, collect the result as [`../swarm/references/bb-workflows.md`](../swarm/references/bb-workflows.md) describes, and skip the child-thread instructions below. If it exits 1, spawn child threads as below.
-
-Spawn one investigator per category that has a matching MCP, all at once so they run concurrently, each owning exactly one tool or MCP. Don't ask one agent to cover multiple MCPs. Tuple: the `why investigators` line, default `codex/gpt-6.1-sol/xhigh`.
+Launch one `panel` seat per category that has a matching MCP, so they run concurrently, each owning exactly one tool or MCP. Don't ask one agent to cover multiple MCPs. Model: `{ "role": "why investigators" }`, default `codex/gpt-6.1-sol/xhigh`.
 
 Each investigator's prompt is `references/investigator-prompt.md` filled in, plus:
 - the category playbook `references/sources/<source>.md` for the selected MCP, adapted from the examples in `references/source-playbook.md`
@@ -78,8 +76,8 @@ If your scope assessment suggests a single-commit trivial target where the PR de
 
 ## Step 4. Synthesize
 
-Spawn one synthesizer. Tuple: the `why synthesizer` line, default `claude-code/claude-opus-5-5/xhigh`. It gets:
-1. The investigator findings, including any null results and any categories skipped with justification
+The synthesizer is the same run's `judge`, on `{ "role": "why synthesizer" }`, default `claude-code/claude-opus-5-5/xhigh`. The run hands it every investigator's outcome, null results and failures included. Its prompt carries:
+1. Any categories skipped with justification
 2. The code anchor
 3. The user's original question
 4. The epistemics framework from `references/epistemics.md`

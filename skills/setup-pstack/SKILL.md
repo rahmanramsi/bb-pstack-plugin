@@ -70,7 +70,7 @@ A role with no line falls back to the skill default. `inherit-parent` as a value
 
 ### 6. Confirm
 
-Run `bb pstack doctor`. It checks every effective role against the live provider catalog and reports whether bb workflows are ready for pstack's panels. Fix any `FAIL` line before you finish. Then show the result with `bb pstack models`. Tell the user the configuration was written and that it applies to new threads, and to existing threads when their provider session next starts. Re-running this skill updates it.
+Run `bb pstack doctor`. It checks every effective role against the live provider catalog. Fix any `FAIL` line before you finish. Then show the result with `bb pstack models`. Tell the user the configuration was written and that it applies to new threads, and to existing threads when their provider session next starts. Re-running this skill updates it.
 
 ### 7. Offer a verification skill (optional)
 
