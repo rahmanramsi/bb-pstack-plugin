@@ -18,8 +18,8 @@ function checklist(name = "feature"): Checklist {
   assert.ok(pr);
   steps.push(...extractSteps(readFileSync(pr[1].file, "utf8"), pr[1].extractor, "pr"));
   return {
-    threadId: "thr_test", playbook: entry[0], revision: 0, nudgedAtRevision: null,
-    steps: steps.map((step, index) => ({ ...step, id: index + 1, resolution: { kind: "open" } })),
+    threadId: "thr_test", playbook: entry[0], revision: 0, nudgedAtRevision: null, createdAt: 1,
+    steps: steps.map((step, index) => ({ ...step, id: index + 1, openedAt: 1, resolution: { kind: "open" } })),
   };
 }
 
@@ -49,8 +49,8 @@ test("every real playbook and figure-it-out yields steps and every after-PR labe
 test("numbered extraction folds sub-bullets verbatim and ignores fenced examples and reply prose", () => {
   const markdown = "# Steps\n\n```md\n1. Example\n```\n\n1. First.\n   - Nested.\n\n   More detail.\n2. Second.\n\n**Reply:** hand back.\n";
   assert.deepEqual(extractSteps(markdown, "numbered", "playbook"), [
-    { section: "playbook", text: "1. First.\n   - Nested.\n\n   More detail.", afterPr: false },
-    { section: "playbook", text: "2. Second.", afterPr: false },
+    { section: "playbook", text: "1. First.\n   - Nested.\n\n   More detail.", skipPolicy: "agent", afterPr: false },
+    { section: "playbook", text: "2. Second.", skipPolicy: "agent", afterPr: false },
   ]);
 });
 
@@ -58,8 +58,7 @@ test("closing only feature step 4 cannot pass the PR gate", () => {
   let state = checklist();
   const done: Resolution = { kind: "done", evidence: [{ kind: "path", path: "src/checklist.ts" }] };
   const result = closeStep(state, 4, done);
-  assert.ok(result.ok);
-  state = result.checklist;
+  assert.equal(result.ok, false);
   const prGate = gate("pr", state);
   assert.ok(!prGate.pass);
   for (const id of [1, 2, 3]) assert.ok(prGate.open.some((step) => step.id === id));
@@ -68,7 +67,7 @@ test("closing only feature step 4 cannot pass the PR gate", () => {
   for (const step of prSteps) assert.ok(prGate.open.some((open) => open.id === step.id));
   assert.ok(prGate.open.every((step) => !step.afterPr));
   for (const step of prGate.open) {
-    const next = closeStep(state, step.id, step.id % 2 ? done : { kind: "skipped", reason: "Does not apply to this change." });
+    const next = closeStep(state, step.id, step.id % 2 || step.skipPolicy !== "agent" ? done : { kind: "skipped", reason: "Does not apply to this change." });
     assert.ok(next.ok);
     state = next.checklist;
   }
@@ -152,14 +151,43 @@ test("a playbook step that runs Opening a PR is an after-PR step, so gate pr doe
 
 test("a truncated open-steps block always ends with the full remainder notice", () => {
   const steps = Array.from({ length: 30 }, (_, index) => ({
-    id: index + 1, section: "playbook" as const, afterPr: false, resolution: { kind: "open" as const },
+    id: index + 1, openedAt: 1, section: "playbook" as const, skipPolicy: "agent" as const, afterPr: false, resolution: { kind: "open" as const },
     text: `Step ${index + 1} ${"x".repeat(index * 7)}`,
   }));
-  const checklist = { threadId: "thr_x", playbook: "feature" as never, steps, revision: 0, nudgedAtRevision: null };
+  const checklist = { threadId: "thr_x", playbook: "feature" as never, steps, revision: 0, nudgedAtRevision: null, createdAt: 1 };
   for (let max = 120; max <= 4000; max += 37) {
     const text = renderOpenSteps(checklist, max);
     assert.ok(text.length <= max, `length at ${max}`);
     const shown = text.split("\n").filter((line) => /^\d+\. \[/.test(line)).length;
     if (shown < steps.length) assert.match(text, new RegExp(`\\n${steps.length - shown} more open steps\\. Run bb pstack checklist show\\.$`), `notice at ${max}`);
   }
+});
+
+test("skip policy markers are parsed once and hidden from checklist text", () => {
+  const state = checklist();
+  assert.deepEqual(state.steps.slice(0, 4).map((step) => step.skipPolicy), ["user", "user", "agent", "never"]);
+  assert.equal(state.steps.some((step) => step.text.includes("pstack: skip=")), false);
+  assert.throws(() => extractSteps("1. Work <!-- pstack: skip=maybe -->", "numbered", "playbook"), /Unknown pstack skip policy/);
+});
+
+test("ordered closure rejects agent waivers and never-skippable steps but leaves PR steps unordered", () => {
+  let state = checklist();
+  const skip = { kind: "skipped", reason: "Already implemented." } as const;
+  const first = closeStep(state, 1, skip);
+  assert.ok(!first.ok);
+  assert.match(first.error, /user must send \/poteto-mode waive 1/);
+  for (const id of [1, 2]) {
+    const result = closeStep(state, id, skip, "user");
+    assert.ok(result.ok);
+    state = result.checklist;
+  }
+  const third = closeStep(state, 3, skip);
+  assert.ok(third.ok);
+  state = third.checklist;
+  const fourth = closeStep(state, 4, skip, "user");
+  assert.ok(!fourth.ok);
+  assert.match(fourth.error, /cannot be skipped.*done 4 --evidence/);
+  const pr = state.steps.find((step) => step.section === "pr");
+  assert.ok(pr);
+  assert.equal(closeStep(state, pr.id, skip).ok, true);
 });

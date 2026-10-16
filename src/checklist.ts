@@ -12,6 +12,7 @@ import { isDeepStrictEqual } from "node:util";
 export type PlaybookName = string & { readonly __brand: "PlaybookName" };
 
 export type StepSection = "playbook" | "pr";
+export type SkipPolicy = "agent" | "user" | "never";
 
 /** Opening a PR paragraphs that can only be done once the PR exists. `gate pr` ignores them; `gate done` does not. A test fails if a label disappears from the source. */
 export const AFTER_PR_LEADS = ["Readiness"] as const;
@@ -19,8 +20,8 @@ export const AFTER_PR_LEADS = ["Readiness"] as const;
 /** A playbook step that runs Opening a PR creates the PR, so it can only close once the PR exists. */
 export const RUNS_OPENING_A_PR = /\bRun \*\*Opening a PR\*\*/;
 
-/** A step as extracted from source, before it is stored. `text` is the source Markdown, verbatim. */
-export type StepDraft = { section: StepSection; text: string; afterPr: boolean };
+/** A source step with policy markers removed from the displayed Markdown. */
+export type StepDraft = { section: StepSection; text: string; afterPr: boolean; skipPolicy: SkipPolicy };
 
 export type Evidence =
   | { kind: "thread"; id: string }
@@ -34,7 +35,7 @@ export type Resolution =
   | { kind: "done"; evidence: readonly [Evidence, ...Evidence[]] }
   | { kind: "skipped"; reason: string };
 
-export type Step = { id: number; section: StepSection; text: string; afterPr: boolean; resolution: Resolution };
+export type Step = StepDraft & { id: number; openedAt: number | null; resolution: Resolution };
 
 export type Checklist = {
   threadId: string;
@@ -44,6 +45,7 @@ export type Checklist = {
   revision: number;
   /** The revision at which the one idle nudge was sent, or null. */
   nudgedAtRevision: number | null;
+  createdAt: number;
 };
 
 /** Where each playbook's steps come from and how to extract them. One table, no branching elsewhere. */
@@ -76,8 +78,8 @@ export function extractSteps(markdown: string, extractor: Extractor, section: St
   function flush() {
     if (current.length > 0) {
       while (current.at(-1)?.trim() === "") current.pop();
-      const text = current.join("\n");
-      steps.push({ section, text, afterPr: afterPr || (extractor === "numbered" && RUNS_OPENING_A_PR.test(text)) });
+      const parsed = parseSkipPolicy(current.join("\n"));
+      steps.push({ section, ...parsed, afterPr: afterPr || (extractor === "numbered" && RUNS_OPENING_A_PR.test(parsed.text)) });
       current = [];
     }
   }
@@ -109,6 +111,31 @@ export function extractSteps(markdown: string, extractor: Extractor, section: St
   }
   flush();
   return steps;
+}
+
+export function parseSkipPolicy(source: string): { text: string; skipPolicy: SkipPolicy } {
+  let skipPolicy: SkipPolicy = "agent";
+  const text = source.replace(/<!--\s*pstack:\s*skip=([^>]*?)\s*-->/g, (_marker, value: string) => {
+    if (value !== "agent" && value !== "user" && value !== "never") throw new Error(`Unknown pstack skip policy "${value}".`);
+    skipPolicy = value;
+    return "";
+  }).split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
+  return { text, skipPolicy };
+}
+
+export function closureError(checklist: Checklist, step: Step, resolution: Exclude<Resolution, { kind: "open" }>, actor: "agent" | "user"): string | null {
+  const first = checklist.steps.find((candidate) => candidate.section === "playbook" && candidate.resolution.kind === "open");
+  if (step.section === "playbook" && first && first.id !== step.id) return `Step ${first.id} is still open. Close it before step ${step.id}. Run bb pstack checklist show.`;
+  if (resolution.kind !== "skipped") return null;
+  if (step.skipPolicy === "never") return `Step ${step.id} cannot be skipped. Complete it with evidence using bb pstack checklist done ${step.id} --evidence <reference>.`;
+  if (step.skipPolicy === "user" && actor !== "user") return `Step ${step.id} needs a user waiver. The user must send /poteto-mode waive ${step.id} <reason>.`;
+  return null;
+}
+
+export function evidenceFreshnessError(evidence: Evidence, createdAt: number, openedAt: number): string | null {
+  if (createdAt >= openedAt) return null;
+  const label = evidence.kind === "thread" || evidence.kind === "run" ? `${evidence.kind}:${evidence.id}` : evidence.kind;
+  return `${label} predates this step. Start fresh work after the step opens, then close it with that new thread: or run: reference.`;
 }
 
 /** Boundary parser for `--evidence thread:thr_x`, `run:psr_…`, `commit:<sha>`, `path:<p>`, `pr:<url>`. */
@@ -149,6 +176,7 @@ export function closeStep(
   checklist: Checklist,
   stepId: number,
   resolution: Exclude<Resolution, { kind: "open" }>,
+  actor: "agent" | "user" = "agent",
 ): { ok: true; checklist: Checklist; changed: boolean } | { ok: false; error: string } {
   const step = checklist.steps.find((step) => step.id === stepId);
   if (!step) return { ok: false, error: `Step ${stepId} does not exist.` };
@@ -157,6 +185,8 @@ export function closeStep(
       ? { ok: true, checklist, changed: false }
       : { ok: false, error: `Step ${stepId} already has a different resolution.` };
   }
+  const problem = closureError(checklist, step, resolution, actor);
+  if (problem) return { ok: false, error: problem };
   return { ok: true, changed: true, checklist: {
     ...checklist,
     revision: checklist.revision + 1,
@@ -174,7 +204,7 @@ export function addStep(checklist: Checklist, text: string, afterId: number | nu
   if (afterId !== null && index < 0) return { ok: false, error: `Step ${afterId} does not exist.` };
   const step: Step = {
     id: Math.max(0, ...checklist.steps.map((step) => step.id)) + 1,
-    section: "playbook", text, afterPr: false, resolution: { kind: "open" },
+    section: "playbook", text, afterPr: false, skipPolicy: "agent", openedAt: null, resolution: { kind: "open" },
   };
   const steps = [...checklist.steps];
   steps.splice(index + 1, 0, step);

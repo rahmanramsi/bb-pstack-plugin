@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createChecklistFeature } from "./checklist-commands.ts";
 import { openChecklistStore } from "./checklist-store.ts";
+import { evidenceFreshnessError } from "./checklist.ts";
 import { STATE_CHANNEL } from "./contract.ts";
 import { rpcContract } from "./rpc.ts";
 import { createRunFeature } from "./run-commands.ts";
@@ -169,13 +170,15 @@ export default async function plugin(bb: BbPluginApi) {
       return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
     },
     publish: (threadId) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: Date.now() }),
-    evidenceError: async (evidence, threadId) => {
+    evidenceError: async (evidence, threadId, openedAt) => {
       if (evidence.kind === "thread") {
-        const found = await bb.sdk.threads.get({ threadId: evidence.id }).then(() => true, () => false);
-        return found ? null : `Thread ${evidence.id} does not exist.`;
+        const found = await bb.sdk.threads.get({ threadId: evidence.id }).catch(() => null);
+        return found ? evidenceFreshnessError(evidence, found.createdAt, openedAt) : `Thread ${evidence.id} does not exist. Start a new evidence thread and use its thread: reference.`;
       }
       if (evidence.kind === "run") {
-        return runStore.info(evidence.id as RunId)?.origin.threadId === threadId ? null : `Run ${evidence.id} is not a run started from this thread.`;
+        const found = runStore.info(evidence.id as RunId);
+        return found?.origin.threadId === threadId ? evidenceFreshnessError(evidence, found.createdAt, openedAt)
+          : `Run ${evidence.id} is not a run started from this thread. Start a run here and use its run: reference.`;
       }
       return null;
     },
