@@ -26,7 +26,7 @@ import {
 } from "./models.ts";
 import {
   checkRoles,
-  failedRequired,
+  failedChecks,
   providerIds,
   renderChecks,
   type Check,
@@ -282,7 +282,7 @@ export default async function plugin(bb: BbPluginApi) {
             const checks: Check[] = checkRoles(roles, catalog);
 
 
-            const failed = failedRequired(checks);
+            const failed = failedChecks(checks);
             return {
               exitCode: failed.length > 0 ? 1 : 0,
               stdout: input.options.json

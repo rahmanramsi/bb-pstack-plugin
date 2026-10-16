@@ -153,7 +153,7 @@ export function createChecklistFeature(deps: {
         const result = store.addStep(id, input.positionals.text, input.options.after ?? null);
         if ("error" in result) return output(id, result.error, 1);
         publish(id);
-        return output(id, `Added step ${result.id}.`);
+        return output(id, `Added step ${result.id}. To add the next step after it, pass --after ${result.id}.`);
       },
     }),
   };

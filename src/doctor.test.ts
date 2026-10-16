@@ -3,7 +3,7 @@ import { test } from "node:test";
 import {
   checkRoles,
   checkTuple,
-  failedRequired,
+  failedChecks,
   providerIds,
   renderChecks,
   type Catalog,
@@ -30,15 +30,15 @@ test("each kind of missing tuple names what is missing", () => {
   assert.match(checkTuple("empty/m/low", catalog).detail, /\(has none\)/);
 });
 
-test("role checks name the role and value, and only required failures fail the run", () => {
+test("role checks name the role and value, and every failure fails the run", () => {
   const checks = checkRoles(
     [{ role: "bug-fix", panel: false, source: "configured", models: ["codex/gpt-9/low"] }],
     catalog,
   );
   assert.equal(checks[0]?.subject, "bug-fix: codex/gpt-9/low");
-  const all = [...checks, { ok: false, required: false, subject: "workflows plugin", detail: "off" }];
-  assert.deepEqual(failedRequired(all).map((check) => check.subject), ["bug-fix: codex/gpt-9/low"]);
-  assert.match(renderChecks(all), /^FAIL  bug-fix: codex\/gpt-9\/low .*\nwarn  workflows plugin  \(off\)$/);
+  const all = [...checks, { ok: true, subject: "swarm workers: codex/gpt-6.1-sol/xhigh", detail: "available" }];
+  assert.deepEqual(failedChecks(all).map((check) => check.subject), ["bug-fix: codex/gpt-9/low"]);
+  assert.match(renderChecks(all), /^FAIL  bug-fix: codex\/gpt-9\/low .*\nok    swarm workers/);
 });
 
 test("provider ids come only from real tuples", () => {
@@ -52,7 +52,7 @@ test("provider ids come only from real tuples", () => {
 
 test("a multi-line detail stays on its check's line", () => {
   const rendered = renderChecks([
-    { ok: false, required: true, subject: "bug-fix: x/y/z", detail: "boom\n  at stack\n" },
+    { ok: false, subject: "bug-fix: x/y/z", detail: "boom\n  at stack\n" },
   ]);
   assert.equal(rendered, "FAIL  bug-fix: x/y/z  (boom at stack)");
 });

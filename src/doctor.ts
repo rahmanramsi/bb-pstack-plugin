@@ -11,7 +11,6 @@ export type Catalog = ReadonlyMap<string, ProviderCatalog>;
 
 export type Check = {
   ok: boolean;
-  required: boolean;
   subject: string;
   detail: string;
 };
@@ -60,7 +59,6 @@ export function checkRoles(roles: readonly EffectiveRole[], catalog: Catalog): C
   return roles.flatMap((role) =>
     role.models.map((value) => ({
       ...checkTuple(value, catalog),
-      required: true,
       subject: `${role.role}: ${value}`,
     })),
   );
@@ -77,14 +75,14 @@ export function providerIds(roles: readonly EffectiveRole[]): string[] {
   return [...ids].sort();
 }
 
-export function failedRequired(checks: readonly Check[]): Check[] {
-  return checks.filter((check) => check.required && !check.ok);
+export function failedChecks(checks: readonly Check[]): Check[] {
+  return checks.filter((check) => !check.ok);
 }
 
 export function renderChecks(checks: readonly Check[]): string {
   return checks
     .map((check) => {
-      const mark = check.ok ? "ok  " : check.required ? "FAIL" : "warn";
+      const mark = check.ok ? "ok  " : "FAIL";
       return `${mark}  ${check.subject}  (${check.detail.replace(/\s+/g, " ").trim()})`;
     })
     .join("\n");
