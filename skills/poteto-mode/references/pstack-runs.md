@@ -52,10 +52,10 @@ Workers default to the `swarm workers` role. Each one returns `PASS`, `ISSUES` o
 bb pstack run start --file "$BB_THREAD_STORAGE/plan.json"
 ```
 
-The command prints the run id, the seats and their models, and a `::pstack-run{run="psr_…"}` line. Copy that line into your reply once, on its own line, unedited. It renders the live card. Starting the same plan again with the same `requestKey` returns the same run.
+The command prints the run id, a one-line summary with the seat and judge counts, and a `::pstack-run{run="psr_…"}` line. `bb pstack run status <id>` lists each job with its model. Copy that line into your reply once, on its own line, unedited. It renders the live card. Starting the same plan again with the same `requestKey` returns the same run.
 
 ## 3. Collect the result
 
-When every job is done, this thread receives one `[pstack run finished · psr_…]` message with each worker's outcome. `bb pstack run status <id>` is authoritative, and `--json` gives the full result. A failed seat or slice is a dropout. Handle it the way the skill handles one. Then run the skill's own synthesis or lead judgment over the result. A judge's answer is an input to your judgment, not a replacement for it.
+When every job is done, this thread receives one agent-only message that starts `pstack panel run psr_… "<title>" finished: <status>.` (or `pstack swarm run …`), with each worker's outcome. `bb pstack run status <id>` is authoritative, and `--json` gives the full result. A failed seat or slice is a dropout. Handle it the way the skill handles one. Then run the skill's own synthesis or lead judgment over the result. A judge's answer is an input to your judgment, not a replacement for it.
 
 Stop a run with `bb pstack run stop <id>`.

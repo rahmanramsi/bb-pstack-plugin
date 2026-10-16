@@ -53,7 +53,7 @@ bb pstack gate pr                        # exit 1 with every open step; run befo
 bb pstack gate done                      # exit 1 until every step, including after-PR ones, is closed
 ```
 
-Every `bb pstack` command ends with the open steps.
+Every `bb pstack` command except `--json` output, `models` and `doctor` ends with the open steps.
 
 ## Shape
 
@@ -63,7 +63,7 @@ Every `bb pstack` command ends with the open steps.
 
 `compile()` is the only place that knows these two shapes.
 
-**A pure reconciler.** `plan(snapshot, now)` returns actions: release, skip, spawn, retry, repair, fail and finish. The engine applies each action through a compare-and-set transition in `src/store.ts`, so applying one twice does nothing. Thread events, a 15 s maintenance tick and startup all call the same `tick(runId)`. The tick polls running workers, so a missed event cannot strand a run.
+**A pure reconciler.** `plan(snapshot, now)` returns actions: release, skip, spawn, retry, repair, fail and finish. The engine applies each action through a compare-and-set transition in `src/run-store.ts`, so applying one twice does nothing. Thread events, a 15 s maintenance tick and startup all call the same `tick(runId)`. The tick polls running workers, so a missed event cannot strand a run.
 
 **No duplicate workers.** An attempt row is claimed with `INSERT OR IGNORE` and stored as `issued` before `threads.spawn` runs. On restart:
 - An issued attempt whose thread is found through plugin metadata is adopted.
