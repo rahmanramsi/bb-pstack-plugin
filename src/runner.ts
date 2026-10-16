@@ -12,6 +12,7 @@
  * because the SDK spawn has no idempotency key and a late success would duplicate the seat or judge.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { RESULT_SCHEMAS, STATE_CHANNEL, type ResultKind, type RunPlan, type RunView } from "./contract.ts";
@@ -495,21 +496,562 @@ export function toView(run: RunSnapshot, meta: { kind: "panel" | "swarm"; title:
   };
 }
 
+
+function resultSchema(kind: ResultKind): Record<string, unknown> {
+  const { $schema: _, ...schema } = z.toJSONSchema(RESULT_SCHEMAS[kind]) as Record<string, unknown>;
+  return schema;
+}
+
+/** The parameters `pstack_result` advertises to one worker: `{ value }` narrowed to its contract. */
+export function resultToolParameters(kind: ResultKind): Record<string, unknown> {
+  return { type: "object", properties: { value: resultSchema(kind) }, required: ["value"], additionalProperties: false };
+}
+
+/** The prompt a worker receives: its job prompt, then the result contract, which wins over any format the prompt describes. */
+export function workerPrompt(job: Pick<JobDraft, "prompt" | "result" | "slice">): string {
+  if (job.result === "text") {
+    return `${job.prompt}\n\n## Result\n\nYour final message is the result. It goes back to the thread that started this run exactly as you write it.`;
+  }
+  const slice = job.slice === null ? "" : `\n\nSet "slice" to ${JSON.stringify(job.slice)}.`;
+  return [
+    job.prompt,
+    "## Result",
+    "This contract replaces any output format described above. Call the `pstack_result` tool exactly once with `{ \"value\": <result> }`, where the result matches this JSON Schema. Your final message is not the result.",
+    `\`\`\`json\n${JSON.stringify(resultSchema(job.result), null, 2)}\n\`\`\`${slice}`,
+    "If the tool is unavailable, end your final message with the result alone in one ```json block.",
+  ].join("\n\n");
+}
+
+const COMPLETION_MAX_CHARS = 16_000;
+
+/** Pure: the agent-only message the origin thread receives when a run finishes, bounded. */
+export function completionMessage(run: RunSnapshot, meta: { kind: "panel" | "swarm"; title: string }): string {
+  const letters = seatLetters(run.jobs);
+  const budget = Math.floor((COMPLETION_MAX_CHARS - 1_000) / run.jobs.length);
+  const sections = run.jobs.map((job) => {
+    const summary = summaryOf(job);
+    const head = `### ${job.label} (${formatChoice(job.model)}): ${job.state}${summary ? `, ${summary}` : ""}`;
+    if (job.state !== "succeeded") return job.error ? `${head}\n${clip(job.error, Math.max(budget, 200))}` : head;
+    if (budget < 200) return head;
+    return `${head}\n${clip(formatValue(job.result, job.value, letters.get(job.key) ?? null), budget)}`;
+  });
+  return [
+    `pstack ${meta.kind} run ${run.id} "${meta.title}" finished: ${run.status}.`,
+    ...sections,
+    `Full results: \`bb pstack run status ${run.id} --json\`.`,
+  ].join("\n\n");
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 40)}\n… (truncated; see run status)` : text;
+}
+
+export class RunnerError extends Error {
+  readonly code: "plan_invalid" | "request_key_conflict" | "origin_unavailable" | "run_not_found";
+  constructor(code: RunnerError["code"], message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+export type JobResult = { key: string; kind: JobKind; label: string; state: JobState; value: unknown; error: string | null };
+
 export type Runner = {
   start(plan: RunPlan, originThreadId: string): Promise<{ runId: RunId; existing: boolean }>;
   stop(runId: RunId, originThreadId: string): Promise<boolean>;
   /** Worker side: `pstack_result({ value })`, identity from the tool's thread id. */
   submit(workerThreadId: string, value: unknown): Promise<{ ok: true } | { ok: false; error: string }>;
   view(runId: RunId, originThreadId: string): RunView;
+  /** Every job's validated value, for `run status`. */
+  results(runId: RunId, originThreadId: string): JobResult[];
+  activeRuns(originThreadId: string): RunId[];
+  /** The result contract of the job a thread works on, from its attempt or its spawn metadata; null for any other thread. Synchronous for `bb.agents.configure`. */
+  workerResult(threadId: string, pluginMetadata: unknown): ResultKind | null;
   /** Lifecycle hooks; each only records the observation and calls tick. */
   onIdle(threadId: string, lastAssistantText: string | null): Promise<void>;
   onFailed(threadId: string, error: string | null): Promise<void>;
   onGone(threadId: string): Promise<void>;
+  /** Applies plan() until the run settles, polling its running workers, then delivers a due completion message. */
+  tick(runId: RunId): Promise<void>;
   /** Background service body: recover, then tick due runs every 15 s until the signal aborts. */
   serve(signal: AbortSignal): Promise<void>;
 };
 
+const WorkerMetadata = z.object({
+  pstackWorker: z.literal(1),
+  runId: z.string(),
+  job: z.string(),
+  ordinal: z.number().int(),
+  originThreadId: z.string(),
+});
+
+type AttemptRef = { runId: RunId; key: string; ordinal: number };
+
+const POLL_INTERVAL_MS = 15_000;
+/** After a corrective turn, the worker may still read as idle for a moment; the poll waits this long before trusting it. */
+const REPAIR_POLL_GRACE_MS = 30_000;
+const NOTIFY_RETRY_BASE_MS = 1_000;
+const NOTIFY_RETRY_MAX_MS = 60 * 60 * 1_000;
+const MAX_ROUNDS = 20;
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isMissingThread(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { status?: unknown; code?: unknown };
+  return candidate.status === 404 || candidate.code === "thread_not_found";
+}
+
+const attemptId = (runId: string, key: string, ordinal: number) => `${runId}/${key}/${ordinal}`;
+
 /** The engine: the only module that calls bb.sdk.threads.*. Applies plan() actions via store CAS transitions. */
-export function createRunner(bb: BbPluginApi, store: RunStore, resolveRole: (role: string) => readonly ModelChoice[]): Runner {
-  throw new Error("not implemented");
+export function createRunner(
+  bb: BbPluginApi,
+  store: RunStore,
+  resolveRole: (role: string) => readonly ModelChoice[],
+  clock: () => number = Date.now,
+): Runner {
+  const spawning = new Set<string>();
+  const notifying = new Set<RunId>();
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+
+  const publish = (threadId: string) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: store.revision(threadId) });
+
+  function wakeAt(runId: RunId, at: number): void {
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      reconcile(runId).catch((error) => bb.log.error(`pstack run ${runId}: ${message(error)}`));
+    }, Math.max(0, at - clock()));
+    timer.unref?.();
+    timers.add(timer);
+  }
+
+  async function stopWorker(threadId: string | null | undefined): Promise<void> {
+    if (!threadId) return;
+    try {
+      await bb.sdk.threads.stop({ threadId });
+    } catch (error) {
+      if (!isMissingThread(error)) bb.log.warn(`Could not stop pstack worker ${threadId}: ${message(error)}`);
+    }
+  }
+
+  function currentJob(ref: AttemptRef): { snapshot: RunSnapshot; job: JobSnapshot } | null {
+    const snapshot = store.snapshot(ref.runId);
+    const job = snapshot?.jobs.find((candidate) => candidate.key === ref.key);
+    if (!snapshot || !job || liveAttempt(job)?.ordinal !== ref.ordinal) return null;
+    return { snapshot, job };
+  }
+
+  function accept(job: JobSnapshot, snapshot: RunSnapshot, value: unknown) {
+    const accepted = acceptResult(job.result, value);
+    if (!accepted.ok || job.kind !== "judge" || job.result !== "grouping") return accepted;
+    const refs = new Set(findingsOf(snapshot.jobs).map((finding) => finding.ref));
+    const error = checkGrouping(accepted.value as ResultValueOf<"grouping">, refs);
+    return error === null ? accepted : { ok: false as const, error };
+  }
+
+  function observeIdle(ref: AttemptRef, text: string | null): void {
+    const current = currentJob(ref);
+    if (!current || current.job.state !== "running") return;
+    const accepted = accept(current.job, current.snapshot, text ?? "");
+    if (accepted.ok) store.transitionJob(ref.runId, ref.key, "running", "succeeded", { valueJson: JSON.stringify(accepted.value), error: null });
+    else store.transitionJob(ref.runId, ref.key, "running", "repairing", { error: accepted.error });
+  }
+
+  function observeFailed(ref: AttemptRef, error: string): void {
+    const current = currentJob(ref);
+    if (current) store.transitionJob(ref.runId, ref.key, current.job.state, "failed", { error });
+  }
+
+  async function workerThreads(visit: (threadId: string, metadata: z.infer<typeof WorkerMetadata>) => void): Promise<void> {
+    for (let offset = 0; ; ) {
+      const threads = await bb.sdk.threads.list({ originPluginId: bb.pluginId, includeHidden: true, archived: false, limit: 100, offset });
+      for (const thread of threads) {
+        if (store.attemptByThread(thread.id)) continue;
+        const metadata = WorkerMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId: thread.id }).catch(() => null));
+        if (metadata.success) visit(thread.id, metadata.data);
+      }
+      if (threads.length < 100) return;
+      offset += threads.length;
+    }
+  }
+
+  /** Attaches a worker found by its spawn metadata to its still-issued attempt. */
+  function adoptInto(threadId: string, metadata: z.infer<typeof WorkerMetadata>): AttemptRef | null {
+    const runId = metadata.runId as RunId;
+    const job = store.snapshot(runId)?.jobs.find((candidate) => candidate.key === metadata.job);
+    if (!job || liveAttempt(job)?.ordinal !== metadata.ordinal) return null;
+    if (store.attachAttempt(runId, job.key, metadata.ordinal, threadId) && job.state === "uncertain") {
+      store.transitionJob(runId, job.key, "uncertain", "running");
+    }
+    return store.attemptByThread(threadId);
+  }
+
+  async function locate(threadId: string): Promise<AttemptRef | null> {
+    const known = store.attemptByThread(threadId);
+    if (known) return known;
+    let metadata;
+    try {
+      metadata = WorkerMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId }));
+    } catch {
+      return null;
+    }
+    return metadata.success ? adoptInto(threadId, metadata.data) : null;
+  }
+
+  async function checkWorker(ref: AttemptRef, threadId: string): Promise<void> {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (thread.archivedAt !== null || thread.deletedAt !== null) observeFailed(ref, "the worker thread was archived or deleted");
+      else if (thread.status === "idle") observeIdle(ref, (await bb.sdk.threads.output({ threadId })).output);
+      else if (thread.status === "error") observeFailed(ref, "the worker thread failed");
+    } catch (error) {
+      if (isMissingThread(error)) observeFailed(ref, "the worker thread was archived or deleted");
+      else bb.log.warn(`Could not check pstack worker ${threadId}: ${message(error)}`);
+    }
+  }
+
+  async function spawn(runId: RunId, job: JobSnapshot, ordinal: number): Promise<boolean> {
+    store.transitionJob(runId, job.key, "queued", "running", { error: null, nextActionAt: null });
+    if (!store.claimAttempt(runId, job.key, ordinal, clock())) return false;
+    const info = store.info(runId)!;
+    const origin = info.origin;
+    const id = attemptId(runId, job.key, ordinal);
+    const ref: AttemptRef = { runId, key: job.key, ordinal };
+    spawning.add(id);
+    try {
+      let threadId: string | null;
+      try {
+        const thread = await bb.sdk.threads.spawn({
+          lifecycleOwnerThreadId: origin.threadId,
+          pluginMetadata: { pstackWorker: 1, runId, job: job.key, ordinal, originThreadId: origin.threadId },
+          projectId: origin.projectId,
+          environment: { type: "reuse", environmentId: origin.environmentId },
+          prompt: workerPrompt(job),
+          title: `${info.title} · ${job.label}`,
+          providerId: job.model.provider,
+          model: job.model.model,
+          reasoningLevel: job.model.reasoningLevel as never,
+          permissionMode: origin.permissionMode as never,
+          visibility: "hidden",
+        });
+        threadId = thread.id;
+      } catch (error) {
+        // The server may have created the thread before the call failed; a second spawn would duplicate the job.
+        threadId = null;
+        await workerThreads((candidate, metadata) => {
+          if (attemptId(metadata.runId, metadata.job, metadata.ordinal) === id) threadId = candidate;
+        }).catch(() => undefined);
+        if (threadId === null) {
+          store.transitionJob(runId, job.key, "running", "failed", { error: `could not start the worker: ${message(error)}` });
+          return true;
+        }
+      }
+      if (!store.attachAttempt(runId, job.key, ordinal, threadId)) {
+        const owner = store.attemptByThread(threadId);
+        if (!owner || attemptId(owner.runId, owner.key, owner.ordinal) !== id) {
+          await stopWorker(threadId);
+          return true;
+        }
+      }
+      publish(origin.threadId);
+      await checkWorker(ref, threadId);
+      return true;
+    } finally {
+      spawning.delete(id);
+    }
+  }
+
+  async function apply(snapshot: RunSnapshot, action: Action): Promise<boolean> {
+    const runId = snapshot.id;
+    if (action.type === "finish") return store.finishRun(runId, action.status, clock());
+    const job = snapshot.jobs.find((candidate) => candidate.key === action.job)!;
+    switch (action.type) {
+      case "release":
+        return store.transitionJob(runId, job.key, "blocked", "queued", { releasedPrompt: action.prompt });
+      case "skip":
+        return store.transitionJob(runId, job.key, "blocked", "skipped", { error: action.reason });
+      case "spawn":
+        return spawn(runId, job, action.ordinal);
+      case "retry": {
+        const moved = store.transitionJob(runId, job.key, "failed", "queued", { nextActionAt: action.at, providerRetries: job.providerRetries + 1 });
+        if (moved) wakeAt(runId, action.at);
+        return moved;
+      }
+      case "fail": {
+        const moved = store.transitionJob(runId, job.key, job.state, "failed", { error: action.error });
+        if (moved) await stopWorker(liveAttempt(job)?.threadId);
+        return moved;
+      }
+      case "repair": {
+        const threadId = liveAttempt(job)?.threadId;
+        if (!threadId) return store.transitionJob(runId, job.key, "repairing", "failed", { error: "the worker thread is unknown" });
+        const moved = store.transitionJob(runId, job.key, "repairing", "running", {
+          repairs: job.repairs + 1,
+          error: null,
+          nextActionAt: clock() + REPAIR_POLL_GRACE_MS,
+        });
+        if (!moved) return false;
+        try {
+          await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: action.message, mentions: [] }] });
+        } catch (error) {
+          store.transitionJob(runId, job.key, "running", "failed", { error: `could not send the corrective turn: ${message(error)}` });
+        }
+        return true;
+      }
+    }
+  }
+
+  async function pollWorkers(snapshot: RunSnapshot): Promise<void> {
+    await Promise.all(
+      snapshot.jobs.map((job) => {
+        const attempt = liveAttempt(job);
+        if (job.state !== "running" || !attempt?.threadId || (job.nextActionAt ?? 0) > clock()) return;
+        return checkWorker({ runId: snapshot.id, key: job.key, ordinal: attempt.ordinal }, attempt.threadId);
+      }),
+    );
+  }
+
+  async function reconcile(runId: RunId, poll = false): Promise<void> {
+    const info = store.info(runId);
+    if (!info) return;
+    if (info.status === "running") {
+      if (poll) await pollWorkers(store.snapshot(runId)!);
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        const snapshot = store.snapshot(runId)!;
+        const actions = plan(snapshot, clock());
+        if (actions.length === 0) break;
+        const changed = await Promise.all(actions.map((action) => apply(snapshot, action)));
+        publish(info.origin.threadId);
+        if (!changed.some(Boolean)) break;
+      }
+    }
+    await notify(runId);
+  }
+
+  async function originGone(threadId: string): Promise<boolean> {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return thread.archivedAt !== null || thread.deletedAt !== null;
+    } catch (error) {
+      if (isMissingThread(error)) return true;
+      throw error;
+    }
+  }
+
+  async function notify(runId: RunId): Promise<void> {
+    const info = store.info(runId);
+    if (!info || info.status === "running" || info.notify.state !== "pending" || (info.notify.nextAt ?? 0) > clock()) return;
+    if (notifying.has(runId)) return;
+    notifying.add(runId);
+    try {
+      if (await originGone(info.origin.threadId)) {
+        store.settleNotification(runId, "abandoned");
+        return;
+      }
+      await bb.sdk.threads.send({
+        threadId: info.origin.threadId,
+        mode: "steer-if-active",
+        input: [{ type: "text", text: completionMessage(store.snapshot(runId)!, info), mentions: [], visibility: "agent-only" }],
+      });
+      store.settleNotification(runId, "sent");
+    } catch (error) {
+      if (isMissingThread(error)) {
+        store.settleNotification(runId, "abandoned");
+        return;
+      }
+      const delay = Math.min(NOTIFY_RETRY_MAX_MS, NOTIFY_RETRY_BASE_MS * 2 ** Math.min(info.notify.attempts, 20));
+      store.deferNotification(runId, clock() + delay);
+      wakeAt(runId, clock() + delay);
+      bb.log.warn(`Could not deliver pstack run ${runId} to ${info.origin.threadId}; retrying in ${delay} ms: ${message(error)}`);
+    } finally {
+      notifying.delete(runId);
+    }
+  }
+
+  async function cancel(runId: RunId): Promise<boolean> {
+    const snapshot = store.snapshot(runId);
+    if (!snapshot || !store.finishRun(runId, "cancelled", clock())) return false;
+    const live = snapshot.jobs.map((job) => liveAttempt(job)?.threadId);
+    for (const job of snapshot.jobs) {
+      if (!["succeeded", "failed", "skipped", "cancelled"].includes(job.state)) store.transitionJob(runId, job.key, job.state, "cancelled");
+    }
+    await Promise.all(live.map(stopWorker));
+    publish(store.info(runId)!.origin.threadId);
+    return true;
+  }
+
+  async function recover(): Promise<void> {
+    const issued = new Map<string, AttemptRef & { state: JobState }>();
+    for (const runId of store.dueRuns(clock())) {
+      const snapshot = store.snapshot(runId)!;
+      if (snapshot.status !== "running") continue;
+      for (const job of snapshot.jobs) {
+        const attempt = liveAttempt(job);
+        const id = attempt && attemptId(runId, job.key, attempt.ordinal);
+        if (attempt?.state === "issued" && !spawning.has(id!)) issued.set(id!, { runId, key: job.key, ordinal: attempt.ordinal, state: job.state });
+      }
+    }
+    if (issued.size === 0) return;
+    const found = new Map<string, string>();
+    await workerThreads((threadId, metadata) => {
+      const id = attemptId(metadata.runId, metadata.job, metadata.ordinal);
+      if (issued.has(id)) found.set(id, threadId);
+    });
+    for (const [id, attempt] of issued) {
+      const threadId = found.get(id);
+      if (threadId) adoptInto(threadId, { pstackWorker: 1, runId: attempt.runId, job: attempt.key, ordinal: attempt.ordinal, originThreadId: "" });
+      else if (attempt.state === "running") store.transitionJob(attempt.runId, attempt.key, "running", "uncertain");
+    }
+  }
+
+  function owned(runId: RunId, originThreadId: string) {
+    const info = store.info(runId);
+    if (!info || info.origin.threadId !== originThreadId) throw new RunnerError("run_not_found", `no run ${runId} on this thread`);
+    return { info, snapshot: store.snapshot(runId)! };
+  }
+
+  async function resolveOrigin(threadId: string): Promise<Origin> {
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (thread.environmentId === null) throw new RunnerError("origin_unavailable", "the thread has no environment for workers to reuse");
+    const defaults = await bb.sdk.threads.defaultExecutionOptions({ threadId });
+    if (defaults === null) throw new RunnerError("origin_unavailable", "the thread has no resolved model, so workers cannot inherit it");
+    return {
+      threadId,
+      projectId: thread.projectId,
+      environmentId: thread.environmentId,
+      providerId: thread.providerId,
+      model: defaults.model,
+      reasoningLevel: defaults.reasoningLevel,
+      permissionMode: defaults.permissionMode,
+    };
+  }
+
+  return {
+    async start(runPlan, originThreadId) {
+      const origin = await resolveOrigin(originThreadId);
+      const compiled = compile(runPlan, resolveRole, origin);
+      if (!compiled.ok) throw new RunnerError("plan_invalid", compiled.error);
+      const created = store.createRun({
+        id: `psr_${randomUUID()}` as RunId,
+        origin,
+        requestKey: runPlan.requestKey ?? null,
+        planHash: createHash("sha256").update(JSON.stringify(runPlan)).digest("hex"),
+        kind: runPlan.kind,
+        title: runPlan.title,
+        deadline: clock() + RUN_DEADLINE_MS,
+        jobs: compiled.jobs,
+      });
+      if ("conflict" in created) {
+        throw new RunnerError("request_key_conflict", `request key "${runPlan.requestKey}" already names a different plan on this thread`);
+      }
+      publish(originThreadId);
+      if (!created.existing) await reconcile(created.id);
+      return { runId: created.id, existing: created.existing };
+    },
+
+    async stop(runId, originThreadId) {
+      owned(runId, originThreadId);
+      const stopped = await cancel(runId);
+      if (stopped) await notify(runId);
+      return stopped;
+    },
+
+    async submit(workerThreadId, value) {
+      const ref = await locate(workerThreadId);
+      const snapshot = ref && store.snapshot(ref.runId);
+      const job = snapshot?.jobs.find((candidate) => candidate.key === ref!.key);
+      if (!ref || !snapshot || !job) return { ok: false, error: "This thread is not a pstack worker." };
+      if (job.result === "text") return { ok: false, error: "This job's result is your final message; do not call pstack_result." };
+      const accepted = accept(job, snapshot, value);
+      if (job.state === "succeeded" && liveAttempt(job) === null && job.attempts.at(-1)?.ordinal === ref.ordinal) {
+        return accepted.ok && JSON.stringify(accepted.value) === JSON.stringify(job.value)
+          ? { ok: true }
+          : { ok: false, error: "A different result was already accepted for this job." };
+      }
+      if ((job.state !== "running" && job.state !== "repairing") || liveAttempt(job)?.ordinal !== ref.ordinal) {
+        return { ok: false, error: "This worker's job is no longer running." };
+      }
+      if (!accepted.ok) return accepted;
+      if (!store.transitionJob(ref.runId, job.key, job.state, "succeeded", { valueJson: JSON.stringify(accepted.value), error: null })) {
+        return { ok: false, error: "This worker's job changed state before the result was recorded." };
+      }
+      await stopWorker(workerThreadId);
+      await reconcile(ref.runId);
+      return { ok: true };
+    },
+
+    view(runId, originThreadId) {
+      const { info, snapshot } = owned(runId, originThreadId);
+      return toView(snapshot, info);
+    },
+
+    results(runId, originThreadId) {
+      return owned(runId, originThreadId).snapshot.jobs.map((job) => ({
+        key: job.key,
+        kind: job.kind,
+        label: job.label,
+        state: job.state,
+        value: job.state === "succeeded" ? job.value : null,
+        error: job.error,
+      }));
+    },
+
+    activeRuns: (originThreadId) => store.runsForThread(originThreadId, true),
+
+    workerResult(threadId, pluginMetadata) {
+      const known = store.attemptByThread(threadId);
+      const metadata = known ? null : WorkerMetadata.safeParse(pluginMetadata);
+      const ref = known ?? (metadata?.success ? { runId: metadata.data.runId as RunId, key: metadata.data.job } : null);
+      if (!ref) return null;
+      return store.snapshot(ref.runId)?.jobs.find((job) => job.key === ref.key)?.result ?? null;
+    },
+
+    async onIdle(threadId, lastAssistantText) {
+      const ref = await locate(threadId);
+      if (!ref) return;
+      observeIdle(ref, lastAssistantText);
+      await reconcile(ref.runId);
+    },
+
+    async onFailed(threadId, error) {
+      const ref = await locate(threadId);
+      if (!ref) return;
+      observeFailed(ref, error ?? "the worker thread failed");
+      await reconcile(ref.runId);
+    },
+
+    async onGone(threadId) {
+      const ref = store.attemptByThread(threadId);
+      if (ref) {
+        observeFailed(ref, "the worker thread was archived or deleted");
+        await reconcile(ref.runId);
+      }
+      for (const runId of store.runsForThread(threadId, false)) {
+        await cancel(runId);
+        store.settleNotification(runId, "abandoned");
+      }
+    },
+
+    tick: (runId) => reconcile(runId, true),
+
+    async serve(signal) {
+      try {
+        await recover();
+      } catch (error) {
+        bb.log.error(`pstack recovery failed: ${message(error)}`);
+      }
+      while (!signal.aborted) {
+        for (const runId of store.dueRuns(clock())) {
+          if (signal.aborted) break;
+          await reconcile(runId, true).catch((error) => bb.log.error(`pstack run ${runId}: ${message(error)}`));
+        }
+        await sleep(POLL_INTERVAL_MS, undefined, { signal }).catch(() => undefined);
+      }
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+    },
+  };
 }
