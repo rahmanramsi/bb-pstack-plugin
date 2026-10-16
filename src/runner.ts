@@ -651,9 +651,14 @@ export function createRunner(
 
   function accept(job: JobSnapshot, snapshot: RunSnapshot, value: unknown) {
     const accepted = acceptResult(job.result, value);
-    if (!accepted.ok || job.kind !== "judge" || job.result !== "grouping") return accepted;
-    const refs = new Set(findingsOf(snapshot.jobs).map((finding) => finding.ref));
-    const error = checkGrouping(accepted.value as ResultValueOf<"grouping">, refs);
+    if (!accepted.ok) return accepted;
+    let error: string | null = null;
+    if (job.kind === "judge" && job.result === "grouping") {
+      error = checkGrouping(accepted.value as ResultValueOf<"grouping">, new Set(findingsOf(snapshot.jobs).map((finding) => finding.ref)));
+    } else if ((job.result === "report" || job.result === "verdict") && job.slice !== null) {
+      const { slice } = accepted.value as ResultValueOf<"report" | "verdict">;
+      if (slice !== job.slice) error = `"slice" is ${JSON.stringify(slice)}, but this job's slice is ${JSON.stringify(job.slice)}`;
+    }
     return error === null ? accepted : { ok: false as const, error };
   }
 

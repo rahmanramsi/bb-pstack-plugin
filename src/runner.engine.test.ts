@@ -291,6 +291,24 @@ test("the swarm engine keeps at most 8 workers running and releases each verifie
   assert.deepEqual(view.jobs.filter((job) => job.slice === "p1").map((job) => [job.kind, job.state]), [["slice", "succeeded"], ["verifier", "running"]]);
 });
 
+test("a report or verdict for another slice is rejected, by the tool and in the final message", async () => {
+  const h = harness();
+  const { runId } = await h.runner.start(SWARM(["a"], true), "thr_origin");
+  const report = (slice: string) => ({ slice, status: "PASS", summary: "ok", evidence: [], issues: [] });
+  const submitted = await h.runner.submit(h.worker(1), report("other"));
+  assert.equal(submitted.ok, false);
+  assert.match((submitted as { error: string }).error, /"other"[\s\S]*"a"/);
+  await h.runner.onIdle(h.worker(1), JSON.stringify(report("other")));
+  assert.equal(h.toWorker(h.worker(1)).length, 1, "a wrong slice in the final message spends a corrective turn");
+  assert.equal(h.spawned.length, 1, "the verifier is not released on another slice's report");
+
+  assert.deepEqual(await h.runner.submit(h.worker(1), report("a")), { ok: true });
+  const verdict = (slice: string) => ({ slice, verdict: "VERIFIED", notes: "" });
+  assert.equal((await h.runner.submit(h.worker(2), verdict("other"))).ok, false);
+  assert.deepEqual(await h.runner.submit(h.worker(2), verdict("a")), { ok: true });
+  assert.equal(h.runner.view(runId, "thr_origin").status, "succeeded");
+});
+
 test("restart: an issued attempt is adopted through its metadata, or marked uncertain and never spawned again", async () => {
   const h = harness();
   const plan = SWARM(["a", "b"]);
