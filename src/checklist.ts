@@ -1,3 +1,7 @@
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+
 /**
  * Playbook checklists: pure domain. The plugin, not the agent, copies a playbook's steps from the
  * skill files; a step closes only as done-with-evidence or skip-with-reason; the PR gate and the
@@ -49,22 +53,91 @@ export type Extractor = "numbered" | "phases" | "paragraphs";
  * Every playbook except opening-a-pr gets the opening-a-pr steps appended in section "pr".
  */
 export function playbookSources(skillsDir: string): Map<PlaybookName, { file: string; extractor: Extractor }> {
-  throw new Error("not implemented");
+  const dir = join(skillsDir, "poteto-mode", "playbooks");
+  const sources = new Map<PlaybookName, { file: string; extractor: Extractor }>();
+  for (const file of readdirSync(dir).filter((file) => file.endsWith(".md")).sort()) {
+    const name = file.slice(0, -3) as PlaybookName;
+    sources.set(name, { file: join(dir, file), extractor: name === "opening-a-pr" ? "paragraphs" : "numbered" });
+  }
+  sources.set("figure-it-out" as PlaybookName, { file: join(skillsDir, "figure-it-out", "SKILL.md"), extractor: "phases" });
+  return sources;
 }
 
 /** Pure: Markdown in, ordered steps out. Sub-bullets fold into their parent step's text. */
 export function extractSteps(markdown: string, extractor: Extractor, section: StepSection): StepDraft[] {
-  throw new Error("not implemented");
+  const steps: StepDraft[] = [];
+  const lines = markdown.split("\n");
+  let current: string[] = [];
+  let afterPr = false;
+  let fence: string | null = null;
+  function flush() {
+    if (current.length > 0) {
+      while (current.at(-1)?.trim() === "") current.pop();
+      steps.push({ section, text: current.join("\n"), afterPr });
+      current = [];
+    }
+  }
+  for (const line of lines) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker) {
+      if (fence === null) fence = marker[1][0];
+      else if (marker[1][0] === fence) fence = null;
+      if (current.length > 0) current.push(line);
+      continue;
+    }
+    if (fence !== null) {
+      if (current.length > 0) current.push(line);
+      continue;
+    }
+    const lead = line.match(/^\*\*([^*]+?)\.\*\*/);
+    const starts = extractor === "numbered" ? /^\d+\.\s+\S/.test(line)
+      : extractor === "phases" ? /^## (?:Start|Phase [A-E](?::.*)?)\r?$/.test(line)
+      : lead !== null;
+    if (starts) {
+      flush();
+      afterPr = extractor === "paragraphs" && AFTER_PR_LEADS.some((label) => label === lead?.[1]);
+      current = [line];
+    } else if (current.length > 0) {
+      if ((extractor === "numbered" && line.trim() !== "" && !/^\s/.test(line)) ||
+          (extractor === "phases" && /^#{1,2} /.test(line))) flush();
+      else current.push(line);
+    }
+  }
+  flush();
+  return steps;
 }
 
 /** Boundary parser for `--evidence thread:thr_x`, `run:psr_…`, `commit:<sha>`, `path:<p>`, `pr:<url>`. */
 export function parseEvidence(raw: string): Evidence | { error: string } {
-  throw new Error("not implemented");
+  const value = raw.trim();
+  const colon = value.indexOf(":");
+  const kind = value.slice(0, colon);
+  const payload = value.slice(colon + 1);
+  if (colon < 0 || !payload.trim() || /[\r\n\0]/.test(payload)) return { error: "Evidence needs a kind and a non-blank value." };
+  switch (kind) {
+    case "thread":
+      if (/^thr_[a-zA-Z0-9_-]+$/.test(payload)) return { kind, id: payload };
+      break;
+    case "run":
+      if (/^psr_[0-9a-f-]{36}$/.test(payload)) return { kind, id: payload };
+      break;
+    case "commit":
+      if (/^[0-9a-f]{7,40}$/i.test(payload)) return { kind, sha: payload };
+      break;
+    case "path": return { kind, path: payload };
+    case "pr": {
+      const url = URL.parse(payload);
+      if (url && ["http:", "https:"].includes(url.protocol) && url.hostname) return { kind, url: payload };
+      break;
+    }
+  }
+  return { error: "Use thread:<id>, run:<id>, commit:<sha>, path:<path>, or pr:<http-url> as evidence." };
 }
 
 /** Boundary parser for a skip reason: trimmed, non-blank, at most 500 chars. */
 export function parseReason(raw: string): string | { error: string } {
-  throw new Error("not implemented");
+  const reason = raw.trim();
+  return reason.length > 0 && reason.length <= 500 ? reason : { error: "A skip reason must contain 1 to 500 characters." };
 }
 
 /** Closing the same step identically is a no-op; a different resolution on a closed step is a conflict. */
@@ -73,7 +146,18 @@ export function closeStep(
   stepId: number,
   resolution: Exclude<Resolution, { kind: "open" }>,
 ): { ok: true; checklist: Checklist; changed: boolean } | { ok: false; error: string } {
-  throw new Error("not implemented");
+  const step = checklist.steps.find((step) => step.id === stepId);
+  if (!step) return { ok: false, error: `Step ${stepId} does not exist.` };
+  if (step.resolution.kind !== "open") {
+    return isDeepStrictEqual(step.resolution, resolution)
+      ? { ok: true, checklist, changed: false }
+      : { ok: false, error: `Step ${stepId} already has a different resolution.` };
+  }
+  return { ok: true, changed: true, checklist: {
+    ...checklist,
+    revision: checklist.revision + 1,
+    steps: checklist.steps.map((step) => step.id === stepId ? { ...step, resolution } : step),
+  } };
 }
 
 /**
@@ -81,7 +165,16 @@ export function closeStep(
  * Added steps get the next id and close like any other; copied steps can never be removed or reworded.
  */
 export function addStep(checklist: Checklist, text: string, afterId: number | null): { ok: true; checklist: Checklist; step: Step } | { ok: false; error: string } {
-  throw new Error("not implemented");
+  if (!text.trim()) return { ok: false, error: "Step text cannot be blank." };
+  const index = afterId === null ? checklist.steps.length - 1 : checklist.steps.findIndex((step) => step.id === afterId);
+  if (afterId !== null && index < 0) return { ok: false, error: `Step ${afterId} does not exist.` };
+  const step: Step = {
+    id: Math.max(0, ...checklist.steps.map((step) => step.id)) + 1,
+    section: "playbook", text, afterPr: false, resolution: { kind: "open" },
+  };
+  const steps = [...checklist.steps];
+  steps.splice(index + 1, 0, step);
+  return { ok: true, step, checklist: { ...checklist, steps, revision: checklist.revision + 1 } };
 }
 
 export type GateResult = { pass: true } | { pass: false; open: readonly Step[]; reason: string };
@@ -91,15 +184,31 @@ export type GateResult = { pass: true } | { pass: false; open: readonly Step[]; 
  * `bb pstack gate done` (before the final reply): fails with any open step at all.
  */
 export function gate(kind: "pr" | "done", checklist: Checklist | null): GateResult {
-  throw new Error("not implemented");
+  if (!checklist) return { pass: false, open: [], reason: "Begin a playbook checklist first." };
+  const open = checklist.steps.filter((step) => step.resolution.kind === "open" && (kind === "done" || !step.afterPr));
+  return open.length === 0 ? { pass: true } : { pass: false, open, reason: `${open.length} open steps block the ${kind} gate.` };
 }
 
 /** One nudge per checklist revision: idle, open steps remain, no active run or child, not yet nudged at this revision. */
 export function shouldNudge(checklist: Checklist, context: { activeRuns: number; activeChildren: number }): boolean {
-  throw new Error("not implemented");
+  return checklist.steps.some((step) => step.resolution.kind === "open") &&
+    context.activeRuns === 0 && context.activeChildren === 0 && checklist.nudgedAtRevision !== checklist.revision;
 }
 
 /** The footer every pstack CLI command prints and the session-instruction block (bounded to `maxChars`). */
 export function renderOpenSteps(checklist: Checklist | null, maxChars: number): string {
-  throw new Error("not implemented");
+  if (!checklist || maxChars <= 0) return "";
+  const open = checklist.steps.filter((step) => step.resolution.kind === "open");
+  const heading = `Open playbook steps (${checklist.playbook}): ${open.length}.`;
+  const lines = open.map((step) => `${step.id}. [${step.section}${step.afterPr ? ", after PR" : ""}] ${step.text.replace(/\s+/g, " ").slice(0, 180)}`);
+  let output = heading;
+  for (const [index, line] of lines.entries()) {
+    const remaining = lines.length - index - 1;
+    const suffix = remaining > 0 ? `\n${remaining} more open steps. Run bb pstack checklist show.` : "";
+    if (`${output}\n${line}${suffix}`.length > maxChars) {
+      return `${output}\n${lines.length - index} more open steps. Run bb pstack checklist show.`.slice(0, maxChars);
+    }
+    output += `\n${line}`;
+  }
+  return output.slice(0, maxChars);
 }
