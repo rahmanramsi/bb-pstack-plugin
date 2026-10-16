@@ -617,7 +617,13 @@ export function createRunner(
   const notifying = new Set<RunId>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
 
-  const publish = (threadId: string) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: store.revision(threadId) });
+  const published = new Map<string, number>();
+  function publish(threadId: string): void {
+    const revision = store.revision(threadId);
+    if (published.get(threadId) === revision) return;
+    published.set(threadId, revision);
+    bb.realtime.publish(STATE_CHANNEL, { threadId, revision });
+  }
 
   function wakeAt(runId: RunId, at: number): void {
     const timer = setTimeout(() => {
@@ -655,6 +661,8 @@ export function createRunner(
   function observeIdle(ref: AttemptRef, text: string | null): void {
     const current = currentJob(ref);
     if (!current || current.job.state !== "running") return;
+    // Inside the grace window after a corrective turn, an idle may still describe the turn being corrected.
+    if ((current.job.nextActionAt ?? 0) > clock()) return;
     const accepted = accept(current.job, current.snapshot, text ?? "");
     if (accepted.ok) store.transitionJob(ref.runId, ref.key, "running", "succeeded", { valueJson: JSON.stringify(accepted.value), error: null });
     else store.transitionJob(ref.runId, ref.key, "running", "repairing", { error: accepted.error });
@@ -679,12 +687,11 @@ export function createRunner(
   }
 
   /** Attaches a worker found by its spawn metadata to its still-issued attempt. */
-  function adoptInto(threadId: string, metadata: z.infer<typeof WorkerMetadata>): AttemptRef | null {
-    const runId = metadata.runId as RunId;
-    const job = store.snapshot(runId)?.jobs.find((candidate) => candidate.key === metadata.job);
-    if (!job || liveAttempt(job)?.ordinal !== metadata.ordinal) return null;
-    if (store.attachAttempt(runId, job.key, metadata.ordinal, threadId) && job.state === "uncertain") {
-      store.transitionJob(runId, job.key, "uncertain", "running");
+  function adoptInto(threadId: string, ref: AttemptRef): AttemptRef | null {
+    const job = store.snapshot(ref.runId)?.jobs.find((candidate) => candidate.key === ref.key);
+    if (!job || liveAttempt(job)?.ordinal !== ref.ordinal) return null;
+    if (store.attachAttempt(ref.runId, ref.key, ref.ordinal, threadId) && job.state === "uncertain") {
+      store.transitionJob(ref.runId, ref.key, "uncertain", "running");
     }
     return store.attemptByThread(threadId);
   }
@@ -698,7 +705,8 @@ export function createRunner(
     } catch {
       return null;
     }
-    return metadata.success ? adoptInto(threadId, metadata.data) : null;
+    if (!metadata.success) return null;
+    return adoptInto(threadId, { runId: metadata.data.runId as RunId, key: metadata.data.job, ordinal: metadata.data.ordinal });
   }
 
   async function checkWorker(ref: AttemptRef, threadId: string): Promise<void> {
@@ -741,9 +749,14 @@ export function createRunner(
       } catch (error) {
         // The server may have created the thread before the call failed; a second spawn would duplicate the job.
         threadId = null;
-        await workerThreads((candidate, metadata) => {
-          if (attemptId(metadata.runId, metadata.job, metadata.ordinal) === id) threadId = candidate;
-        }).catch(() => undefined);
+        try {
+          await workerThreads((candidate, metadata) => {
+            if (attemptId(metadata.runId, metadata.job, metadata.ordinal) === id) threadId = candidate;
+          });
+        } catch {
+          store.transitionJob(runId, job.key, "running", "uncertain");
+          return true;
+        }
         if (threadId === null) {
           store.transitionJob(runId, job.key, "running", "failed", { error: `could not start the worker: ${message(error)}` });
           return true;
@@ -824,10 +837,10 @@ export function createRunner(
         const actions = plan(snapshot, clock());
         if (actions.length === 0) break;
         const changed = await Promise.all(actions.map((action) => apply(snapshot, action)));
-        publish(info.origin.threadId);
         if (!changed.some(Boolean)) break;
       }
     }
+    publish(info.origin.threadId);
     await notify(runId);
   }
 
@@ -902,7 +915,7 @@ export function createRunner(
     });
     for (const [id, attempt] of issued) {
       const threadId = found.get(id);
-      if (threadId) adoptInto(threadId, { pstackWorker: 1, runId: attempt.runId, job: attempt.key, ordinal: attempt.ordinal, originThreadId: "" });
+      if (threadId) adoptInto(threadId, attempt);
       else if (attempt.state === "running") store.transitionJob(attempt.runId, attempt.key, "running", "uncertain");
     }
   }

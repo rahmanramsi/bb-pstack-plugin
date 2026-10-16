@@ -196,6 +196,9 @@ test("an invalid structured result gets two corrective turns, then fails the job
     assert.equal(corrections.length, turn);
     assert.equal(corrections.at(-1)!.mode, "auto");
     assert.match(corrections.at(-1)!.input[0].text, new RegExp(`pstack_result[\\s\\S]*${turn} of 2`));
+    await h.runner.onIdle(h.worker(1), "Looks fine to me.");
+    assert.equal(h.toWorker(h.worker(1)).length, turn, "a stale idle right after a corrective turn spends no budget");
+    h.clock.now += 30_000;
   }
   await h.runner.onIdle(h.worker(1), "Still prose.");
   const seat = h.runner.view(runId, "thr_origin").jobs[0]!;
@@ -244,6 +247,16 @@ test("a spawn that fails after creating its thread adopts that thread instead of
   const second = await other.runner.start(SWARM(["a"]), "thr_origin");
   const job = other.runner.view(second.runId, "thr_origin").jobs[0]!;
   assert.deepEqual([job.state, job.error], ["queued", "could not start the worker: socket hang up"]);
+
+  const blind = harness();
+  blind.failures.spawn.push({ error: new Error("socket hang up"), create: true });
+  (blind.bb.sdk.threads as { list: unknown }).list = async () => {
+    throw new Error("bb is restarting");
+  };
+  const third = await blind.runner.start(SWARM(["a"]), "thr_origin");
+  assert.equal(blind.runner.view(third.runId, "thr_origin").jobs[0]!.state, "uncertain", "an unverifiable spawn is never repeated");
+  await blind.runner.tick(third.runId);
+  assert.equal(blind.spawned.length, 1);
 });
 
 test("the swarm engine keeps at most 8 workers running and releases each verifier with its own slice", async () => {
