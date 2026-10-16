@@ -17,7 +17,7 @@ fork it. improve it. make it yours. PRs are welcome!
 ## install
 
 ```bash
-bb plugin install git:https://github.com/<owner>/bb-pstack-plugin.git
+bb plugin install git:https://github.com/rahmanramsi/bb-pstack-plugin.git
 ```
 
 or, from a local checkout:
