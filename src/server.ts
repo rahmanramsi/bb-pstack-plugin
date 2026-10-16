@@ -1,5 +1,12 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createChecklistFeature } from "./checklist-commands.ts";
+import { openChecklistStore } from "./checklist-store.ts";
+import { STATE_CHANNEL, rpcContract } from "./contract.ts";
+import { createRunFeature } from "./run-commands.ts";
+import { openRunStore } from "./run-store.ts";
+import { createRunner, type RunId } from "./runner.ts";
+import { openDatabase } from "./store.ts";
 import {
   PluginCliError,
   cliCommand,
@@ -11,7 +18,9 @@ import {
   ROLES,
   effectiveRoles,
   findRole,
+  parseChoice,
   parseModelConfig,
+  type ModelChoice,
   renderTable,
   type ModelConfig,
 } from "./models.ts";
@@ -36,24 +45,26 @@ function toConfig(text: string): ModelConfig {
   return parsed.ok ? parsed.config : EMPTY_CONFIG;
 }
 
-const WORKFLOWS_DIR = fileURLToPath(new URL("../workflows/", import.meta.url));
+const SKILLS_DIR = fileURLToPath(new URL("../skills/", import.meta.url));
 
-function workflowNames(): string[] {
-  return readdirSync(WORKFLOWS_DIR)
-    .filter((file) => file.endsWith(".js"))
-    .map((file) => file.slice(0, -".js".length))
-    .sort();
+function skillNames(): string[] {
+  return readdirSync(SKILLS_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) => {
+      try {
+        const name = /^name:\s*"?([^"\n]+?)"?\s*$/m.exec(readFileSync(`${SKILLS_DIR}${entry.name}/SKILL.md`, "utf8"))?.[1];
+        return name ? [name] : [];
+      } catch {
+        return [];
+      }
+    });
 }
 
-function workflowSource(name: string): string {
-  const names = workflowNames();
-  if (!names.includes(name)) {
-    throw new PluginCliError(`unknown workflow "${name}"`, {
-      code: "workflow_not_found",
-      hint: `Bundled workflows: ${names.join(", ")}.`,
-    });
-  }
-  return readFileSync(`${WORKFLOWS_DIR}${name}.js`, "utf8");
+const INSTRUCTIONS_MAX = 4000;
+
+function evidenceLabel(evidence: { kind: string } & Record<string, string>): string {
+  const value = evidence.id ?? evidence.sha ?? evidence.path ?? evidence.url;
+  return `${evidence.kind}:${value}`;
 }
 
 function instructionsFor(text: string): string | null {
@@ -88,19 +99,89 @@ export default async function plugin(bb: BbPluginApi) {
     modelsText = next.models;
   });
 
-  async function workflowsRunning(): Promise<boolean> {
-    const plugins = await bb.sdk.plugins.list();
-    const workflows = plugins.plugins.find((plugin) => plugin.id === "workflows");
-    return workflows?.enabled === true && workflows.status === "running";
-  }
+  const resolveRole = (role: string): ModelChoice[] => {
+    const label = findRole(role);
+    const entry = effectiveRoles(toConfig(modelsText)).find((candidate) => candidate.role === label);
+    return (entry?.models ?? []).flatMap((value) => {
+      const choice = parseChoice(value);
+      return choice ? [choice] : [];
+    });
+  };
 
-  bb.agents.contributeInstructions(() => instructionsFor(modelsText));
+  const db = openDatabase(bb);
+  const runStore = openRunStore(db);
+  const checklistStore = openChecklistStore(db);
+  const runner = createRunner(bb, runStore, resolveRole);
+
+  const checklist = createChecklistFeature({
+    bb,
+    store: checklistStore,
+    skillsDir: SKILLS_DIR,
+    activeWork: async (threadId) => {
+      const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
+      const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
+      return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
+    },
+    publish: (threadId) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: Date.now() }),
+    verifyEvidence: async (evidence) => {
+      if (evidence.kind === "thread") {
+        const found = await bb.sdk.threads.get({ threadId: evidence.id }).then(() => true, () => false);
+        return found ? null : `Thread ${evidence.id} does not exist.`;
+      }
+      if (evidence.kind === "run") {
+        return runStore.snapshot(evidence.id as RunId) ? null : `Run ${evidence.id} does not exist.`;
+      }
+      return null;
+    },
+  });
+
+  const runs = createRunFeature({ bb, runner, footer: checklist.footer, skills: skillNames() });
+  runs.register();
+
+  bb.events.on("thread.idle", ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) return;
+    return checklist.onIdle(thread.id).catch((error) => bb.log.error(`pstack nudge: ${error instanceof Error ? error.message : String(error)}`));
+  });
+
+  bb.agents.contributeInstructions(({ threadId }) => {
+    const parts = [instructionsFor(modelsText), checklist.instructions(threadId)].filter((part): part is string => !!part);
+    return parts.length > 0 ? parts.join("\n\n").slice(0, INSTRUCTIONS_MAX) : null;
+  });
+
+  bb.rpc.register(rpcContract, {
+    pstackThreadView: async ({ threadId }) => {
+      const state = checklistStore.checklist(threadId);
+      return {
+        revision: runStore.revision(threadId) + (state?.revision ?? 0),
+        activeRuns: runner.activeRuns(threadId).map((id) => {
+          const view = runner.view(id, threadId);
+          return { id: view.id, kind: view.kind, title: view.title, status: view.status, jobs: view.jobs };
+        }),
+        checklist: state && {
+          playbook: state.playbook,
+          open: state.steps.filter((step) => step.resolution.kind === "open").length,
+          steps: state.steps.map((step) => ({
+            id: String(step.id),
+            section: step.section,
+            text: step.text,
+            status: step.resolution.kind,
+            evidence: step.resolution.kind === "done" ? step.resolution.evidence.map(evidenceLabel) : [],
+            reason: step.resolution.kind === "skipped" ? step.resolution.reason : null,
+          })),
+        },
+      };
+    },
+    pstackRunView: async ({ threadId, runId }) => runner.view(runId as RunId, threadId),
+    pstackStopRun: async ({ threadId, runId }) => ({ stopped: await runner.stop(runId as RunId, threadId) }),
+  });
 
   bb.cli.register(
     defineCli({
       name: "pstack",
-      summary: "pstack model roles and bundled bb workflows",
+      summary: "pstack model roles, panel and swarm runs, and playbook checklists",
       commands: {
+        ...checklist.commands,
+        ...runs.commands,
         models: cliCommand({
           summary:
             "Print the effective role-to-model table (configured values merged over defaults)",
@@ -143,7 +224,7 @@ export default async function plugin(bb: BbPluginApi) {
         }),
         doctor: cliCommand({
           summary:
-            "Check that every role's model exists in the live provider catalog, and that bb workflows are ready",
+            "Check that every role's model exists in the live provider catalog",
           options: {
             environment: {
               type: "string",
@@ -200,27 +281,6 @@ export default async function plugin(bb: BbPluginApi) {
             const catalog = new Map(entries.filter((entry) => entry !== null));
             const checks: Check[] = checkRoles(roles, catalog);
 
-            const workflowsReady = await workflowsRunning();
-            checks.push({
-              ok: workflowsReady,
-              required: false,
-              subject: "workflows plugin",
-              detail: workflowsReady
-                ? "running, so panels can use pstack-panel and pstack-swarm"
-                : "not running, so panels fall back to child threads (enable with `bb plugin enable workflows`)",
-            });
-            let bundled: string[] = [];
-            try {
-              bundled = workflowNames();
-            } catch {
-              bundled = [];
-            }
-            checks.push({
-              ok: bundled.length > 0,
-              required: true,
-              subject: "bundled workflows",
-              detail: bundled.length > 0 ? bundled.join(", ") : `none found in ${WORKFLOWS_DIR}`,
-            });
 
             const failed = failedRequired(checks);
             return {
@@ -229,48 +289,6 @@ export default async function plugin(bb: BbPluginApi) {
                 ? `${JSON.stringify({ environmentId: environmentId ?? null, checks }, null, 2)}\n`
                 : `${renderChecks(checks)}\n`,
             };
-          },
-        }),
-        "workflow list": cliCommand({
-          summary: "List the bb workflows bundled with pstack",
-          options: {
-            json: { type: "boolean", description: "Emit machine-readable JSON" },
-          },
-          run(input) {
-            const names = workflowNames();
-            return {
-              exitCode: 0,
-              stdout: input.options.json
-                ? `${JSON.stringify(names)}\n`
-                : `${names.join("\n")}\n`,
-            };
-          },
-        }),
-        "workflow ready": cliCommand({
-          summary:
-            "Exit 0 and print `ready` when bb workflows can run pstack's bundled workflows, else exit 1 and print why",
-          async run() {
-            if (!(await workflowsRunning())) {
-              return {
-                exitCode: 1,
-                stdout:
-                  "not ready: the workflows plugin is not running. Spawn child threads instead, or ask the user to run `bb plugin enable workflows`.\n",
-              };
-            }
-            const names = workflowNames();
-            return names.length > 0
-              ? { exitCode: 0, stdout: `ready: ${names.join(", ")}\n` }
-              : { exitCode: 1, stdout: `not ready: no bundled workflows in ${WORKFLOWS_DIR}\n` };
-          },
-        }),
-        "workflow source": cliCommand({
-          summary:
-            "Print a bundled workflow's JavaScript, for `bb workflows run --script` or the bb_workflow_run tool's script field",
-          positionals: [
-            { name: "name", description: "Workflow name, e.g. pstack-panel", required: true },
-          ],
-          run(input) {
-            return { exitCode: 0, stdout: workflowSource(input.positionals.name) };
           },
         }),
       },
