@@ -149,3 +149,17 @@ test("a playbook step that runs Opening a PR is an after-PR step, so gate pr doe
   const feature = extractSteps(readFileSync(sources.get("feature" as never)!.file, "utf8"), "numbered", "playbook");
   assert.deepEqual(feature.filter((step) => step.afterPr).map((step) => step.text.slice(0, 2)), ["8."]);
 });
+
+test("a truncated open-steps block always ends with the full remainder notice", () => {
+  const steps = Array.from({ length: 30 }, (_, index) => ({
+    id: index + 1, section: "playbook" as const, afterPr: false, resolution: { kind: "open" as const },
+    text: `Step ${index + 1} ${"x".repeat(index * 7)}`,
+  }));
+  const checklist = { threadId: "thr_x", playbook: "feature" as never, steps, revision: 0, nudgedAtRevision: null };
+  for (let max = 120; max <= 4000; max += 37) {
+    const text = renderOpenSteps(checklist, max);
+    assert.ok(text.length <= max, `length at ${max}`);
+    const shown = text.split("\n").filter((line) => /^\d+\. \[/.test(line)).length;
+    if (shown < steps.length) assert.match(text, new RegExp(`\\n${steps.length - shown} more open steps\\. Run bb pstack checklist show\\.$`), `notice at ${max}`);
+  }
+});
