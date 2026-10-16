@@ -31,7 +31,7 @@ test("only user messages or user skill mentions can activate an origin", () => {
 });
 
 test("revival retries pending delivery and stops after three successful idle revivals", () => {
-  const state: PotetoThread = { threadId: "thr_test", activatedAt: 1, phase: "activated", charterState: "pending", charterAttempts: 0, charterNextAt: 0, revivals: 0 };
+  const state: PotetoThread = { threadId: "thr_test", activatedAt: 1, phase: "activated", charterState: "pending", charterAttempts: 0, charterNextAt: 0, revivals: 0, auditCursor: null };
   assert.equal(revivalDecision(state, false), "deliver");
   assert.equal(revivalDecision({ ...state, charterState: "sent" }, false), "none");
   assert.equal(revivalDecision({ ...state, charterState: "sent" }, true), "revive");

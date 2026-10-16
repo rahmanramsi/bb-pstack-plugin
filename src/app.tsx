@@ -69,10 +69,12 @@ function ThreadBanner({ threadId }: { threadId: string }) {
   if (state.status === "loading") return null;
   if (state.status === "error") return <div className="pstack"><LoadMessage state={state} /></div>;
   const summary = bannerSummary(state.value);
+  const violations = state.value.violations.filter((violation) => violation.acknowledgedAt === null);
   if (summary.runs === 0 && summary.open === 0 && !state.value.poteto && state.refreshError === null) return null;
   return <div className="pstack"><div className="ps-banner">
     <span>{summary.runs} active {summary.runs === 1 ? "run" : "runs"} · {summary.open} open checklist {summary.open === 1 ? "step" : "steps"}</span>
     {state.value.poteto ? <span role="status">Poteto-mode {state.value.poteto}{state.value.poteto === "stalled" ? ". Begin a playbook checklist to continue." : "."}</span> : null}
+    {violations.length ? <span role="alert">{violations.length} poteto {violations.length === 1 ? "violation holds" : "violations hold"} the done gate.</span> : null}
     <Button type="button" variant="ghost" size="sm" className="ps-action" aria-label="Open runs and checklist" onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION, title: "pstack" })}>Open</Button>
   </div><LoadMessage state={state} /></div>;
 }
@@ -111,6 +113,13 @@ function ThreadInspector({ threadId, runId }: { threadId: string; runId: string 
     </>}
     {selected === null ? <p className="ps-message ps-muted">Select a run from its chat card or the active runs above.</p> : <RunInspector key={`${threadId}/${selected}`} threadId={threadId} runId={selected} />}
     {state.status !== "ready" ? null : <ChecklistPanel checklist={state.value.checklist} />}
+    {state.status !== "ready" || !state.value.violations.length ? null : <section aria-label="Poteto violations">
+      <h3>Poteto violations</h3>
+      <ul>{state.value.violations.map((violation) => <li key={violation.key}>
+        <p><code>{violation.key}</code>. {violation.detail}</p>
+        {violation.acknowledgedAt === null ? <p>To acknowledge, send <code>/poteto-mode ack {violation.key}</code> as a user message.</p> : <p>Acknowledged.</p>}
+      </li>)}</ul>
+    </section>}
   </div>;
 }
 
