@@ -1,3 +1,4 @@
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { parseChoice, type EffectiveRole } from "./models.ts";
 
 export type CatalogModel = { model: string; levels: readonly string[] };
@@ -86,4 +87,28 @@ export function renderChecks(checks: readonly Check[]): string {
       return `${mark}  ${check.subject}  (${check.detail.replace(/\s+/g, " ").trim()})`;
     })
     .join("\n");
+}
+
+/** Reads each provider's live model catalog on the environment's host (the server's when omitted). */
+export async function loadCatalog(bb: BbPluginApi, environmentId: string | undefined, ids: readonly string[]): Promise<Catalog> {
+  const routing = environmentId ? { environmentId } : {};
+  const providers = await bb.sdk.providers.list(routing);
+  const entries = await Promise.all(
+    ids.map(async (id): Promise<[string, ProviderCatalog] | null> => {
+      const info = providers.find((provider) => provider.id === id);
+      if (!info) return null;
+      if (!info.available) return [id, { state: "unavailable" }];
+      try {
+        const result = await bb.sdk.providers.models({ ...routing, providerId: id });
+        if (result.modelLoadError) return [id, { state: "error", detail: result.modelLoadError.detail ?? result.modelLoadError.code }];
+        return [id, {
+          state: "ok",
+          models: result.models.map((entry) => ({ model: entry.model, levels: entry.supportedReasoningEfforts.map((effort) => effort.reasoningEffort) })),
+        }];
+      } catch (error) {
+        return [id, { state: "error", detail: error instanceof Error ? error.message : String(error) }];
+      }
+    }),
+  );
+  return new Map(entries.filter((entry) => entry !== null));
 }

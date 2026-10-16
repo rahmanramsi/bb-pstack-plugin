@@ -616,6 +616,8 @@ export function createRunner(
   store: RunStore,
   resolveRole: (role: string) => readonly ModelChoice[],
   clock: () => number = Date.now,
+  /** Returns one problem per tuple the live catalog on the origin's host does not offer. */
+  modelProblems: (tuples: readonly string[], environmentId: string) => Promise<string[]> = async () => [],
 ): Runner {
   const spawning = new Set<string>();
   const notifying = new Set<RunId>();
@@ -972,6 +974,8 @@ export function createRunner(
       const origin = await resolveOrigin(originThreadId);
       const compiled = compile(runPlan, resolveRole, origin);
       if (!compiled.ok) throw new RunnerError("plan_invalid", compiled.error);
+      const problems = await modelProblems([...new Set(compiled.jobs.map((job) => formatChoice(job.model)))], origin.environmentId);
+      if (problems.length > 0) throw new RunnerError("plan_invalid", `models not available on this thread's machine: ${problems.join("; ")}`);
       const created = store.createRun({
         id: `psr_${randomUUID()}` as RunId,
         origin,

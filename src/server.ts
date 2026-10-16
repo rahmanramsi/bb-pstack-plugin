@@ -26,11 +26,12 @@ import {
 } from "./models.ts";
 import {
   checkRoles,
+  checkTuple,
   failedChecks,
+  loadCatalog,
   providerIds,
   renderChecks,
   type Check,
-  type ProviderCatalog,
 } from "./doctor.ts";
 
 const EMPTY_CONFIG: ModelConfig = { budget: null, roles: new Map() };
@@ -111,7 +112,14 @@ export default async function plugin(bb: BbPluginApi) {
   const db = openDatabase(bb);
   const runStore = openRunStore(db);
   const checklistStore = openChecklistStore(db);
-  const runner = createRunner(bb, runStore, resolveRole);
+  const runner = createRunner(bb, runStore, resolveRole, Date.now, async (tuples, environmentId) => {
+    const ids = [...new Set(tuples.map((tuple) => tuple.split("/")[0]!))];
+    const catalog = await loadCatalog(bb, environmentId, ids);
+    return tuples.flatMap((tuple) => {
+      const check = checkTuple(tuple, catalog);
+      return check.ok ? [] : [`${tuple}: ${check.detail}`];
+    });
+  });
 
   const checklist = createChecklistFeature({
     bb,
@@ -247,48 +255,8 @@ export default async function plugin(bb: BbPluginApi) {
               const thread = await bb.sdk.threads.get({ threadId: ctx.threadId });
               environmentId = thread.environmentId ?? undefined;
             }
-            const routing = environmentId ? { environmentId } : {};
-            const providers = await bb.sdk.providers.list(routing);
-            const entries = await Promise.all(
-              providerIds(roles).map(async (id): Promise<[string, ProviderCatalog] | null> => {
-                const info = providers.find((provider) => provider.id === id);
-                if (!info) return null;
-                if (!info.available) return [id, { state: "unavailable" }];
-                try {
-                  const result = await bb.sdk.providers.models({ ...routing, providerId: id });
-                  if (result.modelLoadError) {
-                    return [
-                      id,
-                      {
-                        state: "error",
-                        detail: result.modelLoadError.detail ?? result.modelLoadError.code,
-                      },
-                    ];
-                  }
-                  return [
-                    id,
-                    {
-                      state: "ok",
-                      models: result.models.map((entry) => ({
-                        model: entry.model,
-                        levels: entry.supportedReasoningEfforts.map(
-                          (effort) => effort.reasoningEffort,
-                        ),
-                      })),
-                    },
-                  ];
-                } catch (error) {
-                  return [
-                    id,
-                    { state: "error", detail: error instanceof Error ? error.message : String(error) },
-                  ];
-                }
-              }),
-            );
-            const catalog = new Map(entries.filter((entry) => entry !== null));
+            const catalog = await loadCatalog(bb, environmentId, providerIds(roles));
             const checks: Check[] = checkRoles(roles, catalog);
-
-
             const failed = failedChecks(checks);
             return {
               exitCode: failed.length > 0 ? 1 : 0,

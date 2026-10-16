@@ -96,7 +96,7 @@ function harness() {
   const worker = (index: number) => `thr_w${index}`;
   const toWorker = (threadId: string) => sent.filter((message) => message.threadId === threadId);
   const toOrigin = () => sent.filter((message) => message.threadId === "thr_origin");
-  return { bb, threads, spawned, sent, stopped, failures, store, runner, restart, clock, worker, toWorker, toOrigin };
+  return { bb, db, threads, spawned, sent, stopped, failures, store, runner, restart, clock, worker, toWorker, toOrigin };
 }
 
 const PANEL_INPUT = {
@@ -497,4 +497,18 @@ test("workerResult names a worker's contract from its metadata before attach and
   assert.equal(h.runner.workerResult("thr_origin", {}), null);
   assert.equal(h.runner.workerResult("thr_x", { pstackWorker: 1 }), null);
   assert.deepEqual(h.runner.activeRuns("thr_origin"), [runId]);
+});
+
+test("start rejects a plan whose models the origin's machine does not offer, before any spawn", async () => {
+  const h = harness();
+  const checked: { tuples: readonly string[]; environmentId: string }[] = [];
+  const runner = createRunner(h.bb, h.store, resolveRole, () => h.clock.now, async (tuples, environmentId) => {
+    checked.push({ tuples, environmentId });
+    return tuples.filter((tuple) => tuple.startsWith("codex/")).map((tuple) => `${tuple}: codex has no such model`);
+  });
+  await assert.rejects(runner.start(PANEL, "thr_origin"), (error: Error & { code?: string }) =>
+    error.code === "plan_invalid" && /models not available on this thread's machine: codex\//.test(error.message));
+  assert.equal(h.spawned.length, 0);
+  assert.equal(checked[0]?.environmentId, "env_1");
+  assert.ok(checked[0]!.tuples.length >= 2);
 });
