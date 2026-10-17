@@ -23,6 +23,7 @@ import {
   TERMINAL,
   acceptReport,
   effectMarker,
+  isReasoningLevel,
   plan,
   settle,
   stop as stopChange,
@@ -164,7 +165,7 @@ export function createIssues(deps: IssuesDeps): Issues {
             model: spec.model,
             reasoningLevel: spec.reasoningLevel,
             ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
-          } as Parameters<typeof bb.sdk.threads.spawn>[0]);
+          });
           return done({ threadId: thread.id });
         } catch (error) {
           return { kind: "unknown", error: `spawn: ${message(error)}` };
@@ -261,7 +262,10 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (!choice) return { error: "no model is configured for the issue worker role" };
     const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId });
     const permissionMode = defaults?.permissionMode ?? null;
-    if (choice.kind === "tuple") return { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
+    if (choice.kind === "tuple") {
+      if (!isReasoningLevel(choice.reasoningLevel)) return { error: `the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows` };
+      return { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
+    }
     if (!defaults) return { error: `the issue worker role inherits the project's model, and project ${projectId} has no default` };
     return { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
   }

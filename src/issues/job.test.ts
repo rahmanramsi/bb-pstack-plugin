@@ -8,6 +8,7 @@ import {
   acceptReport,
   branchFor,
   enter,
+  isReasoningLevel,
   plan,
   prBody,
   settle,
@@ -23,6 +24,7 @@ import {
   type RepoName,
   type ReportFacts,
   type Sha,
+  type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
 
@@ -329,4 +331,12 @@ test("the view names the pending effect of a transit state", () => {
   const view = toView(job({ phase: transit("publishing", [pushEffect], { tries: 2, nextAt: NOW + 5 }) }));
   assert.deepEqual(view.next, { state: "review", op: "push", tries: 2, retryAt: NOW + 5 });
   assert.equal(toView(job()).next, null);
+});
+
+test("a spawn spec takes only the reasoning levels bb's SDK accepts", () => {
+  // @ts-expect-error "extreme" is not a reasoning level
+  const level: SpawnSpec["reasoningLevel"] = "extreme";
+  assert.equal(level, "extreme");
+  assert.equal(isReasoningLevel("xhigh"), true);
+  assert.equal(isReasoningLevel("extreme"), false);
 });

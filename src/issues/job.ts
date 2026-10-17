@@ -5,6 +5,7 @@
  * The head effect runs, and when the last one succeeds the job enters TRANSIT[state]. plan() returns one action at a
  * time, settle() turns an effect's outcome into the next Change, and acceptReport() is the only way out of `working`.
  */
+import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
@@ -48,7 +49,13 @@ export function isTransit(state: JobState): state is TransitState {
   return Object.hasOwn(TRANSIT, state);
 }
 
-export type PermissionMode = "accept-edits" | "auto" | "full";
+type SpawnArgs = Parameters<PluginBoundThreadsArea["spawn"]>[0];
+export type ReasoningLevel = NonNullable<SpawnArgs["reasoningLevel"]>;
+export type PermissionMode = NonNullable<SpawnArgs["permissionMode"]>;
+
+/** The SDK exports the type but not its values; `satisfies` fails the build when the two drift apart. */
+const REASONING_LEVELS = { none: true, low: true, medium: true, high: true, xhigh: true, max: true, ultra: true, ultracode: true } satisfies Record<ReasoningLevel, true>;
+export const isReasoningLevel = (value: string): value is ReasoningLevel => Object.hasOwn(REASONING_LEVELS, value);
 
 /** Resolved once at `start` and stored in the outbox, so a probe or a replay never sees a different prompt. */
 export type SpawnSpec = {
@@ -56,7 +63,7 @@ export type SpawnSpec = {
   prompt: string;
   providerId: string;
   model: string;
-  reasoningLevel: string;
+  reasoningLevel: ReasoningLevel;
   permissionMode: PermissionMode | null;
 };
 

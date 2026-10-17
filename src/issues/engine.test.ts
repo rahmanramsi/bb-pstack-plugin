@@ -273,6 +273,7 @@ function harness() {
   const db = new Database(":memory:");
   for (const statement of MIGRATIONS) db.exec(statement);
   let repoLine = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
+  let workerRole = "codex/gpt-6.1-sol/high";
 
   /** A store that goes dead when its engine "crashes": reads find nothing and writes change nothing. */
   function engine() {
@@ -297,7 +298,7 @@ function harness() {
         return { status: "pushed", sha: input.sha };
       },
       repos: () => [repoLine],
-      resolveRole: (role) => (role === "issue worker" ? [parseChoice("codex/gpt-6.1-sol/high")!] : []),
+      resolveRole: (role) => (role === "issue worker" ? [parseChoice(workerRole)!] : []),
       prGate: () => (failures.gate ? { pass: false, reason: failures.gate } : { pass: true }),
       clock: () => clock.now,
     });
@@ -364,6 +365,7 @@ function harness() {
     restart,
     engine: () => current,
     setRepo: (line: typeof repoLine) => (repoLine = line),
+    setWorkerRole: (value: string) => (workerRole = value),
     holdAt: (key: string, where: "sdk" | "github") => {
       const h = hold(key);
       (where === "sdk" ? holds : gh.holds).push(h);
@@ -656,4 +658,14 @@ test("a worker cannot stop jobs, and a thread naming a job that is not waiting f
   await h.events.get("thread.idle")!({ thread: { id: duplicate.id, originPluginId: "pstack" } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(h.stopped, ["thr_dup"]);
+});
+
+test("a worker role with a reasoning level bb does not know never reaches a spawn", async () => {
+  const h = harness();
+  h.setWorkerRole("codex/gpt-6.1-sol/extreme");
+  h.label(41);
+  await h.engine().issues.sweep();
+  const job = await h.only();
+  assert.equal(h.spawned.length, 0);
+  assert.match(job.error!, /reasoning level "extreme"/);
 });
