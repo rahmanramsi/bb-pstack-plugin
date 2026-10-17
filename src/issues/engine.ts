@@ -21,9 +21,11 @@ import {
   FACTS_FOR,
   LABEL,
   MAX_REJECTIONS,
+  REPORTING,
   Report,
   TERMINAL,
   acceptReport,
+  awaitingThread,
   effectMarker,
   isReasoningLevel,
   plan,
@@ -40,6 +42,7 @@ import {
   type GateFact,
   type Job,
   type JobId,
+  type PullState,
   type RepoName,
   type ReportFacts,
   type Sha,
@@ -116,7 +119,7 @@ export function createIssues(deps: IssuesDeps): Issues {
    * Threads in the job's project whose metadata names the job, created since it was, and not bound to another job.
    * bb lists pinned threads first and then newest first, so paging stops at the first unpinned thread older than that.
    */
-  async function threadsNaming(job: Job, signal?: AbortSignal): Promise<string[]> {
+  async function threadsNaming(job: Job, signal?: AbortSignal | undefined): Promise<string[]> {
     const found: string[] = [];
     const since = job.createdAt - 60_000;
     const PAGE = 100;
@@ -191,7 +194,8 @@ export function createIssues(deps: IssuesDeps): Issues {
         }
       },
       async probe(job, _effect, deadline) {
-        const [threadId] = await threadsNaming(job, until(deadline));
+        // A replacement's probe must not adopt the thread it replaces, which still names the job.
+        const [threadId] = (await threadsNaming(job, until(deadline))).filter((id) => id !== job.threadId);
         return threadId ? done({ threadId }) : { kind: "absent" };
       },
     },
@@ -244,6 +248,61 @@ export function createIssues(deps: IssuesDeps): Issues {
       async probe(job, effect, deadline) {
         const since = (("effects" in job.phase && job.phase.firstAt) || clock()) - 60_000;
         return (await github.repo(job.repo, until(deadline)).findComment(job.issue, effectMarker(effect.key), since)) ? done() : { kind: "absent" };
+      },
+    },
+    "send-round": {
+      async perform(job, effect) {
+        if (!job.threadId) return { kind: "fail", error: "the job has no worker thread" };
+        try {
+          // Queued behind a turn that is still running, never steered into it.
+          await bb.sdk.threads.send({ threadId: job.threadId, mode: "queue-if-active", input: [{ type: "text", text: effect.text, mentions: [] }] });
+        } catch (error) {
+          if (isMissing(error)) return { kind: "fail", error: "the worker thread is gone" };
+          throw error;
+        }
+        return done();
+      },
+    },
+    reply: {
+      async perform(job, effect, deadline) {
+        if (!job.pr) return { kind: "fail", error: "the pull request to reply on is not recorded" };
+        const repo = github.repo(job.repo, until(deadline));
+        const body = `${effect.body}\n\n${effectMarker(effect.key)}`;
+        if (effect.target.kind !== "review-comment") {
+          await repo.comment(job.pr.number, body);
+          return done();
+        }
+        try {
+          await repo.replyToReviewComment(job.pr.number, effect.target.id, body);
+        } catch (error) {
+          // The reviewer deleted the comment; there is no thread left to answer in.
+          if (error instanceof GitHubPermanentError && error.status === 404) bb.log.info(`pstack issues: ${job.id}: review comment ${effect.target.id} is gone, reply dropped`);
+          else throw error;
+        }
+        return done();
+      },
+      async probe(job, effect, deadline) {
+        if (!job.pr) return { kind: "absent" };
+        const repo = github.repo(job.repo, until(deadline));
+        const since = (("effects" in job.phase && job.phase.firstAt) || clock()) - 60_000;
+        const marker = effectMarker(effect.key);
+        const found = effect.target.kind === "review-comment" ? await repo.findReviewComment(job.pr.number, marker, since) : await repo.findComment(job.pr.number, marker, since);
+        return found ? done() : { kind: "absent" };
+      },
+    },
+    "request-review": {
+      async perform(job, effect, deadline) {
+        if (!job.pr) return { kind: "fail", error: "the pull request to request reviews on is not recorded" };
+        const { dropped } = await github.repo(job.repo, until(deadline)).requestReviewers(job.pr.number, effect.reviewers);
+        if (dropped.length > 0) bb.log.info(`pstack issues: ${job.id}: GitHub refused review requests for ${dropped.join(", ")}`);
+        return done();
+      },
+    },
+    "edit-pr": {
+      async perform(job, effect, deadline) {
+        if (!job.pr) return { kind: "fail", error: "the pull request to edit is not recorded" };
+        await github.repo(job.repo, until(deadline)).editPull(job.pr.number, { body: effect.body });
+        return done();
       },
     },
     "stop-thread": {
@@ -310,9 +369,17 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  /** Each open pull request's state as of the last poll, by job. Empty until the first poll after a start. */
+  const pullStates = new Map<JobId, PullState>();
+
   async function gather(job: Job): Promise<Facts> {
     const wanted = FACTS_FOR[job.phase.state];
-    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null };
+    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, pr: null };
+    if (wanted.includes("feedback")) facts.feedback = store.feedback(job.id);
+    if (wanted.includes("pr")) {
+      const state = pullStates.get(job.id);
+      facts.pr = state ? { state } : null;
+    }
     if (wanted.includes("slotFree")) {
       const { busy, ahead } = store.slots(job.id);
       facts.slotFree = ahead < CONCURRENCY - busy;
@@ -415,7 +482,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         newCommit: job.pushedSha === null ? tree.ahead > 0 : tree.headSha !== job.pushedSha,
         gate: job.threadId ? deps.prGate(job.threadId) : { pass: false, reason: "the job has no worker thread" },
         titleConvention: await github.repo(job.repo).titleConvention(),
-        listedCommentIds: [],
+        listed: store.roundFeedback(job.id, job.round),
       };
     } catch (error) {
       return { unavailable: message(error) };
@@ -435,11 +502,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     const bound = store.byThread(threadId);
     if (!bound) {
       const named = (await namedJob(threadId))?.job;
-      if (named?.phase.state !== "starting") return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can report" };
+      if (!named || !awaitingThread(named)) return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can report" };
       background(tick(named.id));
       return { ok: false, code: "unavailable", message: "pstack has not confirmed this thread as the issue's worker yet, try again shortly" };
     }
-    if (bound.phase.state !== "working") return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report` };
+    if (bound.phase.state === "sending") return { ok: false, code: "unavailable", message: "pstack is still starting this round, try again shortly" };
+    if (!REPORTING.has(bound.phase.state)) return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report` };
     let parsed: Report;
     try {
       const result = Report.safeParse(JSON.parse(text));
@@ -452,7 +520,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     if ("unavailable" in facts) return { ok: false, code: "unavailable", message: `pstack could not check the report yet, try again shortly: ${facts.unavailable}` };
 
     const written = writeFresh(bound.id, (job) => {
-      if (job.phase.state !== "working") return null;
+      if (!REPORTING.has(job.phase.state) || job.round !== bound.round) return null;
       const verdict = acceptReport(job, parsed, facts);
       return { change: verdict.change, result: verdict };
     });
@@ -460,7 +528,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const outcome = written.result;
     background(tick(bound.id));
     if (!outcome.ok) {
-      const ended = written.job.phase.state !== "working";
+      const ended = !REPORTING.has(written.job.phase.state);
       return {
         ok: false,
         code: "rejected",
@@ -472,6 +540,10 @@ export function createIssues(deps: IssuesDeps): Issues {
       };
     }
     const sha = short(facts.worktree.headSha);
+    if (bound.round > 1) {
+      const push = parsed.outcome === "changes" ? `pushes ${sha} to ${bound.branch}, ` : "";
+      return { ok: true, message: `Report accepted. pstack ${push}posts your replies, and asks the reviewers to look again.` };
+    }
     const messages = {
       changes: `Report accepted. pstack pushes ${sha} to ${bound.branch} and opens a draft pull request.`,
       "needs-info": "Report accepted. pstack posts your questions on the issue.",
@@ -496,7 +568,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const named = await namedJob(threadId);
     if (!named) return;
     const { job } = named;
-    if (job?.phase.state === "starting") return tick(job.id);
+    if (job && awaitingThread(job)) return tick(job.id);
     if (job && ("effects" in job.phase ? job.phase.effects.some((effect) => effect.op === "stop-thread") : false)) return;
     await bb.sdk.threads.stop({ threadId }).catch((error) => {
       if (!isMissing(error)) throw error;

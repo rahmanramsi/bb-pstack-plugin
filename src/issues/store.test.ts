@@ -118,11 +118,10 @@ test("the migration's state lists match job.ts", () => {
   assert.deepEqual(list(/issue_jobs_open[\s\S]*?state NOT IN \(([^)]*)\)/), new Set(TERMINAL));
 });
 
-test("due lists only jobs that can act now: not a job resting in review, nor an effect under a lease or a backoff", () => {
+test("due lists only jobs that can act now: not a job waiting for an answer, nor an effect under a lease or a backoff", () => {
   const { store } = setup();
-  const [queued, review, leased, backoff, ready] = [41, 42, 43, 44, 45].map((issue, index) => store.insert(newJob({ issue }), 10 + index)!);
-  const sha = "a".repeat(40) as Sha;
-  store.write(review!.id, 0, { phase: { state: "review" }, threadId: "thr_r", pushedSha: sha, pr: { number: 3, url: "u" } }, 20);
+  const [queued, asking, leased, backoff, ready] = [41, 42, 43, 44, 45].map((issue, index) => store.insert(newJob({ issue }), 10 + index)!);
+  store.write(asking!.id, 0, { phase: { state: "needs-info" }, threadId: "thr_r" }, 20);
   store.write(leased!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, leaseUntil: 200 } } as Change, 20);
   store.write(backoff!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 200 } } as Change, 20);
   store.write(ready!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 100 } } as Change, 20);

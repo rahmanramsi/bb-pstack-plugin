@@ -4,7 +4,7 @@
  * cache and the REST wire format stay in here. Callers see domain types and three error classes.
  */
 import { createHash, createPrivateKey, createSign } from "node:crypto";
-import { CONVENTIONAL_TITLE, type PolledFeedback, type RepoName, type Sha } from "./job.ts";
+import { CONVENTIONAL_TITLE, type PolledFeedback, type PullState, type RepoName, type Sha } from "./job.ts";
 
 export type GitHubCredentials = { appId: string; privateKey: string };
 
@@ -51,7 +51,6 @@ export type LabelEvent = { id: number; actor: string; at: number };
 export type PollCursor = { readonly __brand: "PollCursor" };
 /** Opaque to callers, like PollCursor: per pull request list cursors, ETags, and the last known review states. */
 export type FeedbackCursor = { readonly __brand: "FeedbackCursor" };
-export type PullState = "open" | "merged" | "closed";
 
 export type RepoClient = {
   readonly name: RepoName;

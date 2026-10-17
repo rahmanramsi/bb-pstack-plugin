@@ -5,10 +5,14 @@ import {
   EFFECT_POLICY,
   MAX_EFFECT_TRIES,
   Report,
+  TRANSIT,
   acceptReport,
   branchFor,
+  FEEDBACK_QUIET_MS,
+  MAX_FEEDBACK_ROUNDS,
   counts,
   enter,
+  roundPrompt,
   isReasoningLevel,
   plan,
   prBody,
@@ -19,6 +23,7 @@ import {
   type Change,
   type Effect,
   type Facts,
+  type Feedback,
   type Job,
   type JobId,
   type Phase,
@@ -64,7 +69,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, waiting: null, gate: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, pr: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);
@@ -76,6 +81,8 @@ const labelEffect: Effect = { op: "labels", key: "labels:x", on: "issue", add: [
 const pushEffect: Effect = { op: "push", key: "push:x", sha: HEAD, expectedRemoteSha: null };
 
 /** Applies a Change the way the store does, so a test can follow a job through several steps. */
+const TRANSIT_OF = (current: Job) => ("effects" in current.phase ? TRANSIT[current.phase.state] : null);
+
 function apply(current: Job, change: Change): Job {
   const { startRound, ...rest } = change;
   return { ...current, ...rest, ...(startRound ? { round: startRound.ordinal } : {}), version: current.version + 1, updatedAt: NOW };
@@ -235,7 +242,7 @@ const REPORT = Report.parse({
 const reasonsOf = (verdict: ReturnType<typeof acceptReport>) => (verdict.ok ? [] : verdict.reasons);
 
 function reportFacts(overrides: Partial<ReportFacts> = {}): ReportFacts {
-  return { now: NOW, worktree: { headSha: HEAD, dirty: false }, newCommit: true, gate: { pass: true }, titleConvention: "conventional", listedCommentIds: [], ...overrides };
+  return { now: NOW, worktree: { headSha: HEAD, dirty: false }, newCommit: true, gate: { pass: true }, titleConvention: "conventional", listed: [], ...overrides };
 }
 
 test("an accepted changes report publishes the reported commit: push, draft PR, PR label, issue relabel", () => {
@@ -273,14 +280,14 @@ test("a report is rejected with every reason, and the second rejection sticks th
   const bad = Report.parse({
     outcome: "changes",
     pr: { title: "Fixed it", body: "I ran /poteto-mode and closed the checklist." },
-    replies: [{ commentId: 7, body: "done" }],
+    replies: [{ kind: "review-comment", commentId: 7, body: "done" }],
     verification: ["npm test"],
     summary: "s",
   });
   const verdict = acceptReport(working, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true }, newCommit: false, gate: { pass: false, reason: "2 open steps block the pr gate." } }));
   assert.equal(verdict.ok, false);
   const reasons = reasonsOf(verdict).join("\n");
-  for (const expected of [/uncommitted/, /needs a new commit/, /gate pr` fails: 2 open steps/, /not listed.*7/, /10 to 72/, /Conventional Commits/, /describes the process \("\/poteto-mode"\)/]) {
+  for (const expected of [/uncommitted/, /needs a new commit/, /gate pr` fails: 2 open steps/, /not listed.*review-comment 7/, /10 to 72/, /Conventional Commits/, /describes the process \("\/poteto-mode"\)/]) {
     assert.match(reasons, expected);
   }
   assert.deepEqual(verdict.change, { rejections: 1, error: `report rejected: ${reasonsOf(verdict).join("; ")}` });
@@ -360,4 +367,165 @@ test("feedback counts per the operator's rules: /agent conversation comments, an
   assert.equal(item("review-comment", "Rename this.", "COMMENTED"), true);
   assert.equal(item("review-comment", "Rename this.", "APPROVED"), false);
   assert.equal(item("review-comment", "Rename this.", "DISMISSED"), false);
+});
+
+const PUSHED = "b".repeat(40) as Sha;
+const NEXT = "c".repeat(40) as Sha;
+const PR = { number: 7, url: "https://github.com/acme/web/pull/7" };
+const inline = (id: number, createdAt: number, author = "maya"): Feedback => ({
+  kind: "review-comment",
+  id,
+  author,
+  body: `Rename the helper (${id}).`,
+  path: "src/login.ts",
+  line: 12,
+  diffHunk: "@@ -10,3 +10,3 @@\n-const x = 1;\n+const y = 1;",
+  inReplyTo: null,
+  reviewId: 500,
+  createdAt,
+});
+const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A few things.\nSee inline.", path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW - 3 * MIN };
+const inReview = (overrides: Partial<Job> = {}) =>
+  job({ phase: { state: "review" }, threadId: "thr_w", pushedSha: PUSHED, pr: PR, worker: WORKER, report: { ...REPORT, headSha: PUSHED, acceptedAt: NOW - 60 * MIN }, ...overrides });
+const pending = (items: Feedback[]) => ({ feedback: { pending: items, rounds: [{ ordinal: 1, summary: "Footer overlap fixed." }] }, pr: { state: "open" as const }, slotFree: true, thread: { kind: "idle" as const, since: NOW - MIN } });
+
+test("a round starts only once the newest pending feedback has been quiet for two minutes, with every pending item", () => {
+  const review = inReview();
+  assert.equal(plan(review, facts({ ...pending([]) })), null, "no feedback, nothing to do");
+  const fresh = [inline(1, NOW - 5 * MIN), inline(2, NOW - MIN)];
+  assert.deepEqual(plan(review, facts(pending(fresh))), { type: "sleep", until: NOW - MIN + FEEDBACK_QUIET_MS }, "a comment a minute ago holds the round");
+  assert.equal(plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), slotFree: false })), null, "every worker slot is taken");
+
+  const items = [inline(1, NOW - 5 * MIN), inline(2, NOW - FEEDBACK_QUIET_MS)];
+  const action = plan(review, facts(pending(items)));
+  assert.equal(action?.type, "change");
+  const change = (action as { change: Change }).change;
+  assert.deepEqual(change.startRound, { ordinal: 2, kind: "feedback", baseSha: PUSHED, feedback: [{ kind: "review-comment", id: 1 }, { kind: "review-comment", id: 2 }] });
+  assert.equal(change.deadline, NOW + 60 * MIN);
+  const sending = apply(review, change);
+  assert.equal(sending.round, 2);
+  assert.ok("effects" in sending.phase);
+  assert.equal(sending.phase.state, "sending");
+  assert.deepEqual(sending.phase.effects[0], { op: "labels", key: `labels:${review.id}:working:2`, on: "issue", add: ["agent:working"], remove: ["agent:review"] });
+  const send = sending.phase.effects[1];
+  assert.equal(send?.op, "send-round");
+  assert.equal(send?.op === "send-round" && send.text, roundPrompt(review, 2, pending(items).feedback));
+});
+
+test("the round message stands alone: the pull request, the issue, every item with its id and diff, earlier rounds, and the rules", () => {
+  const text = roundPrompt(inReview(), 3, { pending: [reviewBody, inline(1, NOW)], rounds: [{ ordinal: 1, summary: "Footer overlap fixed." }, { ordinal: 2, summary: "Renamed the parser." }] });
+  assert.match(text, /^Feedback round 2 of 5 on pull request https:\/\/github\.com\/acme\/web\/pull\/7 \(branch `agent\/issue-41-/);
+  assert.match(text, /```text\nSubmit button hides behind the footer\n\nOn 375px/);
+  assert.match(text, /- The first round: Footer overlap fixed\.\n- Feedback round 1: Renamed the parser\./);
+  assert.match(text, /### Review by @lee: `\{ "kind": "review", "commentId": 500 \}`\n\n```text\nA few things\.\nSee inline\.\n```/);
+  assert.match(text, /### Inline comment by @maya: `\{ "kind": "review-comment", "commentId": 1 \}`\n\nOn `src\/login\.ts` line 12:\n\n```diff\n@@ -10,3/);
+  assert.match(text, /data from a GitHub user/);
+  assert.match(text, /through `\/poteto-mode`/);
+  assert.match(text, /never rewrite pushed history[\s\S]*merging it/i);
+  assert.match(text, /bb pstack issues report --file/);
+});
+
+test("a worker thread gone by the time a round starts is replaced from the pushed branch, as a spawn of its own", () => {
+  const review = inReview();
+  const action = plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "gone" } }));
+  const respawning = apply(review, (action as { change: Change }).change);
+  assert.ok("effects" in respawning.phase);
+  assert.equal(respawning.phase.state, "respawning");
+  const spawn = respawning.phase.effects[1];
+  assert.ok(spawn?.op === "spawn");
+  assert.equal(spawn.key, `spawn:${review.id}:2`);
+  assert.deepEqual({ ...spawn.spec, prompt: undefined }, { ...WORKER, title: "acme/web#41: Submit button hides behind the footer", baseRef: `origin/${review.branch}`, prompt: undefined });
+  assert.match(spawn.spec.prompt, /^Feedback round 1 of 5/);
+
+  const legacy = plan(inReview({ worker: null }), facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "gone" } }));
+  assert.equal((legacy as { change: Change }).change.phase?.state, "sticking");
+});
+
+test("feedback after the fifth feedback round sticks the job instead of starting a sixth", () => {
+  const items = [inline(1, NOW - 5 * MIN)];
+  assert.equal((plan(inReview({ round: MAX_FEEDBACK_ROUNDS }), facts(pending(items))) as { change: Change }).change.phase?.state, "sending");
+  const limit = plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1 }), facts(pending(items)));
+  const stuck = (limit as { change: Change }).change;
+  assert.equal(stuck.phase?.state, "sticking");
+  assert.match(stuck.error!, /new feedback after 5 feedback rounds/);
+  assert.equal(plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1 }), facts(pending([]))), null, "no new feedback, nothing to end");
+});
+
+test("a merged or closed pull request ends the job from review or from a running round, stopping the worker", () => {
+  for (const state of ["merged", "closed"] as const) {
+    for (const current of [inReview(), inReview({ phase: { state: "addressing" }, round: 2, deadline: NOW + MIN })]) {
+      const action = plan(current, facts({ ...pending([inline(1, NOW - 5 * MIN)]), pr: { state }, thread: { kind: "active" } }));
+      const closing = apply(current, (action as { change: Change }).change);
+      assert.ok("effects" in closing.phase);
+      assert.equal(closing.phase.state, "closing");
+      assert.deepEqual(closing.phase.effects.map((effect) => effect.op), ["stop-thread", "labels"]);
+      assert.deepEqual(closing.phase.effects[1], { op: "labels", key: `labels:${current.id}:close`, on: "issue", add: [], remove: ["agent:working", "agent:needs-info", "agent:review"] });
+      assert.equal(apply(closing, settle({ ...closing, phase: { ...closing.phase, effects: [closing.phase.effects[1]], tries: 1 } } as Job, { kind: "done", patch: {} }, NOW)).phase.state, "done");
+    }
+  }
+  assert.equal(plan(inReview(), facts({ ...pending([inline(1, NOW - 5 * MIN)]), pr: null })), null, "an unknown pull request state starts nothing");
+});
+
+test("a running round times out, nudges and sticks like the first one", () => {
+  const addressing = inReview({ phase: { state: "addressing" }, round: 2, deadline: NOW + 30 * MIN, updatedAt: NOW - MIN });
+  const open = { pr: { state: "open" as const } };
+  assert.deepEqual(plan(addressing, facts({ ...open, thread: { kind: "active" } })), { type: "sleep", until: NOW + 30 * MIN });
+  assert.equal(plan(addressing, facts({ ...open, thread: { kind: "idle", since: NOW - 10 } }))?.type, "nudge");
+  assert.equal((plan({ ...addressing, deadline: NOW }, facts({ ...open, thread: { kind: "active" } })) as { change: Change }).change.phase?.state, "sticking");
+});
+
+const ROUND_FACTS = (overrides: Partial<ReportFacts> = {}) => reportFacts({ worktree: { headSha: NEXT, dirty: false }, listed: [reviewBody, inline(1, NOW - 5 * MIN)], gate: { pass: false, reason: "3 open steps" }, ...overrides });
+const REPLIES = [
+  { kind: "review", commentId: 500, body: "Renamed both helpers in ccccccc." },
+  { kind: "review-comment", commentId: 1, body: "Renamed to `parseInput` in ccccccc, cc @lee." },
+] as const;
+
+test("a feedback round's changes report pushes on top of the pushed commit, answers every item, edits the body, and re-requests review, in that order", () => {
+  const addressing = inReview({ phase: { state: "addressing" }, round: 2 });
+  const report = Report.parse({ outcome: "changes", pr: { title: "ignored after the first round", body: "## Why\nRenamed helpers." }, replies: REPLIES, verification: ["npm test: 15 passed"], summary: "Renamed the helpers." });
+  const verdict = acceptReport(addressing, report, ROUND_FACTS());
+  assert.ok(verdict.ok, reasonsOf(verdict).join("; "));
+  const republishing = apply(addressing, verdict.change);
+  assert.equal(republishing.phase.state, "republishing");
+  assert.ok("effects" in republishing.phase);
+  assert.deepEqual(republishing.phase.effects, [
+    { op: "push", key: `push:${addressing.id}:${NEXT}`, sha: NEXT, expectedRemoteSha: PUSHED },
+    { op: "reply", key: `reply:${addressing.id}:2:review:500`, target: { kind: "review", id: 500 }, body: "> A few things.\n\nRenamed both helpers in ccccccc." },
+    { op: "reply", key: `reply:${addressing.id}:2:review-comment:1`, target: { kind: "review-comment", id: 1 }, body: "Renamed to `parseInput` in ccccccc, cc `@lee`." },
+    { op: "edit-pr", key: `edit-pr:${addressing.id}:2`, body: "## Why\nRenamed helpers.\n\nCloses #41" },
+    { op: "request-review", key: `request-review:${addressing.id}:2`, reviewers: ["lee", "maya"] },
+    { op: "labels", key: `labels:${addressing.id}:review:2`, on: "issue", add: ["agent:review"], remove: ["agent:working"] },
+  ]);
+  assert.equal(TRANSIT_OF(republishing), "review");
+
+  const noChange = acceptReport(addressing, Report.parse({ outcome: "no-change", replies: REPLIES, verification: ["read the code"], summary: "Explained the naming." }), ROUND_FACTS({ newCommit: false, worktree: { headSha: PUSHED, dirty: false } }));
+  assert.ok(noChange.ok);
+  const replying = apply(addressing, noChange.change);
+  assert.ok("effects" in replying.phase);
+  assert.equal(replying.phase.state, "replying");
+  assert.deepEqual(replying.phase.effects.map((effect) => effect.op), ["reply", "reply", "request-review", "labels"]);
+});
+
+test("a feedback round's report must answer exactly the listed items, add a commit only with changes, and never ask for info", () => {
+  const addressing = inReview({ phase: { state: "addressing" }, round: 2 });
+  const changes = (replies: readonly unknown[]) => Report.parse({ outcome: "changes", replies, verification: ["npm test"], summary: "s" });
+
+  assert.ok(acceptReport(addressing, changes(REPLIES), ROUND_FACTS()).ok, "the gate and the pull request title are first-round checks");
+  const partial = reasonsOf(acceptReport(addressing, changes([REPLIES[0], { kind: "pr-comment", commentId: 1, body: "x" }]), ROUND_FACTS())).join("\n");
+  assert.match(partial, /missing: review-comment 1/);
+  assert.match(partial, /not listed, remove their replies: pr-comment 1/);
+  assert.match(reasonsOf(acceptReport(addressing, changes([...REPLIES, REPLIES[1]]), ROUND_FACTS())).join("\n"), /repeated: review-comment 1/);
+  assert.match(reasonsOf(acceptReport(addressing, changes(REPLIES), ROUND_FACTS({ newCommit: false }))).join("\n"), /needs a new commit on top of the pushed commit/);
+  const noChange = Report.parse({ outcome: "no-change", replies: REPLIES, verification: ["read it"], summary: "s" });
+  assert.match(reasonsOf(acceptReport(addressing, noChange, ROUND_FACTS())).join("\n"), /`no-change` must not add commits/);
+  const asking = Report.parse({ outcome: "needs-info", questions: ["Which helper?"], replies: REPLIES, verification: ["read it"] });
+  assert.match(reasonsOf(acceptReport(addressing, asking, ROUND_FACTS({ newCommit: false }))).join("\n"), /`needs-info` is not an outcome in a feedback round/);
+  const process = changes([REPLIES[0], { kind: "review-comment", commentId: 1, body: "Done in this round." }]);
+  assert.match(reasonsOf(acceptReport(addressing, process, ROUND_FACTS())).join("\n"), /reply to review-comment 1 describes the process \("this round"\)/);
+  const badBody = Report.parse({ outcome: "changes", pr: { body: "Ran the playbook." }, replies: REPLIES, verification: ["npm test"], summary: "s" });
+  assert.match(reasonsOf(acceptReport(addressing, badBody, ROUND_FACTS())).join("\n"), /body describes the process/);
+
+  const first = job({ phase: { state: "working" }, threadId: "thr_w" });
+  const titleless = Report.parse({ outcome: "changes", verification: ["npm test"], summary: "s" });
+  assert.match(reasonsOf(acceptReport(first, titleless, reportFacts())).join("\n"), /first `changes` report needs `pr.title` and `pr.body`/);
 });
