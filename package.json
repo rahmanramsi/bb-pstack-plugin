@@ -34,7 +34,7 @@
     "unslop"
   ],
   "scripts": {
-    "test": "node --test src/*.test.ts src/ui/*.test.ts",
+    "test": "node --test src/*.test.ts src/issues/*.test.ts src/ui/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "bb plugin build"
   },
