@@ -429,6 +429,8 @@ test("the round message stands alone: the pull request, the issue, every item wi
 
 test("a worker thread gone by the time a round starts is replaced from the pushed branch, as a spawn of its own", () => {
   const review = inReview();
+  const failed = plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "failed", error: "provider crashed" } }));
+  assert.equal((failed as { change: Change }).change.phase?.state, "respawning", "a failed thread is replaced too");
   const action = plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "gone" } }));
   const respawning = apply(review, (action as { change: Change }).change);
   assert.ok("effects" in respawning.phase);

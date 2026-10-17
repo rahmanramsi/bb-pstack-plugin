@@ -223,3 +223,19 @@ test("a reviewer's text that carries another reply's marker cannot make that rep
   assert.match(posted[1]!, /Renamed y in 3333333/);
   assert.ok(!posted[0]!.includes(sibling), "a marker in quoted text is not posted");
 });
+
+test("a worker thread that failed while its pull request waited for review is replaced on the next round, not sent the round", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  h.threads.get(job.threadId!)!.status = "error";
+  const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+
+  const addressing = await h.only();
+  assert.equal(addressing.state, "addressing", addressing.error ?? "");
+  assert.notEqual(addressing.threadId, job.threadId);
+  assert.equal(h.spawned.length, 2);
+  assert.equal(h.sent.length, 0);
+  assert.match(h.spawned[1]!.prompt, new RegExp(`"commentId": ${comments[0]}`));
+});

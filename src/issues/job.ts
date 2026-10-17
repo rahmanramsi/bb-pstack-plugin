@@ -392,7 +392,9 @@ function next(job: Job, facts: Facts): Action | null {
       const quietAt = Math.max(...feedback.pending.map((item) => item.createdAt)) + FEEDBACK_QUIET_MS;
       if (quietAt > now) return { type: "sleep", until: quietAt };
       if (!facts.slotFree || !facts.thread) return null;
-      return { type: "change", change: startRound(job, feedback, facts.thread.kind === "gone", now) };
+      // A failed thread cannot take the round's message; it is replaced like a gone one.
+      const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
+      return { type: "change", change: startRound(job, feedback, respawn, now) };
     }
     case "addressing":
     case "working": {
@@ -463,7 +465,7 @@ export function start(job: Job, worker: WorkerSettings, now: number): Change {
 }
 
 /**
- * review → sending, or respawning when the worker thread is gone: relabel the issue, then hand the worker every pending
+ * review → sending, or respawning when the worker thread is gone or failed: relabel the issue, then hand the worker every pending
  * item in one message. The round's row and its feedback are written with this change, so no item is sent twice.
  */
 function startRound(job: Job, feedback: FeedbackFact, respawn: boolean, now: number): Change {
