@@ -583,7 +583,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   };
 
   return {
-    commands: issueCommands({ bb, store, report, stop }),
+    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, stop }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
         bb.events.on(event, ({ thread }) => {

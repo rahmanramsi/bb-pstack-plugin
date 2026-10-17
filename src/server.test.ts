@@ -45,3 +45,19 @@ test("a thread pstack launched, such as an issue worker, gets no checklist nudge
   assert.equal(harness.sdk.callsTo("threads.send").length, 1, "a thread a person started is nudged");
   await harness.dispose();
 });
+
+test("an unusable GitHub App private key shows as the repository's poll error", async () => {
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "pstack",
+    settings: { githubAppId: "123", githubPrivateKey: Buffer.from("not a key").toString("base64"), issueRepos: "acme/web project=prj_web host=host_worker" },
+    sdk: { system: { config: async () => ({ primaryHostId: "host_server" }) as never } },
+  });
+  await plugin(bb);
+  const service = harness.runService("pstack-issues");
+  const listed = async () => (await harness.runCli(["issues", "list"], { cwd: "/tmp" })).stdout;
+  while (!(await listed()).includes("poll error")) await new Promise((resolve) => setTimeout(resolve, 5));
+  service.controller.abort();
+  await service.done;
+  assert.match(await listed(), /poll error: githubPrivateKey is not a base64-encoded PEM private key/);
+  await harness.dispose();
+});

@@ -362,7 +362,7 @@ function harness() {
     issue.labels.delete("agent");
     issue.updatedAt = clock.now;
   };
-  const views = async (): Promise<JobView[]> => JSON.parse((await current.run(["issues", "list", "--all", "--json"])).stdout!);
+  const views = async (): Promise<JobView[]> => JSON.parse((await current.run(["issues", "list", "--all", "--json"])).stdout!).jobs;
   const only = async () => {
     const all = await views();
     assert.equal(all.length, 1);
@@ -662,7 +662,13 @@ test("labels from users without write access, and repositories mapped to the ser
   h.label(42);
   await h.engine().issues.sweep();
   assert.equal((await h.views()).length, 1);
-  assert.match(h.store.repoPoll(REPO).error!, /bb server's machine/);
+
+  const listed = await h.engine().run(["issues", "list"]);
+  assert.match(listed.stdout!, /acme\/web {2}polled 0m ago\n {2}poll error: host host_server is the bb server's machine/);
+  const json = JSON.parse((await h.engine().run(["issues", "list", "--json"])).stdout!);
+  assert.deepEqual(json.repos, [{ repo: REPO, polledAt: h.clock.now, error: "host host_server is the bb server's machine; map acme/web to another host" }]);
+  const shown = await h.engine().run(["issues", "show", ignored.id]);
+  assert.match(shown.stdout!, /repo error {4}host host_server is the bb server's machine/);
 });
 
 test("an idle worker that has not reported is reminded twice, then the job sticks", async () => {

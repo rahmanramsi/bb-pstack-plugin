@@ -81,11 +81,14 @@ function stateLabel(job: JobView): string {
   return `${job.state} → ${job.next.state}: ${job.next.op}${job.next.tries > 0 ? `, try ${job.next.tries + 1}` : ""}${retry}`;
 }
 
-function formatList(jobs: readonly JobView[], now: number): string {
-  if (jobs.length === 0) return "No issue jobs.";
-  const repos = [...new Set(jobs.map((job) => job.repo))];
+/** A repository's last poll. `error` is why it failed, including setup problems such as an App that is not installed. */
+export type RepoView = { repo: RepoName; polledAt: number | null; error: string | null };
+
+function formatList(repos: readonly RepoView[], jobs: readonly JobView[], now: number): string {
+  if (repos.length === 0 && jobs.length === 0) return "No issue jobs.";
   return repos
-    .map((repo) => {
+    .map(({ repo, polledAt, error }) => {
+      const header = `${repo}  ${polledAt === null ? "not polled yet" : `polled ${age(polledAt, now)}`}`;
       const rows = jobs
         .filter((job) => job.repo === repo)
         .map((job) => {
@@ -93,12 +96,12 @@ function formatList(jobs: readonly JobView[], now: number): string {
           const detail = job.state === "ignored" || job.state === "stuck" ? job.error : null;
           return `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
         });
-      return [repo, ...rows].join("\n");
+      return [header, ...(error ? [`  poll error: ${error}`] : []), ...rows].join("\n");
     })
     .join("\n\n");
 }
 
-function formatShow(job: JobView): string {
+function formatShow(job: JobView, repo: RepoView, now: number): string {
   const rows: [string, string | null][] = [
     ["state", stateLabel(job)],
     ["issue", job.issueUrl],
@@ -109,6 +112,8 @@ function formatShow(job: JobView): string {
     ["pushed", job.pushedSha],
     ["summary", job.summary],
     ["error", job.error],
+    ["repo polled", repo.polledAt === null ? "not yet" : age(repo.polledAt, now)],
+    ["repo error", repo.error],
   ];
   return [`${job.id} ${job.repo}#${job.issue}`, ...rows.filter(([, value]) => value).map(([label, value]) => `  ${label.padEnd(12)}  ${value}`)].join("\n");
 }
@@ -116,33 +121,43 @@ function formatShow(job: JobView): string {
 export function issueCommands(deps: {
   bb: BbPluginApi;
   store: IssueStore;
+  /** The configured repositories, listed even before they have jobs. */
+  repos: () => readonly RepoMapping[];
+  clock: () => number;
   report(threadId: string, text: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
   stop(id: JobId, by: string): Promise<boolean>;
 }): Record<string, PluginCliCommand> {
   const { bb, store } = deps;
   const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
+  const repoView = (repo: RepoName): RepoView => {
+    const { polledAt, error } = store.repoPoll(repo);
+    return { repo, polledAt, error };
+  };
 
   return {
     "issues list": cliCommand({
-      summary: "List issue jobs per repository with their state, pull request and worker thread",
+      summary: "List each repository's last poll and its issue jobs with their state, pull request and worker thread",
       options: {
         repo: { type: "string", description: "Only this owner/name" },
         all: { type: "boolean", description: "Include finished, stopped, stuck and ignored jobs" },
-        json: { type: "boolean", description: "Emit the job views as JSON" },
+        json: { type: "boolean", description: "Emit { repos, jobs } as JSON" },
       },
       run(input) {
-        const jobs = store.list({ repo: input.options.repo?.toLowerCase() as RepoName | undefined, all: input.options.all ?? false }).map(toView);
-        return input.options.json ? json(jobs) : { exitCode: 0, stdout: `${formatList(jobs, Date.now())}\n` };
+        const only = input.options.repo?.toLowerCase() as RepoName | undefined;
+        const jobs = store.list({ repo: only, all: input.options.all ?? false }).map(toView);
+        const names = [...new Set([...deps.repos().map((mapping) => mapping.repo), ...jobs.map((job) => job.repo)])].filter((repo) => !only || repo === only);
+        const repos = names.map(repoView);
+        return input.options.json ? json({ repos, jobs }) : { exitCode: 0, stdout: `${formatList(repos, jobs, deps.clock())}\n` };
       },
     }),
     "issues show": cliCommand({
-      summary: "Show one issue job: thread, branch, pull request, pending GitHub write, last error",
+      summary: "Show one issue job: thread, branch, pull request, pending GitHub write, last error, and its repository's last poll",
       positionals: [{ name: "job", description: "Job id (psi_…)", required: true }],
       options: { json: { type: "boolean", description: "Emit the job view as JSON" } },
       run(input) {
         const job = store.get(jobId(input.positionals.job));
         if (!job) throw new PluginCliError(`no issue job ${input.positionals.job}`, { code: "job_not_found" });
-        return input.options.json ? json(toView(job)) : { exitCode: 0, stdout: `${formatShow(toView(job))}\n` };
+        return input.options.json ? json(toView(job)) : { exitCode: 0, stdout: `${formatShow(toView(job), repoView(job.repo), deps.clock())}\n` };
       },
     }),
     "issues stop": cliCommand({

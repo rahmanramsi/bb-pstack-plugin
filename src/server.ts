@@ -7,7 +7,7 @@ import { STATE_CHANNEL } from "./contract.ts";
 import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
 import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
 import { createIssues } from "./issues/engine.ts";
-import { createGitHub, decodePrivateKey } from "./issues/github.ts";
+import { GitHubSetupError, createGitHub, decodePrivateKey } from "./issues/github.ts";
 import { openIssueStore } from "./issues/store.ts";
 import { rpcContract } from "./rpc.ts";
 import { createRunFeature } from "./run-commands.ts";
@@ -164,8 +164,10 @@ export default async function plugin(bb: BbPluginApi) {
     store: openIssueStore(db),
     github: createGitHub({
       credentials: () => {
-        const key = current.githubPrivateKey ? decodePrivateKey(current.githubPrivateKey) : null;
-        return current.githubAppId && key?.ok ? { appId: current.githubAppId, privateKey: key.pem } : null;
+        if (!current.githubAppId || !current.githubPrivateKey) return null;
+        const key = decodePrivateKey(current.githubPrivateKey);
+        if (!key.ok) throw new GitHubSetupError(key.error);
+        return { appId: current.githubAppId, privateKey: key.pem };
       },
     }),
     hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),

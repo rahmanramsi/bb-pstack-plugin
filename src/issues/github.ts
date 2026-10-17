@@ -9,6 +9,7 @@ import { CONVENTIONAL_TITLE, type RepoName, type Sha } from "./job.ts";
 export type GitHubCredentials = { appId: string; privateKey: string };
 
 export type GitHubOptions = {
+  /** Null while unset. Throws GitHubSetupError when the settings are present but unusable. */
   credentials: () => GitHubCredentials | null;
   fetch?: typeof globalThis.fetch;
   /** Default https://api.github.com. */
