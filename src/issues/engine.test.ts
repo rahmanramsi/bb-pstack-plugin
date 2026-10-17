@@ -164,6 +164,7 @@ type FakeThread = {
   originPluginId: string;
   environmentId: string;
   metadata: Record<string, unknown>;
+  pinnedAt?: number | null;
 };
 
 function harness() {
@@ -181,6 +182,7 @@ function harness() {
   const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false };
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
+  const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
   const held = async (key: string) => {
@@ -215,13 +217,25 @@ function harness() {
         if (failure) throw new Error("socket hang up");
         return { id: thread.id };
       },
-      async list({ offset = 0, projectId }: { offset?: number; projectId?: string }) {
-        return [...threads.values()].filter((thread) => thread.archivedAt === null && (!projectId || thread.projectId === projectId)).slice(offset, offset + 100);
+      /** bb's order: pinned threads first, then newest first. */
+      async list({ offset = 0, limit = 50, projectId }: { offset?: number; limit?: number; projectId?: string }) {
+        calls.list++;
+        return [...threads.values()]
+          .filter((thread) => thread.archivedAt === null && (!projectId || thread.projectId === projectId))
+          .map((thread) => ({ ...thread, pinnedAt: thread.pinnedAt ?? null }))
+          .sort((a, b) => (b.pinnedAt === null ? 0 : 1) - (a.pinnedAt === null ? 0 : 1) || b.createdAt - a.createdAt)
+          .slice(offset, offset + limit);
       },
       async getPluginMetadata({ threadId }: { threadId: string }) {
+        calls.getPluginMetadata++;
         const thread = threads.get(threadId);
         if (!thread) throw missing();
         return thread.metadata;
+      },
+      async experimental_listPluginMetadata({ threadIds }: { threadIds: string[] }) {
+        calls.listPluginMetadata++;
+        assert.ok(threadIds.length <= 200);
+        return { threads: threadIds.flatMap((threadId) => (threads.has(threadId) ? [{ threadId, metadata: threads.get(threadId)!.metadata }] : [])) };
       },
       async stop({ threadId }: { threadId: string }) {
         stopped.push(threadId);
@@ -378,6 +392,7 @@ function harness() {
     gh: () => gh,
     threads,
     late,
+    calls,
     spawned,
     sent,
     stopped,
@@ -845,4 +860,24 @@ test("a push still running when its claim's lease ends is abandoned, so the job 
   assert.equal(job.state, "publishing");
   assert.equal(job.next?.op, "push");
   assert.notEqual(job.next?.retryAt, null);
+});
+
+test("finding a worker's thread reads metadata a page at a time and stops at threads older than the job", async () => {
+  const h = harness();
+  for (let index = 0; index < 250; index++) {
+    const id = `thr_old${index}`;
+    h.threads.set(id, { id, status: "idle", archivedAt: null, deletedAt: null, createdAt: h.clock.now - 60 * MIN - index, updatedAt: 0, projectId: "prj_web", originPluginId: "pstack", environmentId: `env_${id}`, metadata: {}, pinnedAt: index === 0 ? 1 : null });
+  }
+  h.failures.spawn.push({ create: "later" });
+  h.label(41);
+  await h.engine().issues.sweep();
+  h.threads.set(h.late[0]!.id, h.late[0]!);
+  h.clock.now += 15_000;
+  Object.assign(h.calls, { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 });
+  await h.engine().issues.sweep();
+
+  const adopted = await h.only();
+  assert.equal(adopted.state, "working");
+  assert.equal(adopted.threadId, h.late[0]!.id);
+  assert.deepEqual(h.calls, { list: 1, getPluginMetadata: 0, listPluginMetadata: 1 });
 });

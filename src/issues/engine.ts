@@ -112,19 +112,25 @@ export function createIssues(deps: IssuesDeps): Issues {
   const done = (patch = {}): EffectOutcome => ({ kind: "done", patch });
   const until = (deadline: number) => AbortSignal.timeout(Math.max(0, deadline - clock()));
 
+  /**
+   * Threads in the job's project whose metadata names the job, created since it was, and not bound to another job.
+   * bb lists pinned threads first and then newest first, so paging stops at the first unpinned thread older than that.
+   */
   async function threadsNaming(job: Job, signal?: AbortSignal): Promise<string[]> {
     const found: string[] = [];
     const since = job.createdAt - 60_000;
-    for (let offset = 0; ; offset += 100) {
-      const page = await bb.sdk.threads.list({ originPluginId: bb.pluginId, projectId: job.projectId, includeHidden: true, archived: false, limit: 100, offset, ...(signal ? { signal } : {}) });
-      for (const thread of page) {
-        if (thread.createdAt < since) continue;
-        const bound = store.byThread(thread.id);
-        if (bound && bound.id !== job.id) continue;
-        const metadata = IssueMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId: thread.id }).catch(() => null));
-        if (metadata.success && metadata.data.jobId === job.id) found.push(thread.id);
+    const PAGE = 100;
+    for (let offset = 0; ; offset += PAGE) {
+      const page = await bb.sdk.threads.list({ originPluginId: bb.pluginId, projectId: job.projectId, includeHidden: true, archived: false, limit: PAGE, offset, ...(signal ? { signal } : {}) });
+      const candidates = page.filter((thread) => thread.createdAt >= since && (store.byThread(thread.id)?.id ?? job.id) === job.id).map((thread) => thread.id);
+      if (candidates.length > 0) {
+        const { threads } = await bb.sdk.threads.experimental_listPluginMetadata({ threadIds: candidates, ...(signal ? { signal } : {}) });
+        for (const { threadId, metadata } of threads) {
+          const named = IssueMetadata.safeParse(metadata);
+          if (named.success && named.data.jobId === job.id) found.push(threadId);
+        }
       }
-      if (page.length < 100) return found;
+      if (page.length < PAGE || page.some((thread) => thread.pinnedAt === null && thread.createdAt < since)) return found;
     }
   }
 
