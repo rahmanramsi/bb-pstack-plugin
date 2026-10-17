@@ -251,7 +251,6 @@ const TERMINAL_LIST = [...TERMINAL];
 const TRANSIT_LIST = Object.keys(TRANSIT);
 const placeholders = (values: readonly unknown[]) => values.map(() => "?").join(", ");
 
-/** Calls `onChange` after each write that changed something. Internal calls between writes use the unwrapped ones. */
 export function openIssueStore(db: Db, onChange: () => void): IssueStore {
   const get = (id: JobId): Job | null => {
     const row = db.prepare("SELECT * FROM issue_jobs WHERE id = ?").get(id) as JobRow | undefined;

@@ -15,7 +15,6 @@ const JOB_STATES = [...RESTING_STATES, ...Object.keys(TRANSIT)] as [JobState, ..
 const EFFECT_OPS = Object.keys(EFFECT_POLICY) as [EffectOp, ...EffectOp[]];
 const Poll = { polledAt: z.number().nullable(), error: z.string().nullable() };
 
-/** The board as the app receives it. */
 export const IssueBoardSchema = z.object({
   repos: z.array(z.object({ repo: z.string(), ...Poll })),
   jobs: z.array(
@@ -42,7 +41,6 @@ export const IssueBoardSchema = z.object({
   ),
 });
 
-/** Every repository, or one, with its jobs newest first; or the job a worker thread is bound to. */
 export type BoardFilter = { repo?: RepoName; all: boolean } | { threadId: string };
 
 export function repoView(store: IssueStore, repo: RepoName): RepoView {
@@ -55,7 +53,6 @@ export function listed(store: IssueStore, job: Job): ListedJob {
   return { ...toView(job), poll: { polledAt, error } };
 }
 
-/** `configured` repositories are listed even before they have jobs. A thread that is not a worker gets an empty board. */
 export function issueBoard(store: IssueStore, configured: readonly RepoName[], filter: BoardFilter): IssueBoard {
   if ("threadId" in filter) {
     const job = store.byThread(filter.threadId);

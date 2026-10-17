@@ -105,10 +105,9 @@ export function formatDuration(milliseconds: number): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-/** The `data-state` values styles.css colors. */
-type Tone = "queued" | "running" | "blocked" | "uncertain" | "succeeded" | "failed" | "skipped" | "cancelled";
+type StatusTone = "queued" | "running" | "blocked" | "uncertain" | "succeeded" | "failed" | "skipped" | "cancelled";
 
-export const issueStates: Record<JobState, { label: string; tone: Tone }> = {
+export const issueStates: Record<JobState, { label: string; tone: StatusTone }> = {
   queued: { label: "Queued", tone: "queued" },
   starting: { label: "Starting worker", tone: "running" },
   working: { label: "Working", tone: "running" },
@@ -130,7 +129,6 @@ export const issueStates: Record<JobState, { label: string; tone: Tone }> = {
   ignored: { label: "Ignored", tone: "skipped" },
 };
 
-/** Where a transit job is heading and the step it is on, such as "Next: In review · open-pr · try 2". */
 export function issueNext(job: Pick<IssueJob, "next">): string | null {
   if (job.next === null) return null;
   const { state, op, tries, retryAt } = job.next;

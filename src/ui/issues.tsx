@@ -34,7 +34,6 @@ export function IssuesHeader({ subPath }: PluginNavPanelProps) {
   </div>;
 }
 
-/** The pstack thread panel's section for an issue worker's own job. Renders nothing on any other thread. */
 export function WorkerIssue({ threadId }: { threadId: string }) {
   const { state, refresh } = useIssueBoard({ threadId });
   const now = useNow();

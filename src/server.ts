@@ -81,8 +81,7 @@ function skillNames(): string[] {
 }
 
 const INSTRUCTIONS_MAX = 4000;
-/** One poll or tick writes many rows; they become one signal. */
-const ISSUE_SIGNAL_MS = 250;
+const ISSUE_SIGNAL_DEBOUNCE_MS = 250;
 
 function evidenceLabel(evidence: { kind: string } & Record<string, string>): string {
   const value = evidence.id ?? evidence.sha ?? evidence.path ?? evidence.url;
@@ -211,7 +210,7 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         bb.log.error(`pstack issues: publish failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, ISSUE_SIGNAL_MS);
+    }, ISSUE_SIGNAL_DEBOUNCE_MS);
   });
   const issueRepos = () => {
     if (!current.githubAppId || !current.githubPrivateKey) return [];

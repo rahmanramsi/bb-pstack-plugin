@@ -629,7 +629,6 @@ export function stick(job: Job, reason: string): Change {
   return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason };
 }
 
-/** Whether stop() acts on a job in this state: one that has not ended and is not already ending. */
 export function canStop(state: JobState): boolean {
   return !TERMINAL.has(state) && state !== "stopping" && state !== "sticking";
 }
@@ -872,7 +871,6 @@ export type JobView = {
   parentId: JobId | null;
   repo: RepoName;
   issue: number;
-  /** The issue's title when its label event was seen. */
   title: string;
   issueUrl: string;
   state: JobState;

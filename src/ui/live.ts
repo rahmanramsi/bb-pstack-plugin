@@ -9,7 +9,6 @@ export type LiveState<T> =
   | { status: "error"; message: string }
   | { status: "ready"; value: T; refreshError: string | null };
 
-/** An issue signal names nothing, so it refreshes every issue view. */
 export function hasRevision(payload: unknown): payload is { revision: number } {
   return typeof payload === "object" && payload !== null && "revision" in payload && typeof payload.revision === "number" && Number.isInteger(payload.revision);
 }
@@ -97,7 +96,6 @@ export function useRunView(threadId: string, runId: string) {
   return useLiveView<RunView | null>(load, STATE_CHANNEL, (payload) => signalMatchesThread(payload, threadId));
 }
 
-/** Every repository's issue jobs, ended ones only with `all`; or the job a worker thread is bound to. */
 export function useIssueBoard(filter: { all: boolean } | { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const threadId = "threadId" in filter ? filter.threadId : null;
