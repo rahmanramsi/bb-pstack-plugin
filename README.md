@@ -41,6 +41,15 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 
 an agent can still call plain `bb thread spawn --parent-self --new-environment worktree`. when its machine is full and another machine has room for the same project and model, pstack refuses that spawn and names `bb pstack spawn` as the fix. it never refuses a fork, a person's thread, a reused environment, or a thread pstack spawned. it also lets the spawn through whenever it lacks the facts to decide. turn the `placementGuard` setting off to disable it (`bb plugin config pstack set placementGuard false`).
 
+## development
+
+run these from the plugin checkout:
+
+- `npm install` to install dependencies.
+- `npm test` to run tests.
+- `npm run typecheck` to check types.
+- `bb plugin install /path/to/bb-pstack-plugin` to try the local checkout in bb.
+
 ## get started
 
 two steps:
