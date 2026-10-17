@@ -87,8 +87,10 @@ export type RepoClient = {
   comment(issue: number, body: string): Promise<{ id: number }>;
   createDraftPull(input: { head: string; base: string; title: string; body: string }): Promise<{ number: number; url: string }>;
   editPull(pr: number, input: { body: string }): Promise<void>;
-  /** Answers an inline review comment in its own thread. */
+  /** Answers in an inline thread. `commentId` must be the thread's first comment: GitHub refuses replies to replies. */
   replyToReviewComment(pr: number, commentId: number, body: string): Promise<{ id: number }>;
+  /** An inline review comment's author and text, or null when it no longer exists. */
+  reviewComment(id: number): Promise<{ author: string; body: string } | null>;
   /** Requests a review from each user who can be asked; a user GitHub refuses (422) is dropped, not an error. */
   requestReviewers(pr: number, reviewers: readonly string[]): Promise<{ requested: string[]; dropped: string[] }>;
   /** A fresh token for this one repository with only `contents: write`, and the HTTPS remote. Revoke it after the push. */
@@ -473,6 +475,10 @@ export function createGitHub(options: GitHubOptions): GitHub {
       },
       async replyToReviewComment(pr, commentId, body) {
         return { id: (await call<{ id: number }>(auth, "POST", `${base}/pulls/${pr}/comments/${commentId}/replies`, { body: { body } })).json.id };
+      },
+      async reviewComment(id) {
+        const { status, json } = await call<{ body: string; user: RawUser }>(auth, "GET", `${base}/pulls/comments/${id}`, { ok: [404] });
+        return status === 404 ? null : { author: json.user?.login ?? "ghost", body: json.body };
       },
       async requestReviewers(pr, reviewers) {
         const ask = async (users: readonly string[]) =>

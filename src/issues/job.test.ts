@@ -383,11 +383,12 @@ const inline = (id: number, createdAt: number, author = "maya"): Feedback => ({
   line: 12,
   diffHunk: "@@ -10,3 +10,3 @@\n-const x = 1;\n+const y = 1;",
   inReplyTo: null,
+  parent: null,
   reviewId: 500,
   createdAt,
   postedAt: createdAt,
 });
-const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A few things.\nSee inline.", path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW - 3 * MIN, postedAt: NOW - 3 * MIN };
+const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A few things.\nSee inline.", path: null, line: null, diffHunk: null, inReplyTo: null, parent: null, reviewId: null, createdAt: NOW - 3 * MIN, postedAt: NOW - 3 * MIN };
 const inReview = (overrides: Partial<Job> = {}) =>
   job({ phase: { state: "review" }, threadId: "thr_w", pushedSha: PUSHED, pr: PR, worker: WORKER, report: { ...REPORT, headSha: PUSHED, acceptedAt: NOW - 60 * MIN }, ...overrides });
 const pending = (items: Feedback[]) => ({ feedback: { pending: items, rounds: [{ ordinal: 1, summary: "Footer overlap fixed." }] }, pr: { state: "open" as const }, slotFree: true, thread: { kind: "idle" as const, since: NOW - MIN } });
@@ -496,12 +497,15 @@ test("a feedback round's changes report pushes on top of the pushed commit, answ
   assert.deepEqual(republishing.phase.effects, [
     { op: "push", key: `push:${addressing.id}:${NEXT}`, sha: NEXT, expectedRemoteSha: PUSHED },
     { op: "reply", key: `reply:${addressing.id}:2:review:500`, target: { kind: "review", id: 500 }, body: "> A few things.\n\nRenamed both helpers in ccccccc." },
-    { op: "reply", key: `reply:${addressing.id}:2:review-comment:1`, target: { kind: "review-comment", id: 1 }, body: "Renamed to `parseInput` in ccccccc, cc `@lee`." },
+    { op: "reply", key: `reply:${addressing.id}:2:review-comment:1`, target: { kind: "review-comment", id: 1, thread: 1 }, body: "Renamed to `parseInput` in ccccccc, cc `@lee`." },
     { op: "edit-pr", key: `edit-pr:${addressing.id}:2`, body: "## Why\nRenamed helpers.\n\nCloses #41" },
     { op: "request-review", key: `request-review:${addressing.id}:2`, reviewers: ["lee", "maya"] },
     { op: "labels", key: `labels:${addressing.id}:review:2`, on: "issue", add: ["agent:review"], remove: ["agent:working"] },
   ]);
   assert.equal(TRANSIT_OF(republishing), "review");
+  const followUp = acceptReport(addressing, report, ROUND_FACTS({ listed: [reviewBody, { ...inline(1, NOW - 5 * MIN), inReplyTo: 9 }] }));
+  assert.ok(followUp.ok && followUp.change.phase && "effects" in followUp.change.phase);
+  assert.deepEqual(followUp.change.phase.effects[2], { op: "reply", key: `reply:${addressing.id}:2:review-comment:1`, target: { kind: "review-comment", id: 1, thread: 9 }, body: "Renamed to `parseInput` in ccccccc, cc `@lee`." }, "a reply in a thread goes to the thread's first comment");
 
   const noChange = acceptReport(addressing, later({ outcome: "no-change", replies: REPLIES, verification: ["read the code"], summary: "Explained the naming." }), ROUND_FACTS({ worktree: { headSha: PUSHED, dirty: false, ahead: 1 } }));
   assert.ok(noChange.ok);
@@ -557,7 +561,7 @@ test("text posted on GitHub carries no pstack marker the service did not append 
   const marker = "<!-- pstack:reply:psi_x:2:review-comment:9 -->";
   const nested = "<!-<!-- pstack:a -->- pstack:b -->";
   assert.equal(prBody(`Fixed.${marker}\n${nested}`, 41), "Fixed.\n\nCloses #41");
-  const quoted = { kind: "review", id: 5, author: "maya", body: `Please rename ${marker}`, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, postedAt: NOW } as const;
+  const quoted = { kind: "review", id: 5, author: "maya", body: `Please rename ${marker}`, path: null, line: null, diffHunk: null, inReplyTo: null, parent: null, reviewId: null, createdAt: NOW, postedAt: NOW } as const;
   assert.equal(replyText(`Renamed. ${marker}`, quoted), "> Please rename \n\nRenamed.");
   assert.doesNotMatch(issueText(nested), /pstack:/);
 });

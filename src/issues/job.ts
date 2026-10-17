@@ -101,7 +101,7 @@ export type Effect =
   | { op: "stop-thread"; key: string }
   | { op: "send-round"; key: string; text: string }
   /** `body` is posted as is: a conversation reply already quotes what it answers. */
-  | { op: "reply"; key: string; target: FeedbackRef; body: string }
+  | { op: "reply"; key: string; target: ReplyTarget; body: string }
   | { op: "request-review"; key: string; reviewers: readonly string[] }
   | { op: "edit-pr"; key: string; body: string };
 
@@ -155,6 +155,11 @@ export type IssueSnapshot = { title: string; body: string; url: string; author: 
 export type FeedbackKind = "review" | "review-comment" | "pr-comment";
 /** What a reply answers. GitHub numbers reviews, inline comments and conversation comments separately. */
 export type FeedbackRef = { kind: FeedbackKind; id: number };
+/**
+ * Where a reply goes. GitHub takes replies only on an inline thread's first comment, so an inline reply carries that
+ * comment as `thread`; a review body or a conversation comment is answered in the conversation.
+ */
+export type ReplyTarget = { kind: "review-comment"; id: number; thread: number } | { kind: "review" | "pr-comment"; id: number };
 /** A review body, an inline review comment, or an `/agent` comment on the job's pull request. */
 export type Feedback = FeedbackRef & {
   author: string;
@@ -162,7 +167,9 @@ export type Feedback = FeedbackRef & {
   path: string | null;
   line: number | null;
   diffHunk: string | null;
+  /** For an inline comment answering in a thread: the thread's first comment, and its author and text when known. */
   inReplyTo: number | null;
+  parent: { author: string; body: string } | null;
   reviewId: number | null;
   createdAt: number;
   /**
@@ -171,8 +178,11 @@ export type Feedback = FeedbackRef & {
    */
   postedAt: number;
 };
-/** Feedback as polled, with the state of the review it is or belongs to, before the operator's rules filter it. */
-export type PolledFeedback = Feedback & { pr: number; reviewState: string | null };
+/**
+ * Feedback as polled, with the state of the review it is or belongs to, before the operator's rules filter it. The
+ * poller looks up an inline reply's parent only for an item it stores.
+ */
+export type PolledFeedback = Omit<Feedback, "parent"> & { pr: number; reviewState: string | null };
 
 const COUNTED_REVIEWS: ReadonlySet<string> = new Set(["CHANGES_REQUESTED", "COMMENTED"]);
 const AGENT_COMMAND = /^\s*\/agent\b/i;
@@ -704,7 +714,8 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
 }
 
 function replyEffect(job: Job, reply: RoundReport["replies"][number], answers: Feedback): Extract<Effect, { op: "reply" }> {
-  return { op: "reply", key: `reply:${job.id}:${job.round}:${reply.kind}:${reply.commentId}`, target: { kind: reply.kind, id: reply.commentId }, body: replyText(reply.body, answers) };
+  const target: ReplyTarget = answers.kind === "review-comment" ? { kind: answers.kind, id: answers.id, thread: answers.inReplyTo ?? answers.id } : { kind: answers.kind, id: answers.id };
+  return { op: "reply", key: `reply:${job.id}:${job.round}:${reply.kind}:${reply.commentId}`, target, body: replyText(reply.body, answers) };
 }
 
 function publication(job: Job, report: InitialReport & AcceptedReport): [TransitState, Effect[]] {

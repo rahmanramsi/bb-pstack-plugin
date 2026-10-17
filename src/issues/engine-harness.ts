@@ -158,12 +158,17 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
   if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)\/comments\/(\d+)\/replies$/.exec(path)) && method === "POST") {
     const list = gh.reviewComments.get(Number(match[1])) ?? [];
     const parent = list.find((comment) => comment.id === Number(match![2]));
-    if (!parent) return [404, { message: "Not Found" }];
+    // GitHub answers only on a thread's first comment: "Replies to replies are not supported."
+    if (!parent || parent.in_reply_to_id !== undefined) return [404, { message: "Not Found" }];
     const review = { id: gh.nextId++, body: "", user: { login: APP }, state: "COMMENTED", submitted_at: iso(gh.now()) };
     gh.reviews.set(Number(match[1]), [...(gh.reviews.get(Number(match[1])) ?? []), review]);
     const reply = { ...parent, id: gh.nextId++, body: body.body, user: { login: APP }, in_reply_to_id: parent.id, pull_request_review_id: review.id, created_at: iso(gh.now()), updated_at: iso(gh.now()) };
     list.push(reply);
     return [201, reply];
+  }
+  if ((match = /^\/repos\/acme\/web\/pulls\/comments\/(\d+)$/.exec(path)) && method === "GET") {
+    const found = [...gh.reviewComments.values()].flat().find((comment) => comment.id === Number(match![1]));
+    return found ? [200, found] : [404, { message: "Not Found" }];
   }
   if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)\/reviews$/.exec(path)) && method === "GET") return etagged(gh.reviews.get(Number(match[1])) ?? []);
   if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)\/reviews\/(\d+)\/comments$/.exec(path)) && method === "GET") {
@@ -479,6 +484,16 @@ export function harness() {
     gh.reviews.set(pr, [...(gh.reviews.get(pr) ?? []), { id, body: input.body ?? "", user, state: input.state ?? "CHANGES_REQUESTED", submitted_at: at }]);
     return { id, comments: comments.map((comment) => comment.id) };
   };
+  /** A reviewer's answer in an inline thread, which GitHub files under its own one-comment review. */
+  const answerInThread = (pr: number, root: number, author: string, text: string) => {
+    const list = gh.reviewComments.get(pr)!;
+    const first = list.find((comment) => comment.id === root)!;
+    const reviewId = gh.nextId++;
+    gh.reviews.set(pr, [...(gh.reviews.get(pr) ?? []), { id: reviewId, body: "", user: { login: author }, state: "COMMENTED", submitted_at: iso(clock.now) }]);
+    const comment = { ...first, id: gh.nextId++, body: text, user: { login: author }, in_reply_to_id: root, pull_request_review_id: reviewId, created_at: iso(clock.now), updated_at: iso(clock.now) };
+    list.push(comment);
+    return comment.id;
+  };
   /** A comment in the pull request's conversation. */
   const converse = (pr: number, author: string, text: string) => {
     const comment = { id: gh.nextId++, body: text, user: { login: author }, created_at: iso(clock.now), updated_at: iso(clock.now) };
@@ -515,6 +530,7 @@ export function harness() {
     toReview,
     review,
     converse,
+    answerInThread,
     views,
     only,
     byIssue,

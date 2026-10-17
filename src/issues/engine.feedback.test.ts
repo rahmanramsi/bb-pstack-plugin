@@ -326,3 +326,55 @@ test("a review whose comments were drafted before the App's last replies is answ
   const text: string = h.sent.at(-1)!.input[0].text;
   for (const id of second.comments) assert.match(text, new RegExp(`"commentId": ${id}`));
 });
+
+/** Review issue 41's pull request with one inline comment and let the worker answer it in round 1. */
+async function firstRoundAnswered(h: ReturnType<typeof harness>) {
+  const { job, pr } = await h.toReview();
+  const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: comments[0]!, body: "Renamed it to `input`." }]), { headSha: SHA3 })).exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).state, "review");
+  return { job, pr, root: comments[0]! };
+}
+
+test("a reviewer's answer inside an inline thread is shown with what it answers, and the reply lands on the thread", async () => {
+  const h = harness();
+  const { job, pr, root } = await firstRoundAnswered(h);
+  h.clock.now += MIN;
+  const followUp = h.answerInThread(pr, root, "maya", "No, `value`, not `input`.");
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  const text: string = h.sent.at(-1)!.input[0].text;
+  assert.ok(text.includes(`"commentId": ${followUp} }`));
+  assert.ok(text.includes("In reply to @maya:\n\n```text\nRename `x`.\n```\n\n```text\nNo, `value`, not `input`.\n```"), "the follow-up comes with the comment it answers");
+
+  const report = roundReport([{ kind: "review-comment", commentId: followUp, body: "Renamed it to `value` in 4444444." }], { round: 2 });
+  assert.equal((await h.report(job.threadId!, report, { headSha: "4".repeat(40) })).exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).state, "review", (await h.only()).error ?? "");
+  assert.deepEqual(appReplies(h, pr).map((reply) => [reply.in_reply_to_id, reply.body.split("\n")[0]]), [[root, "Renamed it to `input`."], [root, "Renamed it to `value` in 4444444."]]);
+});
+
+test("a reply is dropped only when GitHub confirms its comment is gone; another 404 is an error, not a silent success", async () => {
+  for (const deleted of [true, false]) {
+    const h = harness();
+    const { job, pr } = await h.toReview();
+    const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+    h.clock.now += FEEDBACK_QUIET_MS;
+    await h.settle();
+    const path = `/repos/acme/web/pulls/${pr}/comments/${comments[0]}/replies`;
+    if (deleted) h.gh().reviewComments.set(pr, []);
+    else h.gh().outages.push({ key: `POST ${path}`, status: 404 });
+    assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: comments[0]!, body: "Renamed." }]), { headSha: SHA3 })).exitCode, 0);
+    await h.settle();
+    const end = await h.only();
+    if (deleted) assert.equal(end.state, "review", end.error ?? "");
+    else {
+      assert.equal(end.state, "stuck");
+      assert.match(end.error!, /404/);
+    }
+  }
+});

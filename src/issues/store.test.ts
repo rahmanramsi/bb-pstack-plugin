@@ -139,6 +139,7 @@ const comment = (id: number, createdAt: number, kind: Feedback["kind"] = "review
   line: 3,
   diffHunk: "@@ -1 +1 @@",
   inReplyTo: null,
+  parent: null,
   reviewId: 500,
   createdAt,
   postedAt: createdAt,

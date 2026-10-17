@@ -17,6 +17,7 @@ import {
   type Effect,
   type Feedback,
   type FeedbackKind,
+  type FeedbackRef,
   type IssueSnapshot,
   type Job,
   type JobId,
@@ -76,6 +77,8 @@ export type IssueStore = {
   withPullRequest(repo: RepoName): Job[];
   /** Stores feedback not seen before; an item already stored, sent or not, is left as it is. Returns how many were new. */
   addFeedback(repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number;
+  /** Whether the item is stored already, sent or not. */
+  hasFeedback(repo: RepoName, ref: FeedbackRef): boolean;
   /** The job's feedback not yet sent in a round, oldest first, and each earlier round's summary. */
   feedback(id: JobId): { pending: Feedback[]; rounds: { ordinal: number; summary: string | null }[] };
   /** The feedback a round sent, which its report must answer. */
@@ -133,6 +136,8 @@ type FeedbackRow = {
   line: number | null;
   diff_hunk: string | null;
   in_reply_to: number | null;
+  parent_author: string | null;
+  parent_body: string | null;
   review_id: number | null;
   created_at: number;
   posted_at: number | null;
@@ -147,6 +152,7 @@ const parseFeedback = (row: FeedbackRow): Feedback => ({
   line: row.line,
   diffHunk: row.diff_hunk,
   inReplyTo: row.in_reply_to,
+  parent: row.parent_author === null || row.parent_body === null ? null : { author: row.parent_author, body: row.parent_body },
   reviewId: row.review_id,
   createdAt: row.created_at,
   postedAt: row.posted_at ?? row.created_at,
@@ -273,12 +279,12 @@ export function openIssueStore(db: Db): IssueStore {
 
   const addFeedback = db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
     const insert = db.prepare(
-      `INSERT OR IGNORE INTO issue_feedback (repo, kind, github_id, job_id, pr_number, author, body, path, line, diff_hunk, in_reply_to, review_id, created_at, posted_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO issue_feedback (repo, kind, github_id, job_id, pr_number, author, body, path, line, diff_hunk, in_reply_to, parent_author, parent_body, review_id, created_at, posted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     let added = 0;
     for (const { jobId, pr, feedback: item } of items) {
-      added += insert.run(repo, item.kind, item.id, jobId, pr, item.author, item.body, item.path, item.line, item.diffHunk, item.inReplyTo, item.reviewId, item.createdAt, item.postedAt).changes;
+      added += insert.run(repo, item.kind, item.id, jobId, pr, item.author, item.body, item.path, item.line, item.diffHunk, item.inReplyTo, item.parent?.author ?? null, item.parent?.body ?? null, item.reviewId, item.createdAt, item.postedAt).changes;
     }
     return added;
   });
@@ -373,6 +379,9 @@ export function openIssueStore(db: Db): IssueStore {
       return rows.map(parse);
     },
     addFeedback,
+    hasFeedback(repo, ref) {
+      return db.prepare("SELECT 1 FROM issue_feedback WHERE repo = ? AND kind = ? AND github_id = ?").get(repo, ref.kind, ref.id) !== undefined;
+    },
     feedback(id) {
       const pending = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round IS NULL ORDER BY created_at, github_id").all(id) as FeedbackRow[];
       const rounds = db.prepare("SELECT ordinal, report_json FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(id) as { ordinal: number; report_json: string | null }[];

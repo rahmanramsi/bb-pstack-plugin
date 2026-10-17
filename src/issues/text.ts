@@ -182,6 +182,7 @@ export function roundPrompt(job: Job, ordinal: number, feedback: FeedbackFact): 
     `### ${FEEDBACK_HEADINGS[item.kind]} by @${item.author}: \`{ "kind": "${item.kind}", "commentId": ${item.id} }\``,
     "",
     ...(item.path ? [`On \`${item.path}\`${item.line === null ? "" : ` line ${item.line}`}:`, "", fenced(item.diffHunk ?? "", "diff"), ""] : []),
+    ...(item.inReplyTo === null ? [] : item.parent ? [`In reply to @${item.parent.author}:`, "", fenced(item.parent.body.trim() || "(no text)"), ""] : ["In reply to an earlier comment in this thread.", ""]),
     fenced(item.body.trim() || "(no text)"),
     "",
   ]);

@@ -274,11 +274,11 @@ export function createIssues(deps: IssuesDeps): Issues {
           return done();
         }
         try {
-          await repo.replyToReviewComment(job.pr.number, effect.target.id, body);
+          await repo.replyToReviewComment(job.pr.number, effect.target.thread, body);
         } catch (error) {
-          // The reviewer deleted the comment; there is no thread left to answer in.
-          if (error instanceof GitHubPermanentError && error.status === 404) bb.log.info(`pstack issues: ${job.id}: review comment ${effect.target.id} is gone, reply dropped`);
-          else throw error;
+          if (!(error instanceof GitHubPermanentError && error.status === 404) || (await repo.reviewComment(effect.target.thread)) !== null) throw error;
+          // The thread's first comment was deleted, and the thread with it: there is nothing left to answer in.
+          bb.log.info(`pstack issues: ${job.id}: review comment ${effect.target.thread} is gone, reply dropped`);
         }
         return done();
       },
@@ -589,7 +589,8 @@ export function createIssues(deps: IssuesDeps): Issues {
           for (const item of result.items) {
             if (!counts(item) || item.author === appLogin || !CAN_TRIGGER.has(await repo.permission(item.author))) continue;
             const { pr: _, reviewState: __, ...rest } = item;
-            feedback.push(rest);
+            const parent = item.inReplyTo !== null && !store.hasFeedback(repo.name, item) ? await repo.reviewComment(item.inReplyTo) : null;
+            feedback.push({ ...rest, parent });
           }
           store.recordPoll(job.id, { cursor: result.next, prState: result.state, feedback }, clock());
         } catch (error) {
