@@ -678,3 +678,20 @@ test("an effect's handler has a probe exactly when its policy looks for a trace 
   const push: EffectHandler<"push"> = { perform };
   assert.ok(labels && push);
 });
+
+test("stopping a job waiting in review or needs-info removes that label from the issue", async () => {
+  for (const [report, label] of [[GOOD, "agent:review"], [{ outcome: "needs-info", questions: ["Which footer, the page or the modal?"], verification: ["read the layout code"] }, "agent:needs-info"]] as const) {
+    const h = harness();
+    h.label(41);
+    await h.engine().issues.sweep();
+    const working = await h.only();
+    await h.report(working.threadId!, report, report === GOOD ? { headSha: SHA2, ahead: 1 } : { headSha: SHA1, ahead: 0 });
+    await h.settle();
+    assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", label]);
+
+    assert.equal((await h.engine().run(["issues", "stop", working.id])).exitCode, 0);
+    await h.settle();
+    assert.equal((await h.only()).state, "stopped");
+    assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
+  }
+});

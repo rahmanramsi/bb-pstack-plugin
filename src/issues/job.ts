@@ -24,6 +24,8 @@ export const LABEL = {
   review: "agent:review",
 } as const;
 export type Label = (typeof LABEL)[keyof typeof LABEL];
+/** The labels that show a job's progress. An ending job removes all of them, whichever one it was showing. */
+const STATUS_LABELS = [LABEL.working, LABEL.needsInfo, LABEL.review] as const;
 
 /** Each transit state and the resting state it enters once its effects are done. The SQL CHECK repeats this list. */
 export const TRANSIT = {
@@ -325,7 +327,7 @@ function workerMayExist(job: Job): boolean {
 function endingEffects(job: Job, kind: "stop" | "stick"): Effect[] {
   const effects: Effect[] = [];
   if (workerMayExist(job)) effects.push({ op: "stop-thread", key: `stop-thread:${job.id}:${kind}` });
-  if (job.phase.state !== "queued") effects.push({ op: "labels", key: `labels:${job.id}:${kind}`, on: "issue", add: [], remove: [LABEL.working] });
+  if (job.phase.state !== "queued") effects.push({ op: "labels", key: `labels:${job.id}:${kind}`, on: "issue", add: [], remove: STATUS_LABELS });
   return effects;
 }
 
