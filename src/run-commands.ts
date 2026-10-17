@@ -74,6 +74,7 @@ function formatStatus(view: RunView, results: ReturnType<Runner["results"]>): st
 export function createRunFeature(deps: {
   bb: BbPluginApi;
   runner: Runner;
+  isRunWorker(threadId: string): boolean;
   /** Appended to every command's stdout. */
   footer(threadId: string): string;
   /** Frontmatter names of the plugin's skills; configure must select them for every thread once it is registered. */
@@ -185,10 +186,10 @@ export function createRunFeature(deps: {
     const logged = (label: string, work: Promise<void>) =>
       work.catch((error) => bb.log.error(`pstack ${label}: ${error instanceof Error ? error.message : String(error)}`));
     bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
-      if (thread.originPluginId === bb.pluginId) return logged("idle", runner.onIdle(thread.id, lastAssistantText));
+      if (deps.isRunWorker(thread.id)) return logged("idle", runner.onIdle(thread.id, lastAssistantText));
     });
     bb.events.on("thread.failed", ({ thread, error }) => {
-      if (thread.originPluginId === bb.pluginId) return logged("failed", runner.onFailed(thread.id, error));
+      if (deps.isRunWorker(thread.id)) return logged("failed", runner.onFailed(thread.id, error));
     });
     bb.events.on("thread.archived", ({ thread }) => logged("archived", runner.onGone(thread.id)));
     bb.events.on("thread.deleted", ({ thread }) => logged("deleted", runner.onGone(thread.id)));

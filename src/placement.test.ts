@@ -139,6 +139,8 @@ test("a pinned branch must be verified at the requested SHA", () => {
   assert.equal(pick(value, [], request).target.where, "home");
   assert.equal(pick({ ...value, branches: new Map([[BOX, { name: "main", sha: "other" }]]) }, [], request).target.where, "home");
   assert.equal(pick({ ...value, branches: new Map([[BOX, { name: "main", sha: "abc" }]]) }, [], request).target.where, "away");
+  assert.deepEqual(pick({ ...value, branches: new Map([[BOX, { name: "main", sha: "abc" }]]) }, [], { ...request, away: { kind: "worktree", baseBranch: null, pin: { branch: "main", sha: "abc" } } }).target.environment,
+    { type: "host", hostId: BOX, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "main" } } });
 });
 
 function service(options: { badLimits?: boolean } = {}) {

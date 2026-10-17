@@ -6,7 +6,7 @@ import { loadCatalog } from "./doctor.ts";
 
 export type HostId = string & { readonly __brand: "HostId" };
 export const hostId = z.string().min(1).transform((value) => value as HostId);
-type SpawnEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
+type CreateThreadEnvironmentArgs = NonNullable<Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"]>;
 
 export interface Need {
   projectId: string | null;
@@ -26,7 +26,7 @@ export interface Target {
   hostId: HostId;
   hostName: string;
   where: "home" | "away";
-  environment: SpawnEnvironment;
+  environment: CreateThreadEnvironmentArgs;
   why: string;
 }
 export interface HostRow {
@@ -63,13 +63,14 @@ export interface Facts {
 export const HOLD_GRACE_MS = 60_000;
 const FACT_TTL_MS = 30_000;
 
-function environment(home: Home | Away, id: HostId): SpawnEnvironment {
+function environment(home: Home | Away, id: HostId): CreateThreadEnvironmentArgs {
   if (home.kind === "reuse") return { type: "reuse", environmentId: home.environmentId };
+  const baseBranch = home.kind === "worktree" ? ("pin" in home && home.pin ? home.pin.branch : home.baseBranch) : null;
   return {
     type: "host", hostId: id,
     workspace: home.kind === "personal" ? { type: "personal" } : {
       type: "managed-worktree",
-      baseBranch: home.baseBranch === null ? { kind: "default" } : { kind: "named", name: home.baseBranch },
+      baseBranch: baseBranch === null ? { kind: "default" } : { kind: "named", name: baseBranch },
     },
   };
 }
