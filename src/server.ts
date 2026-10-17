@@ -1,9 +1,15 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { gate, renderOpenSteps } from "./checklist.ts";
 import { createChecklistFeature } from "./checklist-commands.ts";
 import { openChecklistStore } from "./checklist-store.ts";
 import { evidenceFreshnessError } from "./checklist.ts";
 import { STATE_CHANNEL } from "./contract.ts";
+import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
+import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
+import { createIssues } from "./issues/engine.ts";
+import { GitHubSetupError, createGitHub, decodePrivateKey } from "./issues/github.ts";
+import { openIssueStore } from "./issues/store.ts";
 import { rpcContract } from "./rpc.ts";
 import { createRunFeature } from "./run-commands.ts";
 import { openRunStore } from "./run-store.ts";
@@ -120,10 +126,13 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_schema: checkoutsSchema,
       default: "",
     },
+    ...ISSUE_SETTINGS,
   });
 
-  let { models: modelsText, placementGuard } = await settings.get();
+  let current = await settings.get();
+  let { models: modelsText, placementGuard } = current;
   settings.onChange((next) => {
+    current = next;
     modelsText = next.models;
     placementGuard = next.placementGuard;
   });
@@ -141,7 +150,7 @@ export default async function plugin(bb: BbPluginApi) {
   const runStore = openRunStore(db);
   const isRunWorker = (threadId: string) => runStore.attemptByThread(threadId) !== null;
   const placement = createPlacement(bb);
-  registerDispatchGuard(bb, placement, () => placementGuard);
+  const placementDispatch = registerDispatchGuard(bb, placement, () => placementGuard);
   const checkouts = createCheckouts(bb, {
     get: async () => (await settings.get()).checkouts,
     set: async (text) => { await settings.experimental_set({ checkouts: text }); },
@@ -160,15 +169,17 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const activeWork = async (threadId: string) => {
+    const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
+    const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
+    return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
+  };
+
   const checklist = createChecklistFeature({
     bb,
     store: checklistStore,
     skillsDir: SKILLS_DIR,
-    activeWork: async (threadId) => {
-      const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
-      const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
-      return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
-    },
+    activeWork,
     publish: (threadId) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: Date.now() }),
     evidenceError: async (evidence, threadId, openedAt) => {
       if (evidence.kind === "thread") {
@@ -187,7 +198,48 @@ export default async function plugin(bb: BbPluginApi) {
   const runs = createRunFeature({ bb, runner, footer: checklist.footer, skills: skillNames() });
   runs.register();
 
-  bb.experimental_hooks.on("message.dispatch", checklist.dispatch);
+  const issueStore = openIssueStore(db);
+  const hosts = bb.hosts.experimental_client({ contract: hostContract });
+  const issues = createIssues({
+    bb,
+    store: issueStore,
+    github: createGitHub({
+      credentials: () => {
+        if (!current.githubAppId || !current.githubPrivateKey) return null;
+        const key = decodePrivateKey(current.githubPrivateKey);
+        if (!key.ok) throw new GitHubSetupError(key.error);
+        return { appId: current.githubAppId, privateKey: key.pem };
+      },
+    }),
+    hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),
+    repos: () => {
+      if (!current.githubAppId || !current.githubPrivateKey) return [];
+      const parsed = parseIssueRepos(current.issueRepos);
+      return parsed.ok ? parsed.repos : [];
+    },
+    resolveRole,
+    prGate: (threadId) => {
+      const state = checklistStore.checklist(threadId);
+      const result = gate("pr", state);
+      return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
+    },
+    activeWork,
+    checkWorker: async (hostId, tuple) => {
+      const provider = tuple.split("/")[0]!;
+      const catalog = await loadCatalog(bb, { hostId }, [provider]);
+      const check = checkTuple(tuple, catalog);
+      if (check.ok) return null;
+      // A catalog that failed to load says nothing about the tuple, so the job waits instead of sticking.
+      if (catalog.get(provider)?.state === "error") throw new Error(`${tuple}: ${check.detail}`);
+      return `${tuple}: ${check.detail}`;
+    },
+  });
+  issues.register();
+
+  bb.experimental_hooks.on("message.dispatch", async (context) => {
+    const placed = await placementDispatch(context);
+    return placed.action === "reject" ? placed : checklist.dispatch(context);
+  });
   bb.background.service("pstack-poteto", { start: (signal) => checklist.serve(signal) });
   bb.events.on("thread.active", ({ thread }) => {
     if (thread.originPluginId === bb.pluginId) return;
@@ -195,12 +247,13 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.events.on("thread.idle", ({ thread }) => {
-    if (isRunWorker(thread.id)) return;
+    // Issue workers get the issue engine's own reminder, which knows when their job has ended.
+    if (isRunWorker(thread.id) || issueStore.byThread(thread.id)) return;
     return checklist.onIdle(thread.id).catch((error) => bb.log.error(`pstack nudge: ${error instanceof Error ? error.message : String(error)}`));
   });
 
   bb.agents.contributeInstructions(({ threadId }) => {
-    const parts = [checklist.instructions(threadId), instructionsFor(modelsText)].filter((part): part is string => !!part);
+    const parts = [issues.instructions(threadId), checklist.instructions(threadId), instructionsFor(modelsText)].filter((part): part is string => !!part);
     return parts.length > 0 ? parts.join("\n\n").slice(0, INSTRUCTIONS_MAX) : null;
   });
 
@@ -244,11 +297,12 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register(
     defineCli({
       name: "pstack",
-      summary: "pstack model roles, panel and swarm runs, and playbook checklists",
+      summary: "pstack model roles, panel and swarm runs, playbook checklists, and GitHub issue workers",
       commands: {
         ...checklist.commands,
         ...runs.commands,
         ...createPlacementCommands({ bb, placement, checkouts }),
+        ...issues.commands,
         models: cliCommand({
           summary:
             "Print the effective role-to-model table (configured values merged over defaults)",
@@ -307,7 +361,7 @@ export default async function plugin(bb: BbPluginApi) {
               const thread = await bb.sdk.threads.get({ threadId: ctx.threadId });
               environmentId = thread.environmentId ?? undefined;
             }
-            const catalog = await loadCatalog(bb, environmentId, providerIds(roles));
+            const catalog = await loadCatalog(bb, environmentId ? { environmentId } : {}, providerIds(roles));
             const checks: Check[] = checkRoles(roles, catalog);
             const failed = failedChecks(checks);
             return {

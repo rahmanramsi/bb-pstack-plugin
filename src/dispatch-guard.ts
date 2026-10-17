@@ -54,8 +54,16 @@ export function decide(context: MessageDispatchHookContext, wouldMove: (need: Ne
   };
 }
 
-export function registerDispatchGuard(bb: BbPluginApi, placement: Placement, enabled: () => boolean): void {
-  bb.experimental_hooks.on("message.dispatch", async (context) => {
+/**
+ * Starts the placement refresh service and returns the guard's `message.dispatch` answer. The caller registers it:
+ * bb allows one handler per hook per plugin, so server.ts composes it with the checklist's.
+ */
+export function registerDispatchGuard(
+  bb: BbPluginApi,
+  placement: Placement,
+  enabled: () => boolean,
+): (context: MessageDispatchHookContext) => Promise<MessageDispatchHookDecision> {
+  const guard = async (context: MessageDispatchHookContext): Promise<MessageDispatchHookDecision> => {
     if (!enabled()) return PROCEED;
     try {
       if (!delegateStart(context)) return PROCEED;
@@ -65,7 +73,7 @@ export function registerDispatchGuard(bb: BbPluginApi, placement: Placement, ena
       bb.log.warn(`pstack dispatch guard: ${error instanceof Error ? error.message : String(error)}`);
       return PROCEED;
     }
-  });
+  };
   bb.background.service("pstack-placement", {
     async start(signal) {
       while (!signal.aborted) {
@@ -74,4 +82,5 @@ export function registerDispatchGuard(bb: BbPluginApi, placement: Placement, ena
       }
     },
   });
+  return guard;
 }

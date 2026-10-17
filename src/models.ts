@@ -8,6 +8,8 @@ type RoleSpec = {
   label: string;
   panel: boolean;
   defaults: readonly string[];
+  /** An unconfigured role with a fallback uses that role's effective models. */
+  fallback?: string;
 };
 
 const CODE = "codex/gpt-6.1-sol/xhigh";
@@ -35,6 +37,7 @@ export const ROLES: readonly RoleSpec[] = [
   { label: "swarm workers", panel: false, defaults: [CODE] },
   { label: "architect runners", panel: true, defaults: [JUDGMENT, CODE] },
   { label: "interrogate reviewers", panel: true, defaults: [JUDGMENT, CODE] },
+  { label: "issue worker", panel: false, defaults: [], fallback: "feature, refactoring" },
 ];
 
 const ROLE_BY_LABEL = new Map(ROLES.map((role) => [role.label, role]));
@@ -130,15 +133,18 @@ export type EffectiveRole = {
 };
 
 export function effectiveRoles(config: ModelConfig): EffectiveRole[] {
-  return ROLES.map((role) => {
+  const modelsOf = (role: RoleSpec): string[] => {
     const configured = config.roles.get(role.label);
-    return {
-      role: role.label,
-      panel: role.panel,
-      source: configured ? "configured" : "default",
-      models: configured ? configured.map(formatChoice) : [...role.defaults],
-    };
-  });
+    if (configured) return configured.map(formatChoice);
+    const fallback = role.fallback ? ROLE_BY_LABEL.get(role.fallback) : undefined;
+    return fallback ? modelsOf(fallback) : [...role.defaults];
+  };
+  return ROLES.map((role) => ({
+    role: role.label,
+    panel: role.panel,
+    source: config.roles.has(role.label) ? "configured" : "default",
+    models: modelsOf(role),
+  }));
 }
 
 export function renderTable(config: ModelConfig): string {

@@ -89,7 +89,8 @@ export function renderChecks(checks: readonly Check[]): string {
     .join("\n");
 }
 
-type CatalogRouting = NonNullable<Parameters<BbPluginApi["sdk"]["providers"]["list"]>[0]>;
+/** Where to read a catalog: the host of an environment, a host, or the server's own host. */
+export type CatalogRouting = NonNullable<Parameters<BbPluginApi["sdk"]["providers"]["list"]>[0]>;
 
 export async function loadCatalog(bb: BbPluginApi, route: string | CatalogRouting | undefined, ids: readonly string[]): Promise<Catalog> {
   const routing = typeof route === "string" ? { environmentId: route } : route ?? {};
