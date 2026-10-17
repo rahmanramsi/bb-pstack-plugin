@@ -64,3 +64,17 @@ test("an empty or repeated budget line is an error", () => {
     "line 3: budget appears twice",
   ]);
 });
+
+test("the issue worker role follows feature, refactoring until it is configured itself", () => {
+  const byRole = (text: string) => {
+    const parsed = parseModelConfig(text);
+    assert.ok(parsed.ok);
+    return new Map(effectiveRoles(parsed.config).map((r) => [r.role, r]));
+  };
+  assert.deepEqual(byRole("").get("issue worker")?.models, ["codex/gpt-6.1-sol/xhigh"]);
+  const inherited = byRole("feature, refactoring: claude-code/claude-opus-5-5/high").get("issue worker");
+  assert.deepEqual(inherited, { role: "issue worker", panel: false, source: "default", models: ["claude-code/claude-opus-5-5/high"] });
+  const own = byRole("feature, refactoring: claude-code/claude-opus-5-5/high\nissue worker: codex/gpt-6.1-sol/medium").get("issue worker");
+  assert.deepEqual(own?.models, ["codex/gpt-6.1-sol/medium"]);
+  assert.equal(own?.source, "configured");
+});

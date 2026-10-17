@@ -22,7 +22,8 @@
     "skills": [
       "skills"
     ],
-    "app": "./src/app.tsx"
+    "app": "./src/app.tsx",
+    "host": "./src/host.ts"
   },
   "keywords": [
     "bb-plugin",
@@ -34,7 +35,7 @@
     "unslop"
   ],
   "scripts": {
-    "test": "node --test src/*.test.ts src/ui/*.test.ts",
+    "test": "node --test src/*.test.ts src/issues/*.test.ts src/ui/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "bb plugin build"
   },
@@ -54,6 +55,8 @@
     "tailwind-merge": "^3.4.0",
     "class-variance-authority": "^0.7.1",
     "better-sqlite3": "^12.0.0",
-    "@types/better-sqlite3": "^7.6.12"
+    "@types/better-sqlite3": "^7.6.12",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9"
   }
 }
