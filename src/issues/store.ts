@@ -68,8 +68,9 @@ export type IssueStore = {
    */
   slots(id: JobId): { busy: number; ahead: number };
   /**
-   * The one write. Returns the new row, or null when the version moved (re-read and replan) or when the change would
-   * make the job BUSY while CONCURRENCY other jobs already are. Both checks are in the same statement. In the same
+   * The one write. Returns the new row, or null when the version moved (re-read and replan), when the change would
+   * make the job BUSY while CONCURRENCY other jobs already are (both checks are in the same statement), or when a
+   * round start does not list every pending item. In the same
    * transaction, a round start inserts the round's row and marks its feedback as sent, and the current round's row
    * records the accepted report, the pushed commit, and, once, when the change says the round finished.
    */
@@ -340,6 +341,12 @@ export function openIssueStore(db: Db): IssueStore {
       return { busy, ahead };
     },
     write: db.transaction((id: JobId, version: number, change: Change, now: number): Job | null => {
+      // Feedback that arrived after plan() read the queue is newer than the quiet period it checked: refuse, so the
+      // replan sees it and waits again, instead of leaving it for a round of its own.
+      if (change.startRound?.kind === "feedback") {
+        const { waiting } = db.prepare("SELECT count(*) AS waiting FROM issue_feedback WHERE job_id = ? AND round IS NULL").get(id) as { waiting: number };
+        if (waiting !== change.startRound.feedback.length) return null;
+      }
       const set = columns(change);
       const names = Object.keys(set);
       const slotGuard =

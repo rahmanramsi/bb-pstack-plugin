@@ -169,7 +169,7 @@ test("a round start writes the job, the round's row and its feedback in one tran
   store.addFeedback(REPO, [comment(1, 100), comment(2, 110)].map((feedback) => ({ jobId: job.id, pr: 7, feedback })));
   const listed = [{ kind: "review-comment", id: 1 }, { kind: "review-comment", id: 2 }] as const;
 
-  const refused = { phase: { state: "stopped" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [...listed, { kind: "review", id: 9 }] } } as const;
+  const refused = { phase: { state: "stopped" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [listed[0], { kind: "review", id: 9 }] } } as const;
   assert.throws(() => store.write(job.id, job.version, refused, 200), /review 9 is not pending feedback/);
   assert.equal(store.get(job.id)!.version, job.version, "a failed round start leaves the job as it was");
   assert.equal(store.pendingFeedback(job.id).length, 2);
@@ -234,4 +234,15 @@ test("a job's poll stores its feedback, state and cursor together, and a failed 
   assert.deepEqual(store.jobPoll(job.id), { cursor: { at: 1 }, prState: "open", polledAt: 60, error: "GitHub GET /repos/acme/web/pulls/7: 404" });
   store.recordPoll(job.id, { cursor: { at: 2 }, prState: "merged", feedback: [] }, 70);
   assert.deepEqual(store.jobPoll(job.id), { cursor: { at: 2 }, prState: "merged", polledAt: 70, error: null });
+});
+
+test("a round start whose list misses feedback that arrived while the round was being planned is refused, so the quiet period starts over", () => {
+  const { store } = setup();
+  const job = inReview(store);
+  store.addFeedback(REPO, [comment(1, 100)].map((feedback) => ({ jobId: job.id, pr: 7, feedback })));
+  const planned = { phase: { state: "addressing" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [{ kind: "review-comment", id: 1 }] } } as const;
+  store.addFeedback(REPO, [comment(2, 200)].map((feedback) => ({ jobId: job.id, pr: 7, feedback })));
+  assert.equal(store.write(job.id, job.version, planned, 210), null);
+  assert.equal(store.get(job.id)!.version, job.version);
+  assert.deepEqual(store.pendingFeedback(job.id).map((item) => item.id), [1, 2]);
 });
