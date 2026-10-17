@@ -223,7 +223,7 @@ delegates are child bb threads (`bb pstack spawn --parent-self`), each on the pr
 
 a delegate spawned during a run is a **poteto delegate**: its prompt starts with the [poteto delegate preamble](./skills/poteto-mode/references/poteto-agent.md), which makes it load `poteto-mode` in full, including its inline principles index, before doing any work. a plain thread skips that read and drifts. do not spawn a poteto delegate to run the playbook itself.
 
-panels and fan-outs (`arena`, `swarm`, `interrogate`, `architect`, `how`, `why`, `reflect`) run as one pstack run: a panel puts several models in front of the same task and can hand every answer to a judge or synthesizer, and a swarm runs one brief across many slices with a structured report and an optional verifier per slice. workers are hidden threads you reach from the run's card. writers that need their own checkout stay child threads. see [`pstack-runs.md`](./skills/poteto-mode/references/pstack-runs.md).
+panels and fan-outs (`arena`, `swarm`, `interrogate`, `architect`, `how`, `why`, `reflect`) run as one pstack run: a panel puts several models in front of the same task and can hand every answer to a judge or synthesizer, and a swarm runs one brief across many slices with a structured report and an optional verifier per slice. workers are hidden threads you reach from the run's card. a worker runs on this machine unless its plan says it reads only committed code or only its prompt; then it can move to another machine when this one is full, and `bb pstack run status` shows where each one ran. writers that need their own checkout stay child threads. see [`pstack-runs.md`](./skills/poteto-mode/references/pstack-runs.md).
 
 ## the checklist
 
