@@ -124,7 +124,8 @@ export const EFFECT_POLICY = {
   "open-pr": { recovery: { kind: "probe" }, leaseMs: 60_000 },
   comment: { recovery: { kind: "probe" }, leaseMs: 60_000 },
   "stop-thread": { recovery: { kind: "replay" }, leaseMs: 60_000 },
-  // A second copy of the round message is harmless: the second report finds the job no longer addressing.
+  // A repeated copy of the round message tells the worker to do nothing, and a report from it names its round, which
+  // parseReport refuses once a later round runs.
   "send-round": { recovery: { kind: "replay" }, leaseMs: 60_000 },
   reply: { recovery: { kind: "probe" }, leaseMs: 60_000 },
   // One request per reviewer when GitHub refuses the batch, so it gets longer than one call.
@@ -549,10 +550,14 @@ export const InitialReport = z.discriminatedUnion("outcome", [
 ]);
 export type InitialReport = z.infer<typeof InitialReport>;
 
-/** A feedback round's report. `pr.body`, when set, replaces the pull request description. */
+/**
+ * A feedback round's report. `round` is the feedback round its message named, so a report from a repeated copy of an
+ * earlier round's message is told apart. `pr.body`, when set, replaces the pull request description.
+ */
+const Round = z.number().int().positive();
 export const RoundReport = z.discriminatedUnion("outcome", [
-  z.strictObject({ outcome: z.literal("changes"), pr: z.strictObject({ body: z.string() }).optional(), replies: z.array(Reply), verification: Verification, summary: Line }),
-  z.strictObject({ outcome: z.literal("no-change"), replies: z.array(Reply), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("changes"), round: Round, pr: z.strictObject({ body: z.string() }).optional(), replies: z.array(Reply), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("no-change"), round: Round, replies: z.array(Reply), verification: Verification, summary: Line }),
 ]);
 export type RoundReport = z.infer<typeof RoundReport>;
 
@@ -560,13 +565,23 @@ export type Report = InitialReport | RoundReport;
 /** A report checked against the contract of the job's current round. */
 export type ParsedReport = { round: "initial"; report: InitialReport } | { round: "feedback"; report: RoundReport };
 
-export function parseReport(job: Job, value: unknown): { ok: true; parsed: ParsedReport } | { ok: false; error: z.ZodError } {
+/**
+ * `invalid_report` when the report breaks its round's contract; `other_round` when it answers another feedback round's
+ * message. Neither counts as a rejection.
+ */
+export function parseReport(job: Job, value: unknown): { ok: true; parsed: ParsedReport } | { ok: false; code: "invalid_report" | "other_round"; message: string } {
+  const invalid = (error: z.ZodError) => ({ ok: false, code: "invalid_report", message: `the report does not match the contract:\n${z.prettifyError(error)}` }) as const;
   if (job.round === 1) {
     const result = InitialReport.safeParse(value);
-    return result.success ? { ok: true, parsed: { round: "initial", report: result.data } } : { ok: false, error: result.error };
+    return result.success ? { ok: true, parsed: { round: "initial", report: result.data } } : invalid(result.error);
   }
   const result = RoundReport.safeParse(value);
-  return result.success ? { ok: true, parsed: { round: "feedback", report: result.data } } : { ok: false, error: result.error };
+  if (!result.success) return invalid(result.error);
+  const current = job.round - 1;
+  if (result.data.round !== current) {
+    return { ok: false, code: "other_round", message: `this report is for feedback round ${result.data.round}, and the job is on feedback round ${current}; report only for the latest round message` };
+  }
+  return { ok: true, parsed: { round: "feedback", report: result.data } };
 }
 
 /** A report that passed every check, with the commit it was made at. That commit, not HEAD, is what gets pushed. */

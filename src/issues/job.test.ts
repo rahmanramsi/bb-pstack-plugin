@@ -233,7 +233,7 @@ test("stop replaces a pending outbox, stops a worker that may exist, and is null
 });
 
 const first = (value: unknown) => ({ round: "initial", report: InitialReport.parse(value) }) as const;
-const later = (value: unknown) => ({ round: "feedback", report: RoundReport.parse(value) }) as const;
+const later = (value: object) => ({ round: "feedback", report: RoundReport.parse({ round: 1, ...value }) }) as const;
 
 const REPORT = InitialReport.parse({
   outcome: "changes",
@@ -529,9 +529,12 @@ test("a feedback round's report must answer exactly the listed items, add a comm
 
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
   assert.equal(parseReport(working, { outcome: "changes", verification: ["npm test"], summary: "s" }).ok, false, "the first round's changes need pr.title and pr.body");
-  assert.equal(parseReport(addressing, { outcome: "needs-info", questions: ["Which helper?"], replies: REPLIES, verification: ["read it"] }).ok, false, "a question goes in a reply");
-  assert.equal(parseReport(addressing, { outcome: "changes", pr: { title: "fix: x is renamed", body: "b" }, replies: REPLIES, verification: ["npm test"], summary: "s" }).ok, false, "the title is set once");
-  assert.equal(parseReport(addressing, { outcome: "no-change", verification: ["read it"], summary: "s" }).ok, false, "replies are required");
+  assert.equal(parseReport(addressing, { outcome: "needs-info", round: 1, questions: ["Which helper?"], replies: REPLIES, verification: ["read it"] }).ok, false, "a question goes in a reply");
+  assert.equal(parseReport(addressing, { outcome: "changes", round: 1, pr: { title: "fix: x is renamed", body: "b" }, replies: REPLIES, verification: ["npm test"], summary: "s" }).ok, false, "the title is set once");
+  assert.equal(parseReport(addressing, { outcome: "no-change", round: 1, verification: ["read it"], summary: "s" }).ok, false, "replies are required");
+  const answered = { outcome: "no-change", replies: REPLIES, verification: ["read it"], summary: "s" };
+  assert.deepEqual(parseReport({ ...addressing, round: 3 }, { ...answered, round: 1 }), { ok: false, code: "other_round", message: "this report is for feedback round 1, and the job is on feedback round 2; report only for the latest round message" });
+  assert.equal(parseReport(addressing, { ...answered, round: 1 }).ok, true);
 });
 
 test("a round ends when the job leaves it: back in review, waiting for an answer, or on its way to an end, and not when a job in review ends", () => {

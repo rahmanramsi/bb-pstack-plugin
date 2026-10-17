@@ -154,19 +154,21 @@ export function workerPrompt(job: Job): string {
   ].join("\n");
 }
 
-const ROUND_REPORT_EXAMPLE = JSON.stringify(
-  {
-    outcome: "changes",
-    replies: [
-      { kind: "review-comment", commentId: 1234567, body: "Renamed it to `parseInput` in 9f3c2e1." },
-      { kind: "review", commentId: 7654321, body: "Kept the retry: the upload API drops one request in a few hundred. Added a comment saying so in 9f3c2e1." },
-    ],
-    verification: ["npm test -- login: 15 passed"],
-    summary: "Renamed the parser and explained the retry.",
-  },
-  null,
-  2,
-);
+const roundReportExample = (round: number) =>
+  JSON.stringify(
+    {
+      outcome: "changes",
+      round,
+      replies: [
+        { kind: "review-comment", commentId: 1234567, body: "Renamed it to `parseInput` in 9f3c2e1." },
+        { kind: "review", commentId: 7654321, body: "Kept the retry: the upload API drops one request in a few hundred. Added a comment saying so in 9f3c2e1." },
+      ],
+      verification: ["npm test -- login: 15 passed"],
+      summary: "Renamed the parser and explained the retry.",
+    },
+    null,
+    2,
+  );
 
 const FEEDBACK_HEADINGS = { review: "Review", "review-comment": "Inline comment", "pr-comment": "Comment" } as const;
 
@@ -175,6 +177,7 @@ const FEEDBACK_HEADINGS = { review: "Review", "review-comment": "Inline comment"
  * the pull request, the issue, every item with its kind and id, and what earlier rounds did.
  */
 export function roundPrompt(job: Job, ordinal: number, feedback: FeedbackFact): string {
+  const round = ordinal - 1;
   const items = feedback.pending.flatMap((item) => [
     `### ${FEEDBACK_HEADINGS[item.kind]} by @${item.author}: \`{ "kind": "${item.kind}", "commentId": ${item.id} }\``,
     "",
@@ -184,7 +187,7 @@ export function roundPrompt(job: Job, ordinal: number, feedback: FeedbackFact): 
   ]);
   const earlier = feedback.rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Feedback round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
   return [
-    `Feedback round ${ordinal - 1} of ${MAX_FEEDBACK_ROUNDS} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
+    `Feedback round ${round} of ${MAX_FEEDBACK_ROUNDS} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
     "",
     "## The issue",
     "",
@@ -203,15 +206,17 @@ export function roundPrompt(job: Job, ordinal: number, feedback: FeedbackFact): 
     "- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it.",
     "- Never run `git push`, never use `gh` or another GitHub client, and never switch or create branches.",
     "- Commit every change before you report. Untracked or uncommitted files reject the report.",
+    `- If you already reported feedback round ${round}, this message is a repeated copy: stop without changing anything.`,
     "",
     "## Report",
     "",
     "Write the report JSON to a file, then run `bb pstack issues report --file <path>`:",
     "",
     "```json",
-    ROUND_REPORT_EXAMPLE,
+    roundReportExample(round),
     "```",
     "",
+    `\`round\` is ${round}, this message's round.`,
     "`outcome` is `changes` when you added commits, or `no-change` when the replies answer everything without a code change. `replies` has one entry for each item above, with its `kind` and `commentId`. Set `pr.body` only to replace a pull request description the change made wrong. Every outcome lists `verification`: each check you ran and its result.",
     "A rejected report exits 1 with every reason. Fix them and report again. A second rejection ends the job.",
   ].join("\n");

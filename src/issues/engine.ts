@@ -512,7 +512,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     let parsed: ParsedReport;
     try {
       const result = parseReport(bound, JSON.parse(text));
-      if (!result.ok) return { ok: false, code: "invalid_report", message: `the report does not match the contract:\n${z.prettifyError(result.error)}` };
+      if (!result.ok) return { ok: false, code: result.code, message: result.message };
       parsed = result.parsed;
     } catch (error) {
       return { ok: false, code: "invalid_report", message: `the report is not JSON: ${message(error)}` };

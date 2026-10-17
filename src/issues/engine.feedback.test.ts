@@ -7,6 +7,7 @@ const appComments = (h: ReturnType<typeof harness>, pr: number) => (h.gh().comme
 const appReplies = (h: ReturnType<typeof harness>, pr: number) => (h.gh().reviewComments.get(pr) ?? []).filter((comment) => comment.user.login === APP);
 const roundReport = (replies: { kind: string; commentId: number; body: string }[], extra: Record<string, unknown> = {}) => ({
   outcome: "changes",
+  round: 1,
   replies,
   verification: ["npm test -- login: 15 passed"],
   summary: "Renamed the helpers.",
@@ -76,7 +77,7 @@ test("only feedback from people with write access counts: /agent comments, and r
   assert.deepEqual([...text.matchAll(/"commentId": (\d+)/g)].map((match) => Number(match[1])).filter((id) => id !== 1234567 && id !== 7654321), [command]);
   assert.match(text, /\/agent also cover the 320px layout/);
 
-  const noChange = { outcome: "no-change", replies: [{ kind: "pr-comment", commentId: command, body: "The 320px layout already wraps; see the screenshot test." }], verification: ["npm test -- visual: 4 passed"], summary: "Explained the 320px layout." };
+  const noChange = { outcome: "no-change", round: 1, replies: [{ kind: "pr-comment", commentId: command, body: "The 320px layout already wraps; see the screenshot test." }], verification: ["npm test -- visual: 4 passed"], summary: "Explained the 320px layout." };
   const accepted = await h.report(job.threadId!, noChange, { headSha: SHA2 });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
   await h.settle();
@@ -238,4 +239,30 @@ test("a worker thread that failed while its pull request waited for review is re
   assert.equal(h.spawned.length, 2);
   assert.equal(h.sent.length, 0);
   assert.match(h.spawned[1]!.prompt, new RegExp(`"commentId": ${comments[0]}`));
+});
+
+test("a report from a repeated copy of an earlier round's message is refused without counting against the current round", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const first = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: first.comments[0]!, body: "Renamed in 3333333." }]), { headSha: SHA3 })).exitCode, 0);
+  await h.settle();
+
+  h.clock.now += MIN;
+  const second = h.review(pr, { author: "maya", body: "", comments: ["Rename `y`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  assert.match(h.sent.at(-1)!.input[0].text, /"round": 2/);
+
+  const stale = await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: first.comments[0]!, body: "Renamed again." }]), { headSha: SHA3 });
+  assert.equal(stale.exitCode, 1);
+  assert.match(stale.stderr!, /feedback round 1[\s\S]*feedback round 2/);
+  const still = await h.only();
+  assert.equal(still.state, "addressing");
+  assert.equal(still.error, null, "not a rejection");
+  const current = roundReport([{ kind: "review-comment", commentId: second.comments[0]!, body: "Renamed y too." }], { round: 2 });
+  assert.equal((await h.report(job.threadId!, current, { headSha: "4".repeat(40) })).exitCode, 0);
 });
