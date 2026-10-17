@@ -56,6 +56,8 @@ function job(overrides: Partial<Job> = {}): Job {
     pushedSha: null,
     pr: null,
     error: null,
+    round: 1,
+    worker: null,
     createdAt: NOW - MIN,
     updatedAt: NOW - MIN,
     ...overrides,
@@ -69,13 +71,14 @@ function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bo
   return "effects" in phase ? { ...phase, ...bookkeeping } : phase;
 }
 
-const spawnEffect: Effect = { op: "spawn", key: "spawn:x", spec: { ...WORKER, title: "t", prompt: "p" } };
+const spawnEffect: Effect = { op: "spawn", key: "spawn:x", spec: { ...WORKER, title: "t", prompt: "p", baseRef: "origin/main" } };
 const labelEffect: Effect = { op: "labels", key: "labels:x", on: "issue", add: ["agent:working"], remove: [] };
 const pushEffect: Effect = { op: "push", key: "push:x", sha: HEAD, expectedRemoteSha: null };
 
 /** Applies a Change the way the store does, so a test can follow a job through several steps. */
 function apply(current: Job, change: Change): Job {
-  return { ...current, ...change, version: current.version + 1, updatedAt: NOW };
+  const { startRound, ...rest } = change;
+  return { ...current, ...rest, ...(startRound ? { round: startRound.ordinal } : {}), version: current.version + 1, updatedAt: NOW };
 }
 
 test("a queued job starts only with a free slot and resolved worker settings, labelling before it spawns", () => {

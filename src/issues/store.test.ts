@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 import { MIGRATIONS } from "../store.ts";
-import { CONCURRENCY, RESTING_STATES, TERMINAL, TRANSIT, enter, type Change, type Effect, type JobId, type RepoName, type Sha } from "./job.ts";
+import { CONCURRENCY, RESTING_STATES, TERMINAL, TRANSIT, enter, type AcceptedReport, type Change, type Effect, type Feedback, type JobId, type RepoName, type Sha } from "./job.ts";
 import { openIssueStore, type NewJob } from "./store.ts";
 
 const REPO = "acme/web" as RepoName;
@@ -31,7 +31,7 @@ function newJob(overrides: Partial<NewJob> = {}): NewJob {
   };
 }
 
-const spawn: Effect = { op: "spawn", key: "spawn:x", spec: { title: "t", prompt: "p", providerId: "codex", model: "m", reasoningLevel: "high", permissionMode: null } };
+const spawn: Effect = { op: "spawn", key: "spawn:x", spec: { title: "t", prompt: "p", providerId: "codex", model: "m", reasoningLevel: "high", permissionMode: null, baseRef: "origin/main" } };
 
 test("a write is guarded by version: the stale writer gets null and the row is unchanged", () => {
   const { store } = setup();
@@ -110,7 +110,8 @@ test("repository poll state is stored per repository", () => {
 });
 
 test("the migration's state lists match job.ts", () => {
-  const sql = MIGRATIONS.filter((statement) => statement.includes(" issue_jobs ")).join("\n");
+  const latest = (pattern: RegExp) => MIGRATIONS.filter((statement) => pattern.test(statement)).at(-1)!;
+  const sql = [latest(/^CREATE TABLE issue_jobs(_next)? \(/), latest(/^CREATE UNIQUE INDEX issue_jobs_open /)].join("\n");
   const list = (pattern: RegExp) => new Set([...pattern.exec(sql)![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]));
   assert.deepEqual(list(/state IN \(\s*([^)]*)\)\),/), new Set([...RESTING_STATES, ...Object.keys(TRANSIT)]));
   assert.deepEqual(list(/CHECK \(\(state IN \(([^)]*)\)\) = \(effects_json/), new Set(Object.keys(TRANSIT)));
@@ -127,4 +128,93 @@ test("due lists only jobs that can act now: not a job resting in review, nor an 
   store.write(ready!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 100 } } as Change, 20);
   assert.deepEqual(store.due(150), [queued!.id, ready!.id]);
   assert.deepEqual(store.due(200), [queued!.id, leased!.id, backoff!.id, ready!.id]);
+});
+
+const SHA = "a".repeat(40) as Sha;
+const comment = (id: number, createdAt: number, kind: Feedback["kind"] = "review-comment"): Feedback => ({
+  kind,
+  id,
+  author: "maya",
+  body: `comment ${id}`,
+  path: "src/a.ts",
+  line: 3,
+  diffHunk: "@@ -1 +1 @@",
+  inReplyTo: null,
+  reviewId: 500,
+  createdAt,
+});
+
+/** A job resting in review on pull request 7, as step 1 leaves it. */
+function inReview(store: ReturnType<typeof setup>["store"]) {
+  const job = store.insert(newJob(), 10)!;
+  store.write(job.id, 0, { phase: enter("starting", [spawn]), startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } }, 11);
+  return store.write(job.id, 1, { phase: { state: "review" }, threadId: "thr_r", pushedSha: SHA, pr: { number: 7, url: "u" } }, 12)!;
+}
+
+test("feedback is stored once per GitHub item, and only for the job it was polled for", () => {
+  const { store } = setup();
+  const job = inReview(store);
+  const items = [comment(1, 100), comment(2, 90), comment(1, 100, "review")].map((feedback) => ({ jobId: job.id, pr: 7, feedback }));
+  assert.equal(store.addFeedback(REPO, items), 3, "an inline comment and a review may share an id");
+  assert.equal(store.addFeedback(REPO, items), 0, "a repeated poll adds nothing");
+  assert.deepEqual(store.feedback(job.id).pending.map((item) => [item.kind, item.id]), [["review-comment", 2], ["review-comment", 1], ["review", 1]]);
+  assert.deepEqual(store.feedback(job.id).pending[0], comment(2, 90));
+  assert.deepEqual(store.withPullRequest(REPO).map((open) => open.id), [job.id]);
+});
+
+test("a round start writes the job, the round's row and its feedback in one transaction, and feedback that arrives later waits for the next round", () => {
+  const { db, store } = setup();
+  const job = inReview(store);
+  store.addFeedback(REPO, [comment(1, 100), comment(2, 110)].map((feedback) => ({ jobId: job.id, pr: 7, feedback })));
+  const listed = [{ kind: "review-comment", id: 1 }, { kind: "review-comment", id: 2 }] as const;
+
+  const refused = { phase: { state: "stopped" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [...listed, { kind: "review", id: 9 }] } } as const;
+  assert.throws(() => store.write(job.id, job.version, refused, 200), /review 9 is not pending feedback/);
+  assert.equal(store.get(job.id)!.version, job.version, "a failed round start leaves the job as it was");
+  assert.equal(store.feedback(job.id).pending.length, 2);
+  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM issue_rounds WHERE ordinal = 2").get(), { n: 0 });
+
+  const started = store.write(job.id, job.version, { phase: { state: "addressing" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: listed } }, 200)!;
+  assert.equal(started.round, 2);
+  assert.deepEqual(store.feedback(job.id).pending, []);
+  assert.deepEqual(store.roundFeedback(job.id, 2).map((item) => item.id), [1, 2]);
+  assert.deepEqual(db.prepare("SELECT kind, started_at, base_sha FROM issue_rounds WHERE job_id = ? AND ordinal = 2").get(job.id), { kind: "feedback", started_at: 200, base_sha: SHA });
+
+  store.addFeedback(REPO, [comment(3, 250)].map((feedback) => ({ jobId: job.id, pr: 7, feedback })));
+  assert.deepEqual(store.feedback(job.id).pending.map((item) => item.id), [3], "feedback that arrives during a round waits for the next one");
+  assert.deepEqual(store.roundFeedback(job.id, 2).map((item) => item.id), [1, 2]);
+});
+
+test("the current round's row records its report, its pushed commit, and when the job is back in review", () => {
+  const { db, store } = setup();
+  const job = inReview(store);
+  const next = SHA.replace(/a/g, "b") as Sha;
+  let current = store.write(job.id, job.version, { phase: { state: "addressing" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [] } }, 200)!;
+  const report: AcceptedReport = { outcome: "no-change", replies: [], verification: ["read it"], summary: "Explained the naming.", headSha: SHA, acceptedAt: 300 };
+  current = store.write(job.id, current.version, { report }, 300)!;
+  current = store.write(job.id, current.version, { pushedSha: next }, 310)!;
+  store.write(job.id, current.version, { phase: { state: "review" } }, 320);
+  assert.deepEqual(db.prepare("SELECT ordinal, pushed_sha, finished_at FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(job.id), [
+    { ordinal: 1, pushed_sha: SHA, finished_at: 12 },
+    { ordinal: 2, pushed_sha: next, finished_at: 320 },
+  ]);
+  assert.deepEqual(store.feedback(job.id).rounds, [{ ordinal: 1, summary: null }, { ordinal: 2, summary: "Explained the naming." }]);
+});
+
+test("a step 1 database migrates its jobs to round 1 with their history", () => {
+  const db = new Database(":memory:");
+  const step1 = MIGRATIONS.findIndex((statement) => statement.startsWith("CREATE TABLE issue_jobs_next"));
+  for (const statement of MIGRATIONS.slice(0, step1)) db.exec(statement);
+  db.prepare(
+    `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch,
+       state, thread_id, pushed_sha, pr_number, pr_url, report_json, created_at, updated_at)
+     VALUES ('psi_old', 'acme/web', 41, 1, 1, 'maya', 1, '{}', 'p', 'h', 'main', 'agent/issue-41-x', 'review', 'thr_old', ?, 7, 'u', '{"summary":"Fixed."}', 5, 6)`,
+  ).run(SHA);
+  for (const statement of MIGRATIONS.slice(step1)) db.exec(statement);
+  const store = openIssueStore(db);
+  const job = store.get("psi_old" as JobId)!;
+  assert.equal(job.round, 1);
+  assert.equal(job.phase.state, "review");
+  assert.deepEqual(store.feedback(job.id).rounds, [{ ordinal: 1, summary: "Fixed." }]);
+  assert.throws(() => db.prepare("UPDATE issue_jobs SET state = 'addressing', thread_id = NULL WHERE id = 'psi_old'").run(), /CHECK/);
 });

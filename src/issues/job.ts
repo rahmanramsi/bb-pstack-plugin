@@ -35,17 +35,21 @@ export const TRANSIT = {
   closing: "done",
   stopping: "stopped",
   sticking: "stuck",
+  sending: "addressing",
+  respawning: "addressing",
+  republishing: "review",
+  replying: "review",
 } as const;
 
 export type TransitState = keyof typeof TRANSIT;
-export const RESTING_STATES = ["ignored", "queued", "working", "needs-info", "review", "done", "stopped", "stuck"] as const;
+export const RESTING_STATES = ["ignored", "queued", "working", "needs-info", "review", "addressing", "done", "stopped", "stuck"] as const;
 export type RestingState = (typeof RESTING_STATES)[number];
 export type JobState = TransitState | RestingState;
 
 /** A new label event on the issue may start a new job only once its last job is in one of these. */
 export const TERMINAL: ReadonlySet<JobState> = new Set(["ignored", "done", "stopped", "stuck"]);
-/** States that hold one of the worker slots. A worker waiting in review or needs-info does not. */
-export const BUSY: ReadonlySet<JobState> = new Set(["starting", "working", "publishing"]);
+/** States that hold one of the worker slots: a worker turn runs or its result is being published. */
+export const BUSY: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "sending", "respawning", "addressing", "republishing", "replying"]);
 /** At most this many jobs are BUSY at once. */
 export const CONCURRENCY = 3;
 
@@ -61,14 +65,19 @@ export type PermissionMode = NonNullable<SpawnArgs["permissionMode"]>;
 const REASONING_LEVELS = { none: true, low: true, medium: true, high: true, xhigh: true, max: true, ultra: true, ultracode: true } satisfies Record<ReasoningLevel, true>;
 export const isReasoningLevel = (value: string): value is ReasoningLevel => Object.hasOwn(REASONING_LEVELS, value);
 
-/** Resolved once at `start` and stored in the outbox, so a probe or a replay never sees a different prompt. */
-export type SpawnSpec = {
-  title: string;
-  prompt: string;
+export type WorkerSettings = {
   providerId: string;
   model: string;
   reasoningLevel: ReasoningLevel;
   permissionMode: PermissionMode | null;
+};
+
+/** Resolved when the effect is created and stored in the outbox, so a probe or a replay never sees a different prompt. */
+export type SpawnSpec = WorkerSettings & {
+  title: string;
+  prompt: string;
+  /** The ref the worktree starts from: the base branch for the first worker, the pushed branch for a replacement. */
+  baseRef: string;
 };
 
 /**
@@ -195,9 +204,19 @@ export type Job = {
   pushedSha: Sha | null;
   pr: { number: number; url: string } | null;
   error: string | null;
+  /** The current round's ordinal: 1 is the issue, each later one answers feedback on the pull request. */
+  round: number;
+  /** The worker's settings from the start, so a replacement worker runs the same model. */
+  worker: WorkerSettings | null;
   createdAt: number;
   updatedAt: number;
 };
+
+/**
+ * A round's start, written with the job in one transaction: the round's history row, and every listed feedback item
+ * marked as sent in it. Items that arrive later stay pending for the next round.
+ */
+export type RoundStart = { ordinal: number; kind: "initial" | "feedback"; baseSha: Sha | null; feedback: readonly FeedbackRef[] };
 
 /** The write vocabulary for an existing job. `phase` replaces state, outbox and bookkeeping together. */
 export type Change = {
@@ -210,6 +229,8 @@ export type Change = {
   pushedSha?: Sha;
   pr?: { number: number; url: string };
   error?: string | null;
+  startRound?: RoundStart;
+  worker?: WorkerSettings;
 };
 
 export type ThreadFact =
@@ -219,7 +240,6 @@ export type ThreadFact =
   | { kind: "failed"; error: string }
   | { kind: "gone" };
 
-export type WorkerSettings = Omit<SpawnSpec, "title" | "prompt">;
 /**
  * Why a queued job's worker cannot be resolved. `permanent` when only an operator can fix it, such as a model the host
  * does not have: the job sticks with the reason instead of waiting.
@@ -252,12 +272,17 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly ("slotFree" | "work
   asking: [],
   "needs-info": [],
   review: [],
+  addressing: [],
   closing: [],
   done: [],
   stopping: [],
   stopped: [],
   sticking: [],
   stuck: [],
+  sending: [],
+  respawning: [],
+  republishing: [],
+  replying: [],
 };
 
 /** Resting states whose next action depends on facts outside the row, so the sweep reconciles them every pass. */
@@ -365,9 +390,9 @@ export function settle(job: Job, outcome: EffectOutcome, now: number): Change {
 export function start(job: Job, worker: WorkerSettings, now: number): Change {
   const effects: Effect[] = [
     { op: "labels", key: `labels:${job.id}:working`, on: "issue", add: [LABEL.working], remove: [] },
-    { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job) } },
+    { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
-  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null };
+  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } };
 }
 
 /**
