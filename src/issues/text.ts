@@ -52,17 +52,32 @@ function neutralizeMentions(markdown: string): string {
   return outsideCode(markdown, (text) => text.replace(/(^|[^\w`/.@-])(@[A-Za-z0-9][A-Za-z0-9-]*(?:\/[A-Za-z0-9][\w.-]*)?)/g, "$1`$2`"));
 }
 
+/**
+ * Removes every pstack marker, and repeats, so no marker can be assembled from pieces. Effects append their own marker
+ * after this, and a probe trusts only that one.
+ */
+function unmarked(text: string): string {
+  for (;;) {
+    const next = text.replace(/<!--\s*pstack:[\s\S]*?-->/gi, "");
+    if (next === text) return text;
+    text = next;
+  }
+}
+
 const CLOSING_KEYWORD =
   /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?=(?:[\w.-]+\/[\w.-]+)?#\d+\b|https?:\/\/\S+\/issues\/\d+)/gi;
 
-/** What is posted as the pull request body: mentions neutralized, closing keywords removed, `Closes #<issue>` appended. */
+/**
+ * What is posted as the pull request body: markers and mentions neutralized, closing keywords removed, `Closes #<issue>`
+ * appended.
+ */
 export function prBody(body: string, issue: number): string {
-  return `${outsideCode(neutralizeMentions(body), (text) => text.replace(CLOSING_KEYWORD, "")).trim()}\n\nCloses #${issue}`;
+  return `${outsideCode(neutralizeMentions(unmarked(body)), (text) => text.replace(CLOSING_KEYWORD, "")).trim()}\n\nCloses #${issue}`;
 }
 
-/** Text posted on the issue (questions, the no-change reason) with mentions neutralized. */
+/** Text posted in a comment (questions, the no-change reason, replies) with markers and mentions neutralized. */
 export function issueText(text: string): string {
-  return neutralizeMentions(text).trim();
+  return neutralizeMentions(unmarked(text)).trim();
 }
 
 /**

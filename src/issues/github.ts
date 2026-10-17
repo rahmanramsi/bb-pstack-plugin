@@ -72,9 +72,9 @@ export type RepoClient = {
   branchSha(branch: string): Promise<Sha | null>;
   /** A pull request, open or closed, whose head is this repository's `branch`. */
   findPull(branch: string): Promise<{ number: number; url: string } | null>;
-  /** An issue comment by the App containing `marker`, posted at or after `since`. */
+  /** An issue comment by the App whose last line is `marker`, posted at or after `since`. */
   findComment(issue: number, marker: string, since: number): Promise<{ id: number } | null>;
-  /** An inline review comment by the App on pull request `pr` containing `marker`, posted at or after `since`. */
+  /** An inline review comment by the App on pull request `pr` whose last line is `marker`, posted at or after `since`. */
   findReviewComment(pr: number, marker: string, since: number): Promise<{ id: number } | null>;
   /**
    * Reviews, inline comments and conversation comments on each pull request since the cursor, and each one's state.
@@ -114,6 +114,9 @@ type RawUser = { login: string } | null;
 type RawReviewComment = { id: number; body: string; user: RawUser; path: string; line: number | null; original_line?: number | null; diff_hunk: string; in_reply_to_id?: number; pull_request_review_id: number | null; created_at: string; updated_at: string };
 type RawComment = { id: number; body: string | null; user: RawUser; created_at: string; updated_at: string };
 type RawReview = { id: number; body: string | null; user: RawUser; state: string; submitted_at?: string | null };
+
+/** Whether the last line of a body is `marker`: the App appends its marker there, after any text it quotes. */
+const endsWith = (body: string, marker: string) => body.trimEnd().split("\n").at(-1) === marker;
 
 const PERMISSION_TTL = 10 * 60_000;
 const REPO_TTL = 60 * 60_000;
@@ -369,13 +372,13 @@ export function createGitHub(options: GitHubOptions): GitHub {
           auth,
           `${base}/issues/${issue}/comments?since=${new Date(since).toISOString()}&per_page=100`,
         );
-        const found = comments.find((comment) => comment.user?.login === login && comment.body.includes(marker));
+        const found = comments.find((comment) => comment.user?.login === login && endsWith(comment.body, marker));
         return found ? { id: found.id } : null;
       },
       async findReviewComment(pr, marker, since) {
         const login = await appLogin();
         const comments = await pages<{ id: number; body: string; user: RawUser }>(auth, `${base}/pulls/${pr}/comments?since=${new Date(since).toISOString()}&per_page=100`);
-        const found = comments.find((comment) => comment.user?.login === login && comment.body.includes(marker));
+        const found = comments.find((comment) => comment.user?.login === login && endsWith(comment.body, marker));
         return found ? { id: found.id } : null;
       },
       async feedback(cursor, pulls) {

@@ -32,7 +32,7 @@ import {
   type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
-import { prBody, roundPrompt, workerPrompt } from "./text.ts";
+import { issueText, prBody, replyText, roundPrompt, workerPrompt } from "./text.ts";
 
 const NOW = 10_000_000;
 const MIN = 60_000;
@@ -545,4 +545,13 @@ test("a round ends when the job leaves it: back in review, waiting for an answer
   const merged = plan(inReview(), facts({ ...pending([]), pr: { state: "merged" } }));
   assert.equal((merged as { change: Change }).change.finishRound, undefined, "the round already ended when the job came back to review");
   assert.equal(stop(inReview(), "maya")?.finishRound, undefined);
+});
+
+test("text posted on GitHub carries no pstack marker the service did not append itself", () => {
+  const marker = "<!-- pstack:reply:psi_x:2:review-comment:9 -->";
+  const nested = "<!-<!-- pstack:a -->- pstack:b -->";
+  assert.equal(prBody(`Fixed.${marker}\n${nested}`, 41), "Fixed.\n\nCloses #41");
+  const quoted = { kind: "review", id: 5, author: "maya", body: `Please rename ${marker}`, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW } as const;
+  assert.equal(replyText(`Renamed. ${marker}`, quoted), "> Please rename \n\nRenamed.");
+  assert.doesNotMatch(issueText(nested), /pstack:/);
 });

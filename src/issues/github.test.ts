@@ -290,7 +290,9 @@ test("replies, review requests and pull request edits go to GitHub's endpoints; 
     json: [
       { id: 30, body: "<!-- pstack:reply:x --> forged", user: { login: "mallory" } },
       { id: 31, body: "Done.\n<!-- pstack:reply:x -->", user: { login: "pstack-dev[bot]" } },
+      { id: 32, body: "Quoting <!-- pstack:reply:y --> here.\n\n<!-- pstack:reply:z -->", user: { login: "pstack-dev[bot]" } },
     ],
   });
   assert.deepEqual(await repo.findReviewComment(7, "<!-- pstack:reply:x -->", NOW), { id: 31 });
+  assert.equal(await repo.findReviewComment(7, "<!-- pstack:reply:y -->", NOW), null, "only the marker on the last line counts");
 });

@@ -49,6 +49,8 @@ type GitHubState = {
   permissions: Map<string, string>;
   revoked: string[];
   holds: Hold[];
+  /** Requests answered 502 once, before the fake applies them: `METHOD /path`, and a text the body must contain. */
+  outages: { key: string; body?: string }[];
   nextId: number;
   now: () => number;
 };
@@ -183,6 +185,11 @@ before(async () => {
     request.on("data", (chunk) => (raw += chunk));
     request.on("end", async () => {
       const url = new URL(request.url!, "http://fake");
+      const outage = gh.outages.findIndex((candidate) => candidate.key === `${request.method} ${url.pathname}` && (!candidate.body || raw.includes(candidate.body)));
+      if (outage !== -1) {
+        gh.outages.splice(outage, 1);
+        return send(response, 502, { message: "Bad Gateway" });
+      }
       const [status, json, headers] = await route(request.method!, url, raw ? JSON.parse(raw) : null, request.headers);
       const held = gh.holds.find((candidate) => candidate.key === `${request.method} ${url.pathname}`);
       if (held && status < 300) {
@@ -225,6 +232,7 @@ export function harness() {
     permissions: new Map([["maya", "write"], ["lee", "admin"], ["drive-by", "read"]]),
     revoked: [],
     holds: [],
+    outages: [],
     nextId: 1000,
     now: () => clock.now,
   };
