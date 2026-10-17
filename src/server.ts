@@ -10,6 +10,7 @@ import { RunnerError, createRunner, type RunId } from "./runner.ts";
 import { openDatabase } from "./store.ts";
 import { createPlacement } from "./placement.ts";
 import { createPlacementCommands } from "./placement-commands.ts";
+import { registerDispatchGuard } from "./dispatch-guard.ts";
 import {
   PluginCliError,
   cliCommand,
@@ -96,11 +97,19 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_schema: modelsSchema,
       default: "",
     },
+    placementGuard: {
+      type: "boolean",
+      label: "Placement guard",
+      description:
+        "Refuse an agent's plain `bb thread spawn` into a fresh worktree when its machine is full and another machine has room, and point the agent at `bb pstack spawn`.",
+      default: true,
+    },
   });
 
-  let modelsText = (await settings.get()).models;
+  let { models: modelsText, placementGuard } = await settings.get();
   settings.onChange((next) => {
     modelsText = next.models;
+    placementGuard = next.placementGuard;
   });
 
   const resolveRole = (role: string): ModelChoice[] => {
@@ -116,6 +125,7 @@ export default async function plugin(bb: BbPluginApi) {
   const runStore = openRunStore(db);
   const isRunWorker = (threadId: string) => runStore.attemptByThread(threadId) !== null;
   const placement = createPlacement(bb);
+  registerDispatchGuard(bb, placement, () => placementGuard);
   const checklistStore = openChecklistStore(db);
   const runner = createRunner(bb, runStore, resolveRole, Date.now, async (tuples, environmentId) => {
     const ids = [...new Set(tuples.map((tuple) => tuple.split("/")[0]!))];

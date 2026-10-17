@@ -25,6 +25,7 @@ test("pstack delegates receive checklist nudges while run workers do not", async
     agents: { registerTool() {}, configure() {}, contributeInstructions() {} },
     events: { on: (event: string, handler: IdleHandler) => { if (event === "thread.idle") idle.push(handler); } },
     background: { service() {} },
+    experimental_hooks: { on() {} },
     log: { error() {}, warn() {} },
   } as unknown as BbPluginApi;
   await plugin(bb);
