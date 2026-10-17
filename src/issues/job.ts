@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -41,10 +41,11 @@ export const TRANSIT = {
   respawning: "addressing",
   republishing: "review",
   replying: "review",
+  updating: "tracking",
 } as const;
 
 export type TransitState = keyof typeof TRANSIT;
-export const RESTING_STATES = ["ignored", "queued", "working", "needs-info", "review", "addressing", "done", "stopped", "stuck"] as const;
+export const RESTING_STATES = ["ignored", "queued", "working", "needs-info", "review", "addressing", "tracking", "done", "stopped", "stuck"] as const;
 export type RestingState = (typeof RESTING_STATES)[number];
 export type JobState = TransitState | RestingState;
 
@@ -105,7 +106,10 @@ export type Effect =
   | { op: "request-review"; key: string; reviewers: readonly string[] }
   | { op: "edit-pr"; key: string; body: string }
   /** A replacement worker's worktree must contain `base`, the branch's head on GitHub; when it does not, it is told to merge. */
-  | { op: "check-worktree"; key: string; base: Sha };
+  | { op: "check-worktree"; key: string; base: Sha }
+  /** A parent's one progress comment: edited when the App's comment with the key's marker exists, else created. */
+  | { op: "status"; key: string; body: string }
+  | { op: "close-issue"; key: string };
 
 export type EffectOp = Effect["op"];
 
@@ -135,6 +139,8 @@ export const EFFECT_POLICY = {
   "edit-pr": { recovery: { kind: "replay" }, leaseMs: 60_000 },
   // A repeated note to merge the branch is harmless.
   "check-worktree": { recovery: { kind: "replay" }, leaseMs: 60_000 },
+  status: { recovery: { kind: "replay" }, leaseMs: 60_000 },
+  "close-issue": { recovery: { kind: "replay" }, leaseMs: 60_000 },
 } as const satisfies { readonly [Op in EffectOp]: { recovery: Recovery; leaseMs: number } };
 
 export const MAX_EFFECT_TRIES = 8;
@@ -154,7 +160,13 @@ export type EffectOutcome =
 
 export type EffectPatch = { threadId?: string; pushedSha?: Sha; pr?: { number: number; url: string } };
 
-export type IssueSnapshot = { title: string; body: string; url: string; author: string };
+/** `parent` is set on a sub-issue's job: the parent issue as it was when the job was created. */
+export type IssueSnapshot = { title: string; body: string; url: string; author: string; parent?: { number: number; title: string; body: string; url: string } };
+
+/** A parent issue's sub-issue as last polled. `blockedBy` lists its open blockers as `#n` or `owner/repo#n`. */
+export type SubIssue = { number: number; title: string; url: string; state: "open" | "closed"; blockedBy: string[] };
+/** A sub-issue with its latest job: its open job, else the parent's child job. */
+export type ChildFact = SubIssue & { job: { state: JobState; merged: boolean } | null };
 
 export type FeedbackKind = "review" | "review-comment" | "pr-comment";
 /** What a reply answers. GitHub numbers reviews, inline comments and conversation comments separately. */
@@ -238,8 +250,12 @@ export type Job = {
   repo: RepoName;
   issue: number;
   generation: number;
-  trigger: { eventId: number; actor: string; at: number };
+  /** `eventId` is null for a sub-issue's job, which its parent's label event started. */
+  trigger: { eventId: number | null; actor: string; at: number };
   snapshot: IssueSnapshot;
+  parentId: JobId | null;
+  /** For a parent: the status comment body last planned, so a pass can tell when the progress changed. */
+  progress: string | null;
   projectId: string;
   hostId: string;
   baseBranch: string;
@@ -289,6 +305,7 @@ export type Change = {
   finishRound?: true;
   roundBase?: Sha;
   worker?: WorkerSettings;
+  progress?: string;
 };
 
 export type ThreadFact =
@@ -334,13 +351,17 @@ export type Facts = {
   remote: { head: Sha | null } | null;
   /** The pull request's state as last polled; null until the job's first successful poll. */
   pr: { state: PullState } | null;
+  /** For a parent: its sub-issues as last polled, null until the first poll. */
+  children: readonly ChildFact[] | null;
+  /** For a sub-issue's queued job: its open blockers as its parent last polled them. */
+  blockers: readonly string[] | null;
 };
 
 export type FactName = Exclude<keyof Facts, "now">;
 
 export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   ignored: [],
-  queued: ["slotFree", "worker"],
+  queued: ["blockers", "slotFree", "worker"],
   starting: [],
   working: ["thread", "waiting", "gate"],
   publishing: [],
@@ -358,6 +379,8 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   respawning: ["pr"],
   republishing: [],
   replying: [],
+  tracking: ["children"],
+  updating: [],
 };
 
 /**
@@ -433,6 +456,12 @@ function next(job: Job, facts: Facts): Action | null {
 
   switch (phase.state) {
     case "queued": {
+      if (facts.blockers?.length) {
+        const error = `waiting for ${facts.blockers.join(", ")}`;
+        return job.error === error ? null : { type: "change", change: { error } };
+      }
+      // An unblocked child must count in slots().ahead again while it waits for a slot.
+      if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
       if (!facts.slotFree || !facts.worker) return null;
       if ("error" in facts.worker) {
         if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
@@ -477,9 +506,29 @@ function next(job: Job, facts: Facts): Action | null {
           return job.deadline === null ? null : { type: "sleep", until: job.deadline };
       }
     }
+    case "tracking":
+      return facts.children ? track(job, facts.children) : null;
     default:
       return null;
   }
+}
+
+/** A parent's next step, from its sub-issues and their jobs. */
+function track(job: Job, children: readonly ChildFact[]): Action | null {
+  const body = progressBody(children);
+  const status: Effect = { op: "status", key: `status:${job.id}`, body };
+  const open = children.filter((child) => child.state === "open");
+  if (open.length === 0) {
+    return { type: "change", change: { phase: enter("closing", [status, { op: "close-issue", key: `close-issue:${job.id}` }]), progress: body, error: null } };
+  }
+  const progressing = open.some((child) => !child.job || !TERMINAL.has(child.job.state));
+  const unfinished = open.filter((child) => child.job && TERMINAL.has(child.job.state) && !child.job.merged);
+  if (!progressing && unfinished.length > 0) {
+    const reason = `${unfinished.map((child) => `#${child.number}`).join(", ")} need a person: their jobs ended without a merged pull request`;
+    return { type: "change", change: { phase: enter("sticking", [status, ...endingEffects(job, "stick")]), progress: body, deadline: null, error: reason } };
+  }
+  if (body === job.progress) return null;
+  return { type: "change", change: { phase: enter("updating", [status]), progress: body } };
 }
 
 /** The Change for an effect's outcome, against the row as it was right after the claim. */
@@ -821,6 +870,7 @@ export function branchFor(issue: number, title: string, generation: number): Bra
 
 export type JobView = {
   id: JobId;
+  parentId: JobId | null;
   repo: RepoName;
   issue: number;
   issueUrl: string;
@@ -844,6 +894,7 @@ export function toView(job: Job): JobView {
   const { phase } = job;
   return {
     id: job.id,
+    parentId: job.parentId,
     repo: job.repo,
     issue: job.issue,
     issueUrl: job.snapshot.url,

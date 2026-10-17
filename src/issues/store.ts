@@ -26,6 +26,7 @@ import {
   type PullState,
   type RepoName,
   type RoundSummary,
+  type SubIssue,
   type Sha,
   type BranchName,
   type WorkerSettings,
@@ -35,13 +36,16 @@ export type NewJob = {
   id: JobId;
   repo: RepoName;
   issue: number;
-  trigger: { eventId: number; actor: string; at: number };
+  trigger: { eventId: number | null; actor: string; at: number };
   snapshot: IssueSnapshot;
+  /** Set for a sub-issue's job, whose trigger has no event. */
+  parentId?: JobId;
   projectId: string;
   hostId: string;
   baseBranch: string;
   /** `ignored` carries its reason in `error`. */
-  state: "queued" | "ignored";
+  /** `tracking` for an issue with sub-issues. */
+  state: "queued" | "ignored" | "tracking";
   error: string | null;
 };
 
@@ -92,6 +96,11 @@ export type IssueStore = {
   recordPoll(id: JobId, poll: { cursor: unknown; prState: PullState | null; feedback: readonly Feedback[] }, now: number): void;
   /** A failed poll keeps the last cursor and state, so the next poll starts where the last good one ended. */
   recordPollError(id: JobId, error: string, now: number): void;
+  /** Every job a parent created, open or ended. */
+  children(parentId: JobId): Job[];
+  /** A parent's last poll of its sub-issues, null before the first. */
+  polledChildren(parentId: JobId): SubIssue[] | null;
+  saveChildren(parentId: JobId, children: readonly SubIssue[], now: number): void;
 };
 
 type JobRow = {
@@ -100,7 +109,7 @@ type JobRow = {
   repo: string;
   issue: number;
   generation: number;
-  trigger_event_id: number;
+  trigger_event_id: number | null;
   triggered_by: string;
   triggered_at: number;
   issue_json: string;
@@ -128,6 +137,8 @@ type JobRow = {
   round: number;
   worker_json: string | null;
   round_base: string | null;
+  parent_id: string | null;
+  progress: string | null;
 };
 
 type FeedbackRow = {
@@ -185,6 +196,8 @@ function parse(row: JobRow): Job {
     generation: row.generation,
     trigger: { eventId: row.trigger_event_id, actor: row.triggered_by, at: row.triggered_at },
     snapshot: JSON.parse(row.issue_json) as IssueSnapshot,
+    parentId: row.parent_id as JobId | null,
+    progress: row.progress,
     projectId: row.project_id,
     hostId: row.host_id,
     baseBranch: row.base_branch,
@@ -232,6 +245,7 @@ function columns(change: Change): Record<string, unknown> {
   if (change.startRound !== undefined) set.round = change.startRound.ordinal;
   if (change.worker !== undefined) set.worker_json = JSON.stringify(change.worker);
   if (change.roundBase !== undefined) set.round_base = change.roundBase;
+  if (change.progress !== undefined) set.progress = change.progress;
   return set;
 }
 
@@ -252,15 +266,16 @@ export function openIssueStore(db: Db): IssueStore {
 
   const insert = db.transaction((job: NewJob, now: number): Job | null => {
     if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
-    if (job.state === "queued" && openRow(job.repo, job.issue)) return null;
+    if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
+    if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
     const { earlier } = db
       .prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'")
       .get(job.repo, job.issue) as { earlier: number };
     const generation = earlier + 1;
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, base_branch, branch, state, error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         project_id, host_id, base_branch, branch, state, error, created_at, updated_at, parent_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       job.id,
       job.repo,
@@ -278,6 +293,7 @@ export function openIssueStore(db: Db): IssueStore {
       job.error,
       now,
       now,
+      job.parentId ?? null,
     );
     return get(job.id);
   });
@@ -427,6 +443,19 @@ export function openIssueStore(db: Db): IssueStore {
          ON CONFLICT (job_id) DO UPDATE SET cursor_json = excluded.cursor_json, pr_state = coalesce(excluded.pr_state, pr_state), polled_at = excluded.polled_at, error = NULL`,
       ).run(id, JSON.stringify(poll.cursor), poll.prState, now);
     }),
+    children(parentId) {
+      return (db.prepare("SELECT * FROM issue_jobs WHERE parent_id = ? ORDER BY created_at, id").all(parentId) as JobRow[]).map(parse);
+    },
+    polledChildren(parentId) {
+      const row = db.prepare("SELECT children_json FROM issue_job_polls WHERE job_id = ?").get(parentId) as { children_json: string | null } | undefined;
+      return row?.children_json ? (JSON.parse(row.children_json) as SubIssue[]) : null;
+    },
+    saveChildren(parentId, children, now) {
+      db.prepare(
+        `INSERT INTO issue_job_polls (job_id, children_json, polled_at) VALUES (?, ?, ?)
+         ON CONFLICT (job_id) DO UPDATE SET children_json = excluded.children_json`,
+      ).run(parentId, JSON.stringify(children), now);
+    },
     recordPollError(id, error, now) {
       db.prepare(
         `INSERT INTO issue_job_polls (job_id, polled_at, error) VALUES (?, ?, ?)
