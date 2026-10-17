@@ -55,6 +55,8 @@
     "tailwind-merge": "^3.4.0",
     "class-variance-authority": "^0.7.1",
     "better-sqlite3": "^12.0.0",
-    "@types/better-sqlite3": "^7.6.12"
+    "@types/better-sqlite3": "^7.6.12",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9"
   }
 }
