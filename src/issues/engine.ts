@@ -51,7 +51,7 @@ import {
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
-import { effectMarker, workerInstructions } from "./text.ts";
+import { commentBody, effectMarker, workerInstructions } from "./text.ts";
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
@@ -244,7 +244,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     },
     comment: {
       async perform(job, effect, deadline) {
-        await github.repo(job.repo, until(deadline)).comment(job.issue, `${effect.body}\n\n${effectMarker(effect.key)}`);
+        await github.repo(job.repo, until(deadline)).comment(job.issue, commentBody(effect.body, effect.key));
         return done();
       },
       async probe(job, effect, deadline) {
@@ -269,7 +269,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       async perform(job, effect, deadline) {
         if (!job.pr) return { kind: "fail", error: "the pull request to reply on is not recorded" };
         const repo = github.repo(job.repo, until(deadline));
-        const body = `${effect.body}\n\n${effectMarker(effect.key)}`;
+        const body = commentBody(effect.body, effect.key);
         if (effect.target.kind !== "review-comment") {
           await repo.comment(job.pr.number, body);
           return done();

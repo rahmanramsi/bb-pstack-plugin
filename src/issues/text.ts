@@ -94,6 +94,14 @@ export function effectMarker(key: string): string {
   return `<!-- pstack:${key} -->`;
 }
 
+/** GitHub refuses a comment body longer than this. */
+export const COMMENT_MAX = 65_536;
+
+/** A comment's body as an effect posts it, with the effect's marker on its last line. */
+export function commentBody(body: string, key: string): string {
+  return `${body}\n\n${effectMarker(key)}`;
+}
+
 export function workerTitle(job: Job): string {
   return `${job.repo}#${job.issue}: ${job.snapshot.title}`.slice(0, 120);
 }

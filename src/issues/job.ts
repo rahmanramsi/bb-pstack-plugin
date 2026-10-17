@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { bodyProblems, issueText, nudgeText, prBody, processPhrase, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -652,7 +652,14 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
   if (extra.length > 0) reasons.push(`these comments were not listed, remove their replies: ${extra.join(", ")}`);
   if (repeated.length > 0) reasons.push(`reply to each comment once; repeated: ${[...new Set(repeated)].join(", ")}`);
   if (report.outcome === "changes" && report.pr) reasons.push(...bodyProblems(report.pr.body));
-  for (const reply of report.replies) reasons.push(...phraseProblems([reply.body], `the reply to ${refKey({ kind: reply.kind, id: reply.commentId })}`));
+  for (const reply of report.replies) {
+    const where = `the reply to ${refKey({ kind: reply.kind, id: reply.commentId })}`;
+    reasons.push(...phraseProblems([reply.body], where));
+    const item = facts.listed.find((candidate) => refKey(candidate) === refKey({ kind: reply.kind, id: reply.commentId }));
+    const effect = item && replyEffect(job, reply, item);
+    const length = effect ? commentBody(effect.body, effect.key).length : 0;
+    if (length > COMMENT_MAX) reasons.push(`${where} is ${length} characters as posted; GitHub's limit is ${COMMENT_MAX}`);
+  }
   const accepted = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
   return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted }));
 }
@@ -662,11 +669,7 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
  * when the report replaced it, ask the reviewers to look again, and show the issue as in review.
  */
 function republication(job: Job, report: RoundReport & AcceptedReport, listed: readonly Feedback[]): [TransitState, Effect[]] {
-  const replies: Effect[] = report.replies.map((reply) => {
-    const target = { kind: reply.kind, id: reply.commentId };
-    const item = listed.find((candidate) => refKey(candidate) === refKey(target))!;
-    return { op: "reply", key: `reply:${job.id}:${job.round}:${reply.kind}:${reply.commentId}`, target, body: replyText(reply.body, item) };
-  });
+  const replies: Effect[] = report.replies.map((reply) => replyEffect(job, reply, listed.find((item) => refKey(item) === refKey({ kind: reply.kind, id: reply.commentId }))!));
   const reviewers = [...new Set(listed.map((item) => item.author))];
   const after: Effect[] = [
     ...replies,
@@ -676,6 +679,10 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
   ];
   if (report.outcome !== "changes") return ["replying", after];
   return ["republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: job.pushedSha }, ...after]];
+}
+
+function replyEffect(job: Job, reply: RoundReport["replies"][number], answers: Feedback): Extract<Effect, { op: "reply" }> {
+  return { op: "reply", key: `reply:${job.id}:${job.round}:${reply.kind}:${reply.commentId}`, target: { kind: reply.kind, id: reply.commentId }, body: replyText(reply.body, answers) };
 }
 
 function publication(job: Job, report: InitialReport & AcceptedReport): [TransitState, Effect[]] {

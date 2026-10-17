@@ -555,3 +555,11 @@ test("text posted on GitHub carries no pstack marker the service did not append 
   assert.equal(replyText(`Renamed. ${marker}`, quoted), "> Please rename \n\nRenamed.");
   assert.doesNotMatch(issueText(nested), /pstack:/);
 });
+
+test("a reply too long for GitHub once quoted and marked is a rejection the worker can fix, not a failure after the push", () => {
+  const addressing = inReview({ phase: { state: "addressing" }, round: 2 });
+  const long = later({ outcome: "changes", replies: [REPLIES[0], { ...REPLIES[1], body: "x".repeat(65_500) }], verification: ["npm test"], summary: "s" });
+  assert.match(reasonsOf(acceptReport(addressing, long, ROUND_FACTS())).join("\n"), /the reply to review-comment 1 is 655\d\d characters as posted; GitHub's limit is 65536/);
+  const fits = later({ outcome: "changes", replies: [REPLIES[0], { ...REPLIES[1], body: "x".repeat(65_000) }], verification: ["npm test"], summary: "s" });
+  assert.ok(acceptReport(addressing, fits, ROUND_FACTS()).ok);
+});
