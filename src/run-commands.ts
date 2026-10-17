@@ -63,7 +63,7 @@ function formatStatus(view: RunView, results: ReturnType<Runner["results"]>): st
   const width = Math.max(...view.jobs.map((job) => job.label.length));
   const rows = view.jobs.map((job) => {
     const detail = job.state === "succeeded" ? job.summary : job.error;
-    return `  ${job.label.padEnd(width)}  ${job.state.padEnd(9)}  ${job.model}${job.threadId ? `  ${job.threadId}` : ""}${detail ? `  ${detail}` : ""}`;
+    return `  ${job.label.padEnd(width)}  ${job.state.padEnd(9)}  ${job.model}${job.host ? `  on ${job.host.name}` : ""}${job.threadId ? `  ${job.threadId}` : ""}${detail ? `  ${detail}` : ""}`;
   });
   const values = results
     .filter((result) => result.state === "succeeded")

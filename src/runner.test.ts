@@ -7,6 +7,8 @@ import {
   classifyFailure,
   compile,
   deriveStatus,
+  localPath,
+  pinOf,
   plan,
   toView,
   type Action,
@@ -21,6 +23,8 @@ const ORIGIN: Origin = {
   threadId: "thr_origin",
   projectId: "prj_1",
   environmentId: "env_1",
+  hostId: "host_home",
+  pin: null,
   providerId: "claude-code",
   model: "claude-opus-5-5",
   reasoningLevel: "high",
@@ -65,8 +69,8 @@ function run(jobs: JobDraft[], states: Record<string, Partial<JobSnapshot>> = {}
   };
 }
 
-const attached = (threadId: string) => ({ ordinal: 1, state: "attached" as const, threadId, issuedAt: NOW - 10, finishedAt: null });
-const finished = (ordinal: number) => ({ ordinal, state: "finished" as const, threadId: `thr_${ordinal}`, issuedAt: NOW - 10, finishedAt: NOW - 5 });
+const attached = (threadId: string) => ({ ordinal: 1, state: "attached" as const, threadId, issuedAt: NOW - 10, finishedAt: null, host: null });
+const finished = (ordinal: number) => ({ ordinal, state: "finished" as const, threadId: `thr_${ordinal}`, issuedAt: NOW - 10, finishedAt: NOW - 5, host: null });
 const review = (...titles: string[]) => ({
   findings: titles.map((title) => ({ severity: "warning" as const, title, location: "src/a.ts:1", detail: "detail" })),
 });
@@ -148,6 +152,52 @@ test("compile gives every slice a verifier that waits on that slice only and kee
     ],
   );
   assert.match(jobs[0]!.prompt, /check\.sh[\s\S]*Your slice: packages\/api/);
+});
+
+test("compile gives every job the reads its plan declares, defaulting to origin", () => {
+  const panel = compiled({ ...PANEL, seats: [{ ...PANEL.seats[0], reads: "commit" }], judge: { ...PANEL.judge, reads: "prompt" } });
+  assert.deepEqual(panel.map((job) => job.reads), ["commit", "commit", "prompt"]);
+  assert.deepEqual(compiled(PANEL).map((job) => job.reads), ["origin", "origin", "origin"]);
+  const swarm = compiled({ ...SWARM, reads: "commit", slices: ["a", { name: "b", reads: "origin" }], verify: { prompt: "Re-run.", reads: "prompt" } });
+  assert.deepEqual(swarm.map((job) => [job.key, job.reads]), [["slice-1", "commit"], ["verify-1", "prompt"], ["slice-2", "origin"], ["verify-2", "prompt"]]);
+});
+
+test("compile rejects a job that may leave this machine when its prompt names a local path", () => {
+  const error = (input: unknown) => {
+    const result = compile(RunPlan.parse(input), resolveRole, ORIGIN);
+    return result.ok ? null : result.error;
+  };
+  const seat = (reads: string) => ({ ...PANEL, judge: undefined, seats: [{ label: "R", model: { tuple: "codex/gpt-6.1-sol/high" }, prompt: "Your brief is at /Users/me/brief.md.", reads }] });
+  assert.match(error(seat("commit"))!, /R reads "commit", but its prompt names \/Users\/me\/brief\.md/);
+  assert.match(error(seat("prompt"))!, /\/Users\/me\/brief\.md/);
+  assert.equal(error(seat("origin")), null);
+  assert.match(error({ ...SWARM, reads: "commit", brief: "Read $BB_THREAD_STORAGE/brief.md." })!, /\$BB_THREAD_STORAGE\/brief\.md/);
+});
+
+test("localPath finds home, temp, and thread-storage paths but not repo paths or URLs", () => {
+  for (const [text, path] of [
+    ["see /Users/me/x.md", "/Users/me/x.md"],
+    ["`/tmp/arena-1/candidate-2/`", "/tmp/arena-1/candidate-2/"],
+    ["(/home/bb/notes.txt)", "/home/bb/notes.txt"],
+    ["read ~/notes.md", "~/notes.md"],
+    ["at ${BB_THREAD_STORAGE}/brief.md", "${BB_THREAD_STORAGE}/brief.md"],
+  ] as const) assert.equal(localPath(text), path);
+  for (const text of ["src/runner.ts:120", "https://example.com/home/x", "the /api/v1 route", "a and/or b"]) assert.equal(localPath(text), null);
+});
+
+test("pinOf pins only a clean branch whose HEAD is already on origin", () => {
+  const status = (checkout: unknown, state = "clean", baseRef: string | null = "abc") => ({
+    outcome: "available",
+    workspace: { checkout, workingTree: { state }, mergeBase: { mergeBaseBranch: "origin/feature", baseRef } },
+  }) as unknown as Parameters<typeof pinOf>[0];
+  const branch = { kind: "branch", branchName: "feature", headSha: "abc" };
+  assert.deepEqual(pinOf(status(branch)), { branch: "feature", sha: "abc" });
+  assert.equal(pinOf(status(branch, "dirty_uncommitted")), null);
+  assert.equal(pinOf(status(branch, "untracked")), null);
+  assert.equal(pinOf(status(branch, "clean", null)), null, "origin/feature does not exist");
+  assert.equal(pinOf(status(branch, "clean", "older")), null, "HEAD is ahead of origin/feature");
+  assert.equal(pinOf(status({ kind: "detached", headSha: "abc" })), null);
+  assert.equal(pinOf(status({ ...branch, branchName: "other" })), null, "the merge base is for another branch");
 });
 
 type PlanCase = { name: string; snapshot: RunSnapshot; now?: number; expect: string[]; check?: (actions: Action[]) => void };
@@ -279,17 +329,17 @@ const PLAN_CASES: PlanCase[] = [
   },
   {
     name: "past the deadline every open job fails and nothing spawns",
-    snapshot: run(compiled(SWARM), { "slice-1": { state: "running", attempts: [attached("thr_1")] }, "slice-2": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null }] } }, NOW),
+    snapshot: run(compiled(SWARM), { "slice-1": { state: "running", attempts: [attached("thr_1")] }, "slice-2": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null, host: null }] } }, NOW),
     expect: ["fail:slice-1", "fail:verify-1", "fail:slice-2", "fail:verify-2"],
   },
   {
     name: "restart: an issued attempt with no thread never spawns again",
-    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "running", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null }] } }),
+    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "running", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null, host: null }] } }),
     expect: [],
   },
   {
     name: "restart: an uncertain job never spawns again before the deadline",
-    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null }] } }),
+    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null, host: null }] } }),
     expect: [],
   },
   {
@@ -348,7 +398,7 @@ test("deriveStatus marks a swarm partial when a verifier rejects a report or a s
 });
 
 test("classifyFailure", () => {
-  for (const error of ["Provider overloaded", "HTTP 503 from upstream", "rate limit exceeded", "read ECONNRESET", "socket hang up", "api error 529"]) {
+  for (const error of ["Provider overloaded", "HTTP 503 from upstream", "rate limit exceeded", "read ECONNRESET", "socket hang up", "api error 529", "workspace mismatch: the worker's HEAD on box is abc", "workspace unverified: could not read the worker's HEAD"]) {
     assert.equal(classifyFailure(error), "transient", error);
   }
   for (const error of ["model not found", "permission denied", "the run deadline passed", "status 400"]) {

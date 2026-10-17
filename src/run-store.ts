@@ -1,5 +1,5 @@
 import type { Db } from "./store.ts";
-import { LIVE, TERMINAL, type AttemptSnapshot, type JobDraft, type JobSnapshot, type JobState, type Origin, type RunId, type RunSnapshot } from "./runner.ts";
+import { LIVE, TERMINAL, type AttemptSnapshot, type Host, type JobDraft, type JobSnapshot, type JobState, type Origin, type RunId, type RunSnapshot } from "./runner.ts";
 
 type FinalStatus = Exclude<RunSnapshot["status"], "running">;
 type NotifyState = "pending" | "sent" | "abandoned";
@@ -32,7 +32,8 @@ export type RunStore = {
   runsForThread(originThreadId: string, active: boolean): RunId[];
   dueRuns(now: number): RunId[];
   transitionJobAndAttempt(runId: RunId, key: string, from: JobState, to: JobState, patch?: JobPatch): boolean;
-  claimAttempt(runId: RunId, key: string, ordinal: number, now: number): boolean;
+  /** Marks the attempt issued on the machine chosen for it. An issued attempt keeps that machine for good. */
+  claimAttempt(runId: RunId, key: string, ordinal: number, now: number, host: Host): boolean;
   attachAttempt(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
   /** Records a thread that turned up after its attempt finished without one, with cleanup pending. */
   recordLateThread(runId: RunId, key: string, ordinal: number, threadId: string): boolean;
@@ -75,7 +76,16 @@ type JobRow = {
   error: string | null;
 };
 
-type AttemptRow = { job_key: string; ordinal: number; state: AttemptSnapshot["state"]; thread_id: string | null; issued_at: number; finished_at: number | null };
+type AttemptRow = {
+  job_key: string;
+  ordinal: number;
+  state: AttemptSnapshot["state"];
+  thread_id: string | null;
+  issued_at: number;
+  finished_at: number | null;
+  host_id: string | null;
+  host_name: string | null;
+};
 
 const PATCH_COLUMNS: Record<keyof JobPatch, string> = {
   releasedPrompt: "released_prompt",
@@ -144,10 +154,11 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
       const run = readRun(runId);
       if (!run) return null;
       const attempts = db
-        .prepare("SELECT job_key, ordinal, state, thread_id, issued_at, finished_at FROM attempts WHERE run_id = ? ORDER BY ordinal")
+        .prepare("SELECT job_key, ordinal, state, thread_id, issued_at, finished_at, host_id, host_name FROM attempts WHERE run_id = ? ORDER BY ordinal")
         .all(runId) as AttemptRow[];
       const jobs = (db.prepare("SELECT * FROM jobs WHERE run_id = ? ORDER BY ord").all(runId) as JobRow[]).map((row): JobSnapshot => {
-        const draft = JSON.parse(row.draft_json) as JobDraft;
+        // Drafts stored before `reads` existed read the origin worktree.
+        const draft = { reads: "origin", ...JSON.parse(row.draft_json) } as JobDraft;
         return {
           ...draft,
           prompt: row.released_prompt ?? draft.prompt,
@@ -160,6 +171,7 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
               threadId: attempt.thread_id,
               issuedAt: attempt.issued_at,
               finishedAt: attempt.finished_at,
+              host: attempt.host_id === null ? null : { id: attempt.host_id, name: attempt.host_name ?? attempt.host_id },
             })),
           providerRetries: row.provider_retries,
           repairs: row.repairs,
@@ -176,7 +188,8 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
       if (!run) return null;
       return {
         id: runId,
-        origin: JSON.parse(run.origin_json) as Origin,
+        // Runs stored before the origin's machine and pin were recorded have neither.
+        origin: { hostId: null, pin: null, ...JSON.parse(run.origin_json) } as Origin,
         kind: run.kind,
         title: run.title,
         status: run.status,
@@ -207,13 +220,13 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
 
     transitionJobAndAttempt: (runId, key, from, to, patch = {}) => bump(transitionJobAndAttempt(runId, key, from, to, patch)),
 
-    claimAttempt(runId, key, ordinal, now) {
+    claimAttempt(runId, key, ordinal, now, host) {
       const changes = db
         .prepare(
-          `INSERT OR IGNORE INTO attempts (run_id, job_key, ordinal, state, issued_at)
-           SELECT ?, ?, ?, 'issued', ? WHERE EXISTS (SELECT 1 FROM jobs WHERE run_id = ? AND key = ? AND state = 'running')`,
+          `INSERT OR IGNORE INTO attempts (run_id, job_key, ordinal, state, issued_at, host_id, host_name)
+           SELECT ?, ?, ?, 'issued', ?, ?, ? WHERE EXISTS (SELECT 1 FROM jobs WHERE run_id = ? AND key = ? AND state = 'running')`,
         )
-        .run(runId, key, ordinal, now, runId, key).changes;
+        .run(runId, key, ordinal, now, host.id, host.name, runId, key).changes;
       return bump(changes === 1);
     },
 

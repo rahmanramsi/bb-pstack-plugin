@@ -12,6 +12,8 @@ Investigators and the synthesizer run together as one pstack run ([`../poteto-mo
 
 Run workers are ordinary threads on their provider, so they keep its MCP access, which the MCP-backed investigators and the synthesizer's citation spot-checks need. Investigators still shouldn't write anything. Say so in each prompt.
 
+The source control investigator sets `"reads": "commit"`, because git history travels with the commit. MCP-backed investigators and the synthesizer keep the default `"reads": "origin"`, because MCP servers and their sign-ins are set up per machine. Keep a `commit` prompt free of local paths.
+
 ## Operating Posture
 
 Operate as a **careful, cautious, and precise investigator**. Be honest about what you know vs what you're inferring. Read `references/epistemics.md` for the full confidence framework and phrasing guide. The synthesizer must follow it.

@@ -16,8 +16,8 @@ const VIEW: RunView = {
   createdAt: 1,
   finishedAt: null,
   jobs: [
-    { key: "slice-1", kind: "slice", label: "packages/api", model: "codex/gpt-6.1-sol/high", state: "succeeded", attempt: 1, threadId: "thr_w1", startedAt: 1, finishedAt: 2, error: null, summary: "PASS", slice: "packages/api" },
-    { key: "verify-1", kind: "verifier", label: "Verify packages/api", model: "codex/gpt-6.1-sol/high", state: "running", attempt: 1, threadId: "thr_w2", startedAt: 2, finishedAt: null, error: null, summary: null, slice: "packages/api" },
+    { key: "slice-1", kind: "slice", label: "packages/api", model: "codex/gpt-6.1-sol/high", state: "succeeded", attempt: 1, threadId: "thr_w1", host: { id: "host_box", name: "box" }, startedAt: 1, finishedAt: 2, error: null, summary: "PASS", slice: "packages/api" },
+    { key: "verify-1", kind: "verifier", label: "Verify packages/api", model: "codex/gpt-6.1-sol/high", state: "running", attempt: 1, threadId: "thr_w2", host: null, startedAt: 2, finishedAt: null, error: null, summary: null, slice: "packages/api" },
   ],
   findings: [],
   matrix: null,
@@ -106,7 +106,7 @@ test("run start --plan-json prints the run id, a summary, the directive on its o
     "",
   ]);
   assert.equal(h.started[0]!.threadId, "thr_origin");
-  assert.deepEqual(h.started[0]!.plan, { ...PLAN, model: { role: "swarm workers" } });
+  assert.deepEqual(h.started[0]!.plan, { ...PLAN, reads: "origin", model: { role: "swarm workers" } });
 
   const json = await h.run(["run", "start", "--plan-json", JSON.stringify(PLAN), "--json"]);
   const parsed = JSON.parse(json.stdout!);
@@ -150,7 +150,7 @@ test("run start rejects a malformed plan, a plan the runner refuses, and a missi
 test("run status prints jobs and results, or JSON with both", async () => {
   const h = harness();
   const text = await h.run(["run", "status", RUN]);
-  assert.match(text.stdout!, /^psr_\S+ swarm "check\.sh": running\n  packages\/api\s+succeeded\s+codex\/gpt-6\.1-sol\/high\s+thr_w1\s+PASS/);
+  assert.match(text.stdout!, /^psr_\S+ swarm "check\.sh": running\n  packages\/api\s+succeeded\s+codex\/gpt-6\.1-sol\/high\s+on box\s+thr_w1\s+PASS/);
   assert.match(text.stdout!, /## packages\/api\n\n\{\n {2}"status": "PASS"\n\}/);
   const json = await h.run(["run", "status", RUN, "--json"]);
   const parsed = JSON.parse(json.stdout!);

@@ -17,6 +17,14 @@ export const ModelRef = z.union([
 export const ResultKind = z.enum(["text", "review", "grouping", "report", "verdict"]);
 export type ResultKind = z.infer<typeof ResultKind>;
 
+/**
+ * What a job reads, which decides where it may run. `origin`: this thread's live worktree, so it runs here.
+ * `commit`: only files committed and pushed at run start, so it may run on another machine's worktree.
+ * `prompt`: only its prompt, so it may run on any machine with a checkout of the project.
+ */
+export const Reads = z.enum(["origin", "commit", "prompt"]);
+export type Reads = z.infer<typeof Reads>;
+
 export const Severity = z.enum(["critical", "warning", "nit"]);
 
 export const Finding = z
@@ -80,6 +88,7 @@ export const RunPlan = z.discriminatedUnion("kind", [
               model: ModelRef,
               prompt: z.string().min(1),
               result: ResultKind.default("text"),
+              reads: Reads.default("origin"),
             })
             .strict(),
         )
@@ -97,6 +106,7 @@ export const RunPlan = z.discriminatedUnion("kind", [
           model: ModelRef,
           prompt: z.string().min(1),
           result: ResultKind.default("text"),
+          reads: Reads.default("origin"),
         })
         .strict()
         .optional(),
@@ -108,17 +118,18 @@ export const RunPlan = z.discriminatedUnion("kind", [
       title: z.string().min(1).max(120),
       requestKey: z.string().min(1).max(200).optional(),
       brief: z.string().min(1),
+      reads: Reads.default("origin"),
       model: ModelRef.default({ role: "swarm workers" }),
       slices: z
         .array(
           z.union([
             z.string().min(1).max(120),
-            z.object({ name: z.string().min(1).max(120), brief: z.string().optional(), model: ModelRef.optional() }).strict(),
+            z.object({ name: z.string().min(1).max(120), brief: z.string().optional(), model: ModelRef.optional(), reads: Reads.optional() }).strict(),
           ]),
         )
         .min(1)
         .max(64),
-      verify: z.object({ prompt: z.string().min(1), model: ModelRef.optional() }).strict().optional(),
+      verify: z.object({ prompt: z.string().min(1), model: ModelRef.optional(), reads: Reads.default("origin") }).strict().optional(),
     })
     .strict(),
 ]);
@@ -136,6 +147,8 @@ const JobView = z.object({
   state: JobState,
   attempt: z.number().int(),
   threadId: z.string().nullable(),
+  /** The machine the latest attempt was issued on. */
+  host: z.object({ id: z.string(), name: z.string() }).nullable(),
   startedAt: z.number().nullable(),
   finishedAt: z.number().nullable(),
   error: z.string().nullable(),

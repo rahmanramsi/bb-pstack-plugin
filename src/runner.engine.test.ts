@@ -4,8 +4,9 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import Database from "better-sqlite3";
 import { RunPlan } from "./contract.ts";
 import { parseChoice, type ModelChoice } from "./models.ts";
+import { createPlacement } from "./placement.ts";
 import { openRunStore } from "./run-store.ts";
-import { createRunner, compile, type RunId } from "./runner.ts";
+import { createRunner, compile, WORKSPACE_MISMATCH, type RunId } from "./runner.ts";
 import { MIGRATIONS } from "./store.ts";
 
 type FakeThread = {
@@ -16,7 +17,28 @@ type FakeThread = {
   output: string | null;
   metadata: Record<string, unknown>;
   originPluginId: string | null;
+  environmentId: string;
+  hostId: string;
 };
+
+const PIN = { branch: "feature", sha: "c0ffee" };
+const HOSTS = [
+  { id: "host_home", name: "Mac Mini" },
+  { id: "host_box", name: "box" },
+];
+
+function checkout(options: { branch?: string; sha: string | null; state?: string; pushed?: string | null; mergeBase?: string }) {
+  const branch = options.branch ?? PIN.branch;
+  return {
+    outcome: "available",
+    workspace: {
+      branch: { currentBranch: branch, defaultBranch: "main" },
+      checkout: { kind: "branch", branchName: branch, headSha: options.sha },
+      workingTree: { state: options.state ?? "clean", hasUncommittedChanges: options.state !== undefined && options.state !== "clean" },
+      mergeBase: options.mergeBase === undefined ? null : { mergeBaseBranch: options.mergeBase, baseRef: options.pushed === undefined ? options.sha : options.pushed, aheadCount: 0, behindCount: 0 },
+    },
+  };
+}
 
 const ROLES: Record<string, string[]> = {
   "interrogate reviewers": ["claude-code/claude-opus-5-5/high", "codex/gpt-6.1-sol/high"],
@@ -25,9 +47,15 @@ const ROLES: Record<string, string[]> = {
 };
 const resolveRole = (role: string): ModelChoice[] => (ROLES[role] ?? []).map((value) => parseChoice(value)!);
 
-function harness() {
+/** `homeLimit` is the origin machine's concurrency limit; the other machine, `box`, has 8 slots and the pinned branch. */
+function harness(options: { homeLimit?: number; origin?: ReturnType<typeof checkout> } = {}) {
   const threads = new Map<string, FakeThread>();
-  threads.set("thr_origin", { id: "thr_origin", status: "active", archivedAt: null, deletedAt: null, output: null, metadata: {}, originPluginId: null });
+  const thread = (fields: Pick<FakeThread, "id"> & Partial<FakeThread>): FakeThread => ({
+    status: "active", archivedAt: null, deletedAt: null, output: null, metadata: {}, originPluginId: "pstack", environmentId: `env_${fields.id}`, hostId: "host_home", ...fields,
+  });
+  threads.set("thr_origin", thread({ id: "thr_origin", originPluginId: null, environmentId: "env_1" }));
+  const statuses = new Map<string, unknown>([["env_1", options.origin ?? checkout({ sha: PIN.sha, mergeBase: `origin/${PIN.branch}` })]]);
+  const limits = { home: options.homeLimit ?? 20 };
   const spawned: Record<string, any>[] = [];
   const sent: Record<string, any>[] = [];
   const stopped: string[] = [];
@@ -40,7 +68,10 @@ function harness() {
       async get({ threadId }: { threadId: string }) {
         const thread = threads.get(threadId);
         if (!thread) throw missing();
-        return { ...thread, environmentId: "env_1", projectId: "prj_1", providerId: "claude-code" };
+        return { ...thread, projectId: "prj_1", providerId: "claude-code" };
+      },
+      async listRunning() {
+        return [...threads.values()].filter((entry) => entry.status === "active" && !stopped.includes(entry.id)).map(({ id, hostId }) => ({ id, hostId }));
       },
       async defaultExecutionOptions() {
         return { model: "claude-opus-5-5", reasoningLevel: "high", permissionMode: "auto" };
@@ -50,7 +81,9 @@ function harness() {
         const failure = failures.spawn.shift();
         const id = `thr_w${++next}`;
         if (!failure || failure.create) {
-          threads.set(id, { id, status: "active", archivedAt: null, deletedAt: null, output: null, metadata: args.pluginMetadata, originPluginId: "pstack" });
+          const away = args.environment.type === "host";
+          threads.set(id, thread({ id, metadata: args.pluginMetadata, environmentId: away ? `env_${id}` : args.environment.environmentId, hostId: away ? args.environment.hostId : "host_home" }));
+          if (away) statuses.set(`env_${id}`, checkout({ sha: PIN.sha }));
         }
         if (failure) throw failure.error;
         return { id };
@@ -80,9 +113,29 @@ function harness() {
       },
     },
   };
+  const machines = {
+    hosts: { list: async () => HOSTS.map((host) => ({ ...host, status: "connected", lifecycle: { phase: "active" } })) },
+    environments: {
+      async get({ environmentId }: { environmentId: string }) {
+        return { id: environmentId, hostId: [...threads.values()].find((entry) => entry.environmentId === environmentId)?.hostId ?? "host_home" };
+      },
+      async status({ environmentId, mergeBaseBranch }: { environmentId: string; mergeBaseBranch?: string }) {
+        const status = statuses.get(environmentId) as ReturnType<typeof checkout>;
+        if (!status) throw missing();
+        const merge = status.workspace.mergeBase;
+        return mergeBaseBranch === undefined || !merge ? { ...status, workspace: { ...status.workspace, mergeBase: null } } : merge.mergeBaseBranch === mergeBaseBranch ? status : { ...status, workspace: { ...status.workspace, mergeBase: { ...merge, mergeBaseBranch, baseRef: null } } };
+      },
+      listProviders: async () => [{ id: "git-worktree", availability: { status: "available" } }],
+    },
+    projects: { branches: async () => ({ checkout: { kind: "branch", branchName: PIN.branch, headSha: PIN.sha } }) },
+    providers: {
+      list: async () => [{ id: "claude-code", available: true }, { id: "codex", available: true }],
+      models: async () => ({ models: [{ model: "claude-opus-5-5", supportedReasoningEfforts: [] }, { model: "gpt-6.1-sol", supportedReasoningEfforts: [] }] }),
+    },
+  };
   const bb = {
     pluginId: "pstack",
-    sdk,
+    sdk: { ...sdk, ...machines },
     realtime: { publish() {} },
     log: { info() {}, warn() {}, error() {}, debug() {} },
   } as unknown as BbPluginApi;
@@ -91,12 +144,17 @@ function harness() {
   for (const statement of MIGRATIONS) db.exec(statement);
   const clock = { now: 1_000_000 };
   const store = openRunStore(db, () => clock.now);
-  const runner = createRunner(bb, store, resolveRole, () => clock.now);
-  const restart = () => createRunner(bb, openRunStore(db, () => clock.now), resolveRole, () => clock.now);
+  const placement = () => createPlacement(bb, {
+    clock: () => clock.now,
+    exec: async () => JSON.stringify({ globalLimit: null, hosts: [{ id: "host_home", effectiveLimit: limits.home }, { id: "host_box", effectiveLimit: 8 }] }),
+  });
+  const runner = createRunner(bb, store, { resolveRole, placement: placement(), clock: () => clock.now });
+  const restart = () => createRunner(bb, openRunStore(db, () => clock.now), { resolveRole, placement: placement(), clock: () => clock.now });
   const worker = (index: number) => `thr_w${index}`;
   const toWorker = (threadId: string) => sent.filter((message) => message.threadId === threadId);
   const toOrigin = () => sent.filter((message) => message.threadId === "thr_origin");
-  return { bb, db, threads, spawned, sent, stopped, failures, store, runner, restart, clock, worker, toWorker, toOrigin };
+  const hosts = (runId: RunId) => runner.view(runId, "thr_origin").jobs.map((job) => job.host?.name ?? null);
+  return { bb, db, threads, thread, statuses, spawned, sent, stopped, failures, store, runner, restart, clock, worker, toWorker, toOrigin, hosts };
 }
 
 const PANEL_INPUT = {
@@ -157,7 +215,7 @@ test("start with the same request key returns the existing run without spawning 
 test("a pstack delegate without worker metadata leaves every run untouched when it goes idle or fails", async () => {
   const h = harness();
   const { runId } = await h.runner.start(PANEL, "thr_origin");
-  h.threads.set("thr_delegate", { id: "thr_delegate", status: "idle", archivedAt: null, deletedAt: null, output: "done", metadata: {}, originPluginId: "pstack" });
+  h.threads.set("thr_delegate", h.thread({ id: "thr_delegate", status: "idle", output: "done" }));
   const before = JSON.stringify(h.runner.view(runId, "thr_origin"));
   await h.runner.onIdle("thr_delegate", "done");
   await h.runner.onFailed("thr_delegate", "boom");
@@ -298,7 +356,7 @@ test("a spawn error with no thread found leaves the job uncertain until its thre
   assert.equal(h.spawned.length, 1);
 
   const metadata = h.spawned[0]!.pluginMetadata;
-  h.threads.set("thr_late", { id: "thr_late", status: "idle", archivedAt: null, deletedAt: null, output: null, metadata, originPluginId: "pstack" });
+  h.threads.set("thr_late", h.thread({ id: "thr_late", status: "idle", metadata }));
   await h.runner.onIdle("thr_late", JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] }));
   const adopted = h.runner.view(runId, "thr_origin");
   assert.deepEqual([adopted.status, adopted.jobs[0]!.threadId, adopted.jobs[0]!.error], ["succeeded", "thr_late", null]);
@@ -311,7 +369,7 @@ test("a tick adopts an uncertain spawn's thread when its events are missed", asy
   const { runId } = await h.runner.start(SWARM(["a"]), "thr_origin");
   const metadata = h.spawned[0]!.pluginMetadata;
   const output = JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] });
-  h.threads.set("thr_late", { id: "thr_late", status: "idle", archivedAt: null, deletedAt: null, output, metadata, originPluginId: "pstack" });
+  h.threads.set("thr_late", h.thread({ id: "thr_late", status: "idle", output, metadata }));
   await h.runner.tick(runId);
   assert.deepEqual(h.runner.results(runId, "thr_origin").map((job) => job.state), ["succeeded"]);
   assert.equal(h.spawned.length, 1);
@@ -326,7 +384,7 @@ test("a thread that turns up after its attempt is no longer live is stopped, not
   assert.equal(h.runner.view(runId, "thr_origin").jobs[0]!.state, "failed");
 
   const metadata = h.spawned[0]!.pluginMetadata;
-  h.threads.set("thr_late", { id: "thr_late", status: "active", archivedAt: null, deletedAt: null, output: null, metadata, originPluginId: "pstack" });
+  h.threads.set("thr_late", h.thread({ id: "thr_late", metadata }));
   h.failures.stop.push(new Error("bb is restarting"));
   await h.runner.onIdle("thr_late", "anything");
   assert.deepEqual(h.stopped, []);
@@ -369,34 +427,23 @@ test("a report or verdict for another slice is rejected, by the tool and in the 
 test("restart: an issued attempt is adopted through its metadata, or marked uncertain and never spawned again", async () => {
   const h = harness();
   const plan = SWARM(["a", "b", "c"]);
-  const origin = { threadId: "thr_origin", projectId: "prj_1", environmentId: "env_1", providerId: "claude-code", model: "m", reasoningLevel: "high", permissionMode: "auto" };
+  const origin = { threadId: "thr_origin", projectId: "prj_1", environmentId: "env_1", hostId: "host_home", pin: null, providerId: "claude-code", model: "m", reasoningLevel: "high", permissionMode: "auto" };
   const compiled = compile(plan, resolveRole, origin);
   assert.ok(compiled.ok);
   const runId = "psr_33333333-3333-3333-3333-333333333333" as RunId;
   h.store.createRun({ id: runId, origin, requestKey: null, planHash: "h", kind: "swarm", title: "check.sh", deadline: h.clock.now + 60_000, jobs: compiled.jobs });
   for (const key of ["slice-1", "slice-2", "slice-3"]) {
     h.store.transitionJobAndAttempt(runId, key, "queued", "running");
-    h.store.claimAttempt(runId, key, 1, h.clock.now);
+    h.store.claimAttempt(runId, key, 1, h.clock.now, HOSTS[0]!);
   }
   h.store.transitionJobAndAttempt(runId, "slice-3", "running", "failed", { error: "the worker thread failed" });
-  h.threads.set("thr_stray", {
-    id: "thr_stray",
-    status: "active",
-    archivedAt: null,
-    deletedAt: null,
-    output: null,
-    metadata: { pstackWorker: 1, runId, job: "slice-3", ordinal: 1, originThreadId: "thr_origin" },
-    originPluginId: "pstack",
-  });
-  h.threads.set("thr_lost", {
+  h.threads.set("thr_stray", h.thread({ id: "thr_stray", metadata: { pstackWorker: 1, runId, job: "slice-3", ordinal: 1, originThreadId: "thr_origin" } }));
+  h.threads.set("thr_lost", h.thread({
     id: "thr_lost",
     status: "idle",
-    archivedAt: null,
-    deletedAt: null,
     output: JSON.stringify({ slice: "a", status: "PASS", summary: "ok", evidence: [], issues: [] }),
     metadata: { pstackWorker: 1, runId, job: "slice-1", ordinal: 1, originThreadId: "thr_origin" },
-    originPluginId: "pstack",
-  });
+  }));
 
   const stopped = new AbortController();
   stopped.abort();
@@ -514,13 +561,126 @@ test("workerResult names a worker's contract from its metadata before attach and
 test("start rejects a plan whose models the origin's machine does not offer, before any spawn", async () => {
   const h = harness();
   const checked: { tuples: readonly string[]; environmentId: string }[] = [];
-  const runner = createRunner(h.bb, h.store, resolveRole, () => h.clock.now, async (tuples, environmentId) => {
-    checked.push({ tuples, environmentId });
-    return tuples.filter((tuple) => tuple.startsWith("codex/")).map((tuple) => `${tuple}: codex has no such model`);
+  const runner = createRunner(h.bb, h.store, {
+    resolveRole,
+    placement: createPlacement(h.bb, { exec: async () => "{}" }),
+    clock: () => h.clock.now,
+    async modelProblems(tuples, environmentId) {
+      checked.push({ tuples, environmentId });
+      return tuples.filter((tuple) => tuple.startsWith("codex/")).map((tuple) => `${tuple}: codex has no such model`);
+    },
   });
   await assert.rejects(runner.start(PANEL, "thr_origin"), (error: Error & { code?: string }) =>
     error.code === "plan_invalid" && /models not available on this thread's machine: codex\//.test(error.message));
   assert.equal(h.spawned.length, 0);
   assert.equal(checked[0]?.environmentId, "env_1");
   assert.ok(checked[0]!.tuples.length >= 2);
+});
+
+const CLAUDE = "claude-code/claude-opus-5-5/high";
+const explore = (seats: [label: string, reads: string][], prompt = "Read-only. Explore src/runner.ts.") =>
+  RunPlan.parse({ kind: "panel", title: "Explore", seats: seats.map(([label, reads]) => ({ label, model: { tuple: CLAUDE }, prompt, reads })) });
+
+test("a commit job stays home while home has room and leaves for a worktree at the pinned commit when it is full", async () => {
+  const h = harness({ homeLimit: 3 });
+  const { runId } = await h.runner.start(explore([["Here", "origin"], ["A", "commit"], ["B", "commit"]]), "thr_origin");
+  assert.deepEqual(h.spawned.map((args) => args.environment), [
+    { type: "reuse", environmentId: "env_1" },
+    { type: "reuse", environmentId: "env_1" },
+    { type: "host", hostId: "host_box", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "feature" } } },
+  ]);
+  assert.deepEqual(h.hosts(runId), ["Mac Mini", "Mac Mini", "box"]);
+  assert.doesNotMatch(h.spawned[1]!.prompt, new RegExp(WORKSPACE_MISMATCH), "a commit job at home reads the origin worktree");
+  assert.match(h.spawned[2]!.prompt, /^This job runs on another machine[\s\S]*`feature`[\s\S]*c0ffee[\s\S]*WORKSPACE_MISMATCH[\s\S]*Read-only\. Explore/);
+
+  await h.runner.onIdle(h.worker(3), "It works like this.");
+  assert.equal(h.runner.view(runId, "thr_origin").jobs[2]!.state, "succeeded", "a worker at the pinned HEAD is accepted");
+});
+
+test("an origin job stays home when home is full", async () => {
+  const h = harness({ homeLimit: 1 });
+  const { runId } = await h.runner.start(explore([["Here", "origin"]]), "thr_origin");
+  assert.deepEqual(h.spawned[0]!.environment, { type: "reuse", environmentId: "env_1" });
+  assert.deepEqual(h.hosts(runId), ["Mac Mini"]);
+});
+
+test("commit jobs stay home without a clean, pushed origin checkout, and prompt jobs need no pin", async () => {
+  for (const origin of [
+    checkout({ sha: PIN.sha, state: "dirty_uncommitted", mergeBase: `origin/${PIN.branch}` }),
+    checkout({ sha: PIN.sha, mergeBase: `origin/${PIN.branch}`, pushed: null }),
+  ]) {
+    const h = harness({ homeLimit: 1, origin });
+    await h.runner.start(explore([["A", "commit"], ["B", "prompt"]]), "thr_origin");
+    assert.deepEqual(h.spawned.map((args) => args.environment), [
+      { type: "reuse", environmentId: "env_1" },
+      { type: "host", hostId: "host_box", workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } },
+    ]);
+    assert.doesNotMatch(h.spawned[1]!.prompt, new RegExp(WORKSPACE_MISMATCH));
+  }
+});
+
+test("start rejects a plan whose commit job names a local path, before any spawn", async () => {
+  const h = harness();
+  await assert.rejects(h.runner.start(explore([["A", "commit"]], "Your brief is at /Users/me/brief.md."), "thr_origin"), (error: Error & { code?: string }) =>
+    error.code === "plan_invalid" && error.message.includes("/Users/me/brief.md"));
+  assert.equal(h.spawned.length, 0);
+});
+
+test("a judge whose materialized prompt names a local path stays home, and one without leaves", async () => {
+  for (const [answer, type] of [["I wrote /tmp/explore/notes.md.", "reuse"], ["It works like this.", "host"]] as const) {
+    const h = harness({ homeLimit: 1 });
+    await h.runner.start(RunPlan.parse({
+      kind: "panel",
+      title: "Explore",
+      seats: [{ label: "Explorer", model: { tuple: CLAUDE }, prompt: "Explore." }],
+      judge: { model: { tuple: CLAUDE }, prompt: "Explain from the findings.", reads: "prompt" },
+    }), "thr_origin");
+    await h.runner.onIdle(h.worker(1), answer);
+    assert.equal(h.spawned[1]!.environment.type, type, answer);
+  }
+});
+
+test("a remote commit worker at another HEAD fails as transient and its retry runs home", async () => {
+  const h = harness({ homeLimit: 1 });
+  const { runId } = await h.runner.start(explore([["A", "commit"]]), "thr_origin");
+  assert.equal(h.spawned[0]!.environment.hostId, "host_box");
+  h.statuses.set(`env_${h.worker(1)}`, checkout({ sha: "beef" }));
+  await h.runner.onIdle(h.worker(1), "It works like this.");
+  const job = h.runner.view(runId, "thr_origin").jobs[0]!;
+  assert.equal(job.state, "queued");
+  assert.match(job.error!, /workspace mismatch: the worker's HEAD on box is beef, not the pinned c0ffee/);
+
+  h.clock.now += 1_000;
+  await h.runner.tick(runId);
+  assert.deepEqual(h.spawned[1]!.environment, { type: "reuse", environmentId: "env_1" }, "the retry stays home though home is full");
+  assert.doesNotMatch(h.spawned[1]!.prompt, new RegExp(WORKSPACE_MISMATCH));
+  await h.runner.onIdle(h.worker(2), "It works like this.");
+  assert.deepEqual(h.runner.results(runId, "thr_origin").map((result) => [result.state, result.value]), [["succeeded", "It works like this."]]);
+  assert.deepEqual(h.hosts(runId), ["Mac Mini"]);
+
+  const structured = harness({ homeLimit: 1 });
+  const review = await structured.runner.start(RunPlan.parse({ kind: "panel", title: "Review", seats: [{ label: "A", model: { tuple: CLAUDE }, prompt: "Review it.", reads: "commit", result: "review" }] }), "thr_origin");
+  structured.statuses.set(`env_${structured.worker(1)}`, checkout({ sha: "beef" }));
+  const submitted = await structured.runner.submit(structured.worker(1), { findings: [] });
+  assert.equal(submitted.ok, false);
+  assert.equal(structured.runner.view(review.runId, "thr_origin").jobs[0]!.state, "queued", "pstack_result is not accepted from the wrong HEAD");
+});
+
+test("an away spawn that may not have started keeps its machine and is never placed again, across a restart", async () => {
+  const h = harness({ homeLimit: 1 });
+  h.failures.spawn.push({ error: new Error("socket hang up"), create: false });
+  const { runId } = await h.runner.start(explore([["A", "commit"]]), "thr_origin");
+  assert.deepEqual([h.runner.view(runId, "thr_origin").jobs[0]!.state, ...h.hosts(runId)], ["uncertain", "box"]);
+
+  const restarted = h.restart();
+  h.clock.now += 60_000;
+  await restarted.tick(runId);
+  assert.equal(h.spawned.length, 1);
+
+  h.threads.set("thr_late", h.thread({ id: "thr_late", status: "idle", metadata: h.spawned[0]!.pluginMetadata, hostId: "host_box" }));
+  h.statuses.set("env_thr_late", checkout({ sha: PIN.sha }));
+  await restarted.onIdle("thr_late", "It works like this.");
+  const view = restarted.view(runId, "thr_origin");
+  assert.deepEqual([view.status, view.jobs[0]!.threadId, view.jobs[0]!.host?.name], ["succeeded", "thr_late", "box"]);
+  assert.equal(h.spawned.length, 1);
 });

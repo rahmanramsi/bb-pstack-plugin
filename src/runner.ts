@@ -6,11 +6,12 @@
  * The engine (createRunner) applies each with a compare-and-set in run-store.ts, so applying one twice does
  * nothing. Events, a 15 s maintenance tick, and startup all just call tick(runId).
  *
- * Restart rule: an attempt is persisted as `issued` before threads.spawn. If the spawn call fails or the
- * process dies before the thread id is attached, a hidden plugin-owned thread whose metadata names the attempt
- * is adopted, by an event or by a tick's scan, and until then the job is `uncertain`, up to the run deadline.
- * It never spawns again for an issued attempt, because the SDK spawn has no idempotency key and a late success
- * would duplicate the seat or judge. A thread whose attempt is no longer live is stopped.
+ * Restart rule: an attempt is persisted as `issued`, with the machine placement chose for it, before
+ * threads.spawn. If the spawn call fails or the process dies before the thread id is attached, a hidden
+ * plugin-owned thread whose metadata names the attempt is adopted, by an event or by a tick's scan, and until
+ * then the job is `uncertain`, up to the run deadline. It never spawns again for an issued attempt, or on another
+ * machine, because the SDK spawn has no idempotency key and a late success would duplicate the seat or judge.
+ * A thread whose attempt is no longer live is stopped.
  *
  * Cleanup rule: once an attempt finishes (accepted, failed, past the deadline or cancelled), its worker is
  * stopped by every tick of its run, finished or not, until a stop succeeds or the thread is gone.
@@ -19,18 +20,26 @@ import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { RESULT_SCHEMAS, STATE_CHANNEL, type ResultKind, type RunPlan, type RunView } from "./contract.ts";
+import { RESULT_SCHEMAS, STATE_CHANNEL, type Reads, type ResultKind, type RunPlan, type RunView } from "./contract.ts";
 import { formatChoice, parseChoice, type ModelChoice } from "./models.ts";
+import { hostId, type Away, type HostId, type Need, type Placement } from "./placement.ts";
 import type { RunStore } from "./run-store.ts";
 
 export type RunId = string & { readonly __brand: "RunId" };
 export type JobKind = "seat" | "judge" | "slice" | "verifier";
+
+export type Pin = NonNullable<Away["pin"]>;
+export type Host = { id: string; name: string };
 
 /** What the engine needs from the origin thread, snapshotted at start. */
 export type Origin = {
   threadId: string;
   projectId: string;
   environmentId: string;
+  /** The origin environment's machine. Null only for runs stored before it was recorded. */
+  hostId: string | null;
+  /** The origin's branch and HEAD when its worktree was clean and pushed at start, so `commit` jobs may leave. */
+  pin: Pin | null;
   providerId: string;
   model: string;
   reasoningLevel: string;
@@ -48,6 +57,7 @@ export type JobDraft = {
   model: Tuple;
   prompt: string;
   result: ResultKind;
+  reads: Reads;
   /** Keys this job waits on. Empty means ready at start. A judge waits on every seat; a verifier on its slice. */
   after: readonly string[];
   /** For a judge: how many of `after` must succeed. Ignored otherwise. */
@@ -88,7 +98,14 @@ export function compile(
   };
 
   try {
-    return { ok: true, jobs: plan.kind === "panel" ? compilePanel(plan, models, origin) : compileSwarm(plan, models) };
+    const jobs = plan.kind === "panel" ? compilePanel(plan, models, origin) : compileSwarm(plan, models);
+    for (const job of jobs) {
+      const path = job.reads === "origin" ? null : localPath(job.prompt);
+      if (path !== null) {
+        throw new CompileError(`${job.label} reads "${job.reads}", but its prompt names ${path}, which exists only on this machine; put the content in the prompt or read "origin"`);
+      }
+    }
+    return { ok: true, jobs };
   } catch (error) {
     if (error instanceof CompileError) return { ok: false, error: error.message };
     throw error;
@@ -96,6 +113,13 @@ export function compile(
 }
 
 type Models = (ref: { role: string } | { tuple: string }) => Tuple[];
+
+const LOCAL_PATH = /(?:^|[\s"'`(=:])((?:\/(?:Users|home|root|tmp|private|var|Volumes|mnt)\/|~\/|\$\{?(?:BB_THREAD_STORAGE|TMPDIR|HOME)\b)[^\s"'`)]*)/;
+
+/** Pure: the first path in `text` under a home, temp, or thread-storage directory, which another machine does not have. */
+export function localPath(text: string): string | null {
+  return LOCAL_PATH.exec(text)?.[1] ?? null;
+}
 
 function compilePanel(plan: Extract<RunPlan, { kind: "panel" }>, models: Models, origin: Origin): JobDraft[] {
   const expanded = plan.seats.flatMap((seat) => models(seat.model).map((model) => ({ seat, model })));
@@ -107,6 +131,7 @@ function compilePanel(plan: Extract<RunPlan, { kind: "panel" }>, models: Models,
     model,
     prompt: seat.prompt,
     result: seat.result,
+    reads: seat.reads,
     after: [],
     quorum: 0,
     slice: null,
@@ -127,6 +152,7 @@ function compilePanel(plan: Extract<RunPlan, { kind: "panel" }>, models: Models,
     model: pool.find((model) => model.provider !== origin.providerId) ?? pool[0]!,
     prompt: plan.judge.prompt,
     result: plan.judge.result,
+    reads: plan.judge.reads,
     after: seats.map((seat) => seat.key),
     quorum,
     slice: null,
@@ -147,6 +173,7 @@ function compileSwarm(plan: Extract<RunPlan, { kind: "swarm" }>, models: Models)
       model: models(slice.model ?? plan.model)[0]!,
       prompt: [plan.brief, `Your slice: ${slice.name}`, slice.brief].filter(Boolean).join("\n\n"),
       result: "report",
+      reads: slice.reads ?? plan.reads,
       after: [],
       quorum: 0,
       slice: slice.name,
@@ -159,6 +186,7 @@ function compileSwarm(plan: Extract<RunPlan, { kind: "swarm" }>, models: Models)
       model: models(plan.verify.model ?? plan.model)[0]!,
       prompt: plan.verify.prompt,
       result: "verdict",
+      reads: plan.verify.reads,
       after: [key],
       quorum: 1,
       slice: slice.name,
@@ -171,6 +199,57 @@ function seatLetter(index: number): string {
   return String.fromCharCode(65 + index);
 }
 
+const AWAY: Record<Reads, (origin: Origin) => Away | null> = {
+  origin: () => null,
+  commit: (origin) => origin.pin && { kind: "worktree", baseBranch: origin.pin.branch, pin: origin.pin },
+  prompt: () => ({ kind: "worktree", baseBranch: null, pin: null }),
+};
+
+/**
+ * Pure: where a job's next attempt may run. Home is the origin environment. Away is a fresh worktree on another
+ * machine, taken only when home is full, and never by a job whose prompt names a local path or whose earlier
+ * attempt already ran away.
+ */
+export function needFor(job: JobSnapshot, origin: Origin, home: HostId): Need {
+  const ranAway = job.attempts.some((attempt) => attempt.host !== null && attempt.host.id !== home);
+  const away = ranAway || localPath(job.prompt) !== null ? null : AWAY[job.reads](origin);
+  return {
+    projectId: origin.projectId,
+    home: { kind: "reuse", environmentId: origin.environmentId, hostId: home },
+    away,
+    affinity: "home",
+    model: away === null ? null : `${job.model.provider}/${job.model.model}`,
+  };
+}
+
+type WorkspaceStatus = Awaited<ReturnType<BbPluginApi["sdk"]["environments"]["status"]>>;
+
+/** Pure: the pin of a clean worktree whose HEAD is already on `origin/<branch>`, else null. */
+export function pinOf(status: WorkspaceStatus): Pin | null {
+  if (status.outcome !== "available") return null;
+  const { checkout, workingTree, mergeBase } = status.workspace;
+  if (checkout.kind !== "branch" || checkout.headSha === null || workingTree.state !== "clean") return null;
+  if (mergeBase?.mergeBaseBranch !== `origin/${checkout.branchName}` || mergeBase.baseRef !== checkout.headSha) return null;
+  return { branch: checkout.branchName, sha: checkout.headSha };
+}
+
+function headOf(status: WorkspaceStatus): string | null {
+  if (status.outcome !== "available") return null;
+  const { checkout } = status.workspace;
+  return checkout.kind === "branch" || checkout.kind === "detached" ? checkout.headSha : null;
+}
+
+export const WORKSPACE_MISMATCH = "WORKSPACE_MISMATCH";
+
+/** Prepended to a `commit` job that runs away, so it stops before reading a checkout other than the pinned one. */
+export function commitPreamble(pin: Pin): string {
+  return [
+    `This job runs on another machine, in a fresh worktree of \`${pin.branch}\` that must be at commit ${pin.sha}.`,
+    `First run \`git rev-parse HEAD\`. If it does not print ${pin.sha}, reply with only ${WORKSPACE_MISMATCH} and stop.`,
+    "Read-only: do not edit, commit, or push.",
+  ].join(" ");
+}
+
 export type JobState = "blocked" | "queued" | "running" | "repairing" | "uncertain" | "succeeded" | "failed" | "skipped" | "cancelled";
 
 export type AttemptSnapshot = {
@@ -179,6 +258,8 @@ export type AttemptSnapshot = {
   threadId: string | null;
   issuedAt: number;
   finishedAt: number | null;
+  /** The machine the attempt was issued on, fixed when it was issued. */
+  host: Host | null;
 };
 
 export type JobSnapshot = JobDraft & {
@@ -358,6 +439,7 @@ function weakOutcome(job: JobSnapshot): boolean {
 }
 
 const TRANSIENT_PATTERNS = [
+  /\bworkspace (?:mismatch|unverified)\b/,
   /provider[^\n]*(?:overload|capacity|busy|temporar|unavailable|rate.?limit)/,
   /(?:rate.?limit|too many requests)/,
   /(?:http|status|api error|error)\s*(?:429|500|502|503|504|529)\b/,
@@ -494,6 +576,7 @@ export function toView(run: RunSnapshot, meta: { kind: "panel" | "swarm"; title:
         state: job.state,
         attempt: Math.max(1, job.attempts.length),
         threadId: latest?.threadId ?? null,
+        host: latest?.host ?? null,
         startedAt: job.attempts[0]?.issuedAt ?? null,
         finishedAt: TERMINAL.has(job.state) ? (latest?.finishedAt ?? null) : null,
         error: job.error,
@@ -614,11 +697,16 @@ const refOf = (metadata: z.infer<typeof WorkerMetadata>): AttemptRef => ({ runId
 export function createRunner(
   bb: BbPluginApi,
   store: RunStore,
-  resolveRole: (role: string) => readonly ModelChoice[],
-  clock: () => number = Date.now,
-  /** Returns one problem per tuple the live catalog on the origin's host does not offer. */
-  modelProblems: (tuples: readonly string[], environmentId: string) => Promise<string[]> = async () => [],
+  deps: {
+    resolveRole: (role: string) => readonly ModelChoice[];
+    /** Chooses each attempt's machine and holds its slot until the thread shows up as running. */
+    placement: Placement;
+    clock?: () => number;
+    /** Returns one problem per tuple the live catalog on the origin's host does not offer. */
+    modelProblems?: (tuples: readonly string[], environmentId: string) => Promise<string[]>;
+  },
 ): Runner {
+  const { resolveRole, placement, clock = Date.now, modelProblems = async () => [] } = deps;
   const spawning = new Set<string>();
   const notifying = new Set<RunId>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
@@ -694,6 +782,31 @@ export function createRunner(
     if (current) store.transitionJobAndAttempt(ref.runId, ref.key, current.job.state, "failed", { error });
   }
 
+  /**
+   * For a `commit` attempt that ran away: whether its worktree is still at the pinned commit. A mismatch or an
+   * unreadable worktree fails the attempt as transient, and the retry stays home.
+   */
+  async function workspaceProblem(ref: AttemptRef, threadId: string): Promise<string | null> {
+    const current = currentJob(ref);
+    const attempt = current && liveAttempt(current.job);
+    const { origin } = store.info(ref.runId)!;
+    if (!current || current.job.reads !== "commit" || !attempt?.host || attempt.host.id === origin.hostId || !origin.pin) return null;
+    try {
+      const { environmentId } = await bb.sdk.threads.get({ threadId });
+      const head = environmentId === null ? null : headOf(await bb.sdk.environments.status({ environmentId }));
+      if (head === origin.pin.sha) return null;
+      return `workspace mismatch: the worker's HEAD on ${attempt.host.name} is ${head ?? "unknown"}, not the pinned ${origin.pin.sha}`;
+    } catch (error) {
+      return `workspace unverified: could not read the worker's HEAD on ${attempt.host.name}: ${message(error)}`;
+    }
+  }
+
+  async function observeResult(ref: AttemptRef, threadId: string, text: string | null): Promise<void> {
+    const problem = await workspaceProblem(ref, threadId);
+    if (problem) observeFailed(ref, problem);
+    else observeIdle(ref, text);
+  }
+
   /** Plugin-owned worker threads not yet bound to an attempt, with the attempt their metadata names. */
   async function unboundWorkers(): Promise<{ threadId: string; ref: AttemptRef }[]> {
     const workers: { threadId: string; ref: AttemptRef }[] = [];
@@ -748,7 +861,7 @@ export function createRunner(
     try {
       const thread = await bb.sdk.threads.get({ threadId });
       if (thread.archivedAt !== null || thread.deletedAt !== null) observeFailed(ref, "the worker thread was archived or deleted");
-      else if (thread.status === "idle") observeIdle(ref, (await bb.sdk.threads.output({ threadId })).output);
+      else if (thread.status === "idle") await observeResult(ref, threadId, (await bb.sdk.threads.output({ threadId })).output);
       else if (thread.status === "error") observeFailed(ref, "the worker thread failed");
     } catch (error) {
       if (isMissingThread(error)) observeFailed(ref, "the worker thread was archived or deleted");
@@ -758,30 +871,43 @@ export function createRunner(
 
   async function spawn(runId: RunId, job: JobSnapshot, ordinal: number): Promise<boolean> {
     store.transitionJobAndAttempt(runId, job.key, "queued", "running", { error: null, nextActionAt: null });
-    if (!store.claimAttempt(runId, job.key, ordinal, clock())) return false;
     const info = store.info(runId)!;
     const origin = info.origin;
     const id = attemptId(runId, job.key, ordinal);
     const ref: AttemptRef = { runId, key: job.key, ordinal };
+    if (spawning.has(id)) return false;
     spawning.add(id);
     try {
       let threadId: string | null;
+      let issued = false;
       try {
-        const thread = await bb.sdk.threads.spawn({
-          lifecycleOwnerThreadId: origin.threadId,
-          pluginMetadata: { pstackWorker: 1, runId, job: job.key, ordinal, originThreadId: origin.threadId },
-          projectId: origin.projectId,
-          environment: { type: "reuse", environmentId: origin.environmentId },
-          prompt: workerPrompt(job),
-          title: `${info.title} · ${job.label}`,
-          providerId: job.model.provider,
-          model: job.model.model,
-          reasoningLevel: job.model.reasoningLevel as never,
-          permissionMode: origin.permissionMode as never,
-          visibility: "hidden",
+        const home = hostId.parse(origin.hostId ?? (await bb.sdk.environments.get({ environmentId: origin.environmentId })).hostId);
+        const placed = await placement.place(needFor(job, origin, home), async (target) => {
+          if (!store.claimAttempt(runId, job.key, ordinal, clock(), { id: target.hostId, name: target.hostName })) return null;
+          issued = true;
+          const away = target.where === "away" && job.reads === "commit" && origin.pin;
+          const thread = await bb.sdk.threads.spawn({
+            lifecycleOwnerThreadId: origin.threadId,
+            pluginMetadata: { pstackWorker: 1, runId, job: job.key, ordinal, originThreadId: origin.threadId },
+            projectId: origin.projectId,
+            environment: target.environment,
+            prompt: workerPrompt(away ? { ...job, prompt: `${commitPreamble(away)}\n\n${job.prompt}` } : job),
+            title: `${info.title} · ${job.label}`,
+            providerId: job.model.provider,
+            model: job.model.model,
+            reasoningLevel: job.model.reasoningLevel as never,
+            permissionMode: origin.permissionMode as never,
+            visibility: "hidden",
+          });
+          return thread.id;
         });
-        threadId = thread.id;
+        if (!issued) return false;
+        threadId = placed.threadId!;
       } catch (error) {
+        if (!issued) {
+          bb.log.warn(`Could not place pstack worker ${id}: ${message(error)}`);
+          return false;
+        }
         // The server may have created the thread, or may still create it, so no error proves it does not exist.
         const workers = await unboundWorkers().catch(() => []);
         threadId = workers.find((worker) => attemptId(worker.ref.runId, worker.ref.key, worker.ref.ordinal) === id)?.threadId ?? null;
@@ -958,10 +1084,13 @@ export function createRunner(
     if (thread.environmentId === null) throw new RunnerError("origin_unavailable", "the thread has no environment for workers to reuse");
     const defaults = await bb.sdk.threads.defaultExecutionOptions({ threadId });
     if (defaults === null) throw new RunnerError("origin_unavailable", "the thread has no resolved model, so workers cannot inherit it");
+    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
     return {
       threadId,
       projectId: thread.projectId,
       environmentId: thread.environmentId,
+      hostId: environment.hostId,
+      pin: null,
       providerId: thread.providerId,
       model: defaults.model,
       reasoningLevel: defaults.reasoningLevel,
@@ -969,11 +1098,24 @@ export function createRunner(
     };
   }
 
+  /** The origin's pin, or null when its worktree is dirty, detached, or ahead of `origin/<branch>`. */
+  async function readPin(environmentId: string): Promise<Pin | null> {
+    try {
+      const current = await bb.sdk.environments.status({ environmentId });
+      if (current.outcome !== "available" || current.workspace.checkout.kind !== "branch") return null;
+      return pinOf(await bb.sdk.environments.status({ environmentId, mergeBaseBranch: `origin/${current.workspace.checkout.branchName}` }));
+    } catch (error) {
+      bb.log.warn(`Could not read the checkout of ${environmentId}; commit jobs stay on its machine: ${message(error)}`);
+      return null;
+    }
+  }
+
   return {
     async start(runPlan, originThreadId) {
-      const origin = await resolveOrigin(originThreadId);
+      let origin = await resolveOrigin(originThreadId);
       const compiled = compile(runPlan, resolveRole, origin);
       if (!compiled.ok) throw new RunnerError("plan_invalid", compiled.error);
+      if (compiled.jobs.some((job) => job.reads === "commit")) origin = { ...origin, pin: await readPin(origin.environmentId) };
       const problems = await modelProblems([...new Set(compiled.jobs.map((job) => formatChoice(job.model)))], origin.environmentId);
       if (problems.length > 0) throw new RunnerError("plan_invalid", `models not available on this thread's machine: ${problems.join("; ")}`);
       const created = store.createRun({
@@ -1007,6 +1149,12 @@ export function createRunner(
       const job = snapshot?.jobs.find((candidate) => candidate.key === ref!.key);
       if (!ref || !snapshot || !job) return { ok: false, error: "This thread is not a pstack worker." };
       if (job.result === "text") return { ok: false, error: "This job's result is your final message; do not call pstack_result." };
+      const problem = await workspaceProblem(ref, workerThreadId);
+      if (problem) {
+        observeFailed(ref, problem);
+        await reconcile(ref.runId);
+        return { ok: false, error: `${problem}. This attempt failed; the job retries on the origin's machine.` };
+      }
       const accepted = accept(job, snapshot, value);
       if (job.state === "succeeded" && liveAttempt(job) === null && job.attempts.at(-1)?.ordinal === ref.ordinal) {
         return accepted.ok && JSON.stringify(accepted.value) === JSON.stringify(job.value)
@@ -1053,7 +1201,7 @@ export function createRunner(
     async onIdle(threadId, lastAssistantText) {
       const ref = await locate(threadId);
       if (!ref) return;
-      observeIdle(ref, lastAssistantText);
+      await observeResult(ref, threadId, lastAssistantText);
       await reconcile(ref.runId);
     },
 
