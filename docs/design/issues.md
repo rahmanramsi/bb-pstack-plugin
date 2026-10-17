@@ -50,10 +50,10 @@ bb pstack issues show <job>           # rounds, thread, pull request, last error
 bb pstack issues stop <job>
 ```
 
-The worker thread uses one command:
+The worker thread uses one command. The plugin CLI has no stdin, so the worker writes the report to a file on its machine and passes the path:
 
 ```sh
-bb pstack issues report --result-file -
+bb pstack issues report --file "$BB_THREAD_STORAGE/report.json"
 ```
 
 ```json
@@ -68,9 +68,11 @@ bb pstack issues report --result-file -
 
 `outcome` is `changes`, `needs-info` (with `questions`), or `no-change` (with `summary` as the reason). `pr` is required on the first `changes` round and optional later. `replies` must answer every comment id the round listed.
 
+A rejected report exits 1 and prints every reason. When pstack cannot check a report yet, for example while the worktree status is unavailable, the command exits 1 with code `unavailable`, and the attempt does not count as a rejection.
+
 ## Shape
 
-**One issue is one job.** A job owns one worker thread, one branch `agent/issue-<n>-<slug>`, and at most one pull request. The job row is unique on `(repo, issue)`.
+**One label event is one job.** A job owns one worker thread, one branch `agent/issue-<n>-<slug>`, and at most one pull request. A partial unique index allows one open job per `(repo, issue)`. Re-adding the `agent` label after a job ended starts a new job, and its branch gets the suffix `-<generation>` (`agent/issue-41-submit-button-2`), so it never collides with the earlier pull request.
 
 **The agent holds no GitHub credentials.** The worker edits code and makes local commits in its worktree, then reports. The service performs every GitHub write: push, pull request create and edit, replies, labels, status comment, and review re-requests. A worker that follows injected instructions from an issue or comment can still change only its own branch, and only through a report the service validates. Workers run on hosts that do not store the App key. The worker host should not have a `gh` login with write access to the repository.
 
@@ -95,7 +97,18 @@ any ──(round limit, timeout, repeated invalid report)──► stuck
 
 `working`, `needs-info`, `review`, and `stuck` map to the labels `agent:working`, `agent:needs-info`, `agent:review`, and `agent:stuck`. The issue has one status comment that the service edits. It states the current state and links the pull request, and nothing else.
 
-**A pure reconciler.** As in `src/runner.ts`, `plan(job, pendingEvents, now)` returns actions: spawn, send round, push, open or update the pull request, reply, set labels, edit the status comment, stop, and finish. The engine applies each action through a compare-and-set transition in the store. The poller, thread events, a 15 s tick, and startup all call the same `tick(jobId)`.
+**The job row is the state machine, and transit states carry the outbox.** A job is either in a resting state (`queued`, `working`, `needs-info`, `review`, and the terminal `done`, `stopped`, `stuck`, `ignored`) or in a transit state (`starting`, `publishing`, `asking`, `closing`, `stopping`, `sticking`). A transit state carries the list of writes it still owes, in `effects_json` on the job row, and enters its resting state when the last one succeeds. So "writes are pending" and "the job is in transit" are one fact. A SQL `CHECK` enforces it, and a job can never reach `review` with its pull request unopened.
+
+| Transit state | Effects, in order | Then |
+|---|---|---|
+| `starting` | label the issue `agent:working`, spawn the worker | `working` |
+| `publishing` | push the reported commit, open the draft pull request, label it `agent`, relabel the issue `agent:review` | `review` |
+| `asking` | post the questions, relabel the issue `agent:needs-info` | `needs-info` |
+| `closing` | post the no-change reason, remove `agent:working` | `done` |
+| `stopping` | stop the worker, remove `agent:working` | `stopped` |
+| `sticking` | stop the worker, remove `agent:working` | `stuck` |
+
+**A pure core.** `src/issues/job.ts` imports nothing but zod. `plan(job, facts)` returns at most one action, `settle(job, outcome, now)` turns an effect's outcome into the next change, and `acceptReport(job, report, facts)` is the only way out of `working`. `EFFECT_POLICY` in the same file says, per effect, whether to probe before a retry, whether a negative probe allows running it again, and how long a claim holds. The engine gathers facts, applies the action, and writes every change with `store.write(id, version, change)`, one `UPDATE` guarded by the row's version. The poller, thread events, the 15 s sweep, and the report command all end in the same `tick(jobId)`.
 
 **Rounds.** A round is one message to the worker and one report back. Events that arrive while a round runs wait for the next round. Feedback is debounced: a round starts 2 minutes after the last event, so one review with ten inline comments becomes one round. The round message stands alone. It contains the pull request URL, every comment with its id, file, line, body, and diff hunk, and a short summary of earlier rounds. The worker can act on it after context compaction, and a replacement thread can act on it if the original is gone.
 
@@ -103,13 +116,13 @@ any ──(round limit, timeout, repeated invalid report)──► stuck
 
 **Report validation.** The service rejects a report and tells the worker why when any check fails:
 
-- The worktree has uncommitted changes.
-- `changes` without a new commit since the round started, or `no-change` and `needs-info` with one.
+- The worktree has uncommitted or untracked changes.
+- `changes` without a new commit, or `no-change` and `needs-info` with one. On the first round, a new commit means `environments.status` with `mergeBaseBranch: "origin/<base>"` reports `workspace.mergeBase.aheadCount > 0`. On later rounds, HEAD differs from the commit pstack last pushed. Neither needs a start commit captured before the worker begins.
 - The first round's thread checklist fails `gate pr`.
 - `verification` is empty.
 - A listed comment id has no reply, or a reply names an id the round did not list.
 - The title is not one line of 10 to 72 characters, or it does not follow the repository's title convention. The convention is Conventional Commits when the last 20 merged pull requests mostly use it.
-- The body is empty, longer than 10,000 characters, or describes the process instead of the change. It must not name the playbook, checklist, gate, rounds, threads, prompts, or the agent.
+- The body is empty, longer than 10,000 characters, or describes the process instead of the change. The check matches whole phrases such as `poteto-mode`, `pstack`, `playbook`, `the checklist`, `gate pr`, `this round`, and `the agent`, not bare words, so "thread pool", "user agent", and "round the timestamp" pass. The title and the text posted on the issue get the same check.
 
 Before posting, the service neutralizes `@mentions` into code spans, removes `Closes`, `Fixes`, and `Resolves` keywords, and appends `Closes #<n>`. After two rejected reports in one round, the job moves to `stuck`.
 
@@ -117,35 +130,37 @@ Before posting, the service neutralizes `@mentions` into code spans, removes `Cl
 
 **The pull request tool.** Opening a PR tells the agent to use a run's built-in PR tool instead of a forge CLI. For an issue worker, `bb pstack issues report` is that tool. The worker prompt says so and forbids `git push`, `gh`, and branch changes. The worker may rebase its own commits before the first push. After that it adds commits and never rewrites pushed history. It resolves conflicts by merging the base branch.
 
-**Push through the host entry.** The worktree lives on a host, and the token lives on the server. pstack gains a `bb.host` entry with one RPC method, `push({ worktreePath, remoteUrl, refspec, expectedRemoteSha, token })`. The server mints a fresh installation token and calls the method on the worktree's host. The host runs `git push` with the token in a one-shot `http.extraHeader` passed through `GIT_CONFIG_*` environment variables, so it never appears in a URL, the process list, the git config, or the worker's environment. The refspec is `HEAD:refs/heads/agent/issue-<n>-<slug>`, so the local branch name bb chose for the worktree does not matter. The push is never forced. `expectedRemoteSha` makes a push that does not fast-forward fail instead of overwriting.
+**Push through the host entry.** The worktree lives on a host, and the token lives on the server. pstack has a `bb.host` entry (`src/host.ts`) with one RPC method, `push({ worktreePath, remoteUrl, branch, sha, expectedRemoteSha, token })`. The caller names a commit and a branch, never a refspec. The host builds `<sha>:refs/heads/<branch>` itself, and the contract admits only branches that match `agent/issue-<n>-<slug>` and full 40-character commit ids.
 
-**Workers.** The service spawns a visible thread in the mapped project. Its environment is `{ type: "host", hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } }`. It sets `pluginMetadata: { pstackIssue: 1, jobId }` and uses the model of the new `issue worker` role, which falls back to `feature`. The service refuses a `host` that equals the server's `primaryHostId`.
+- **The validated commit, not HEAD.** The accepted report records the worktree's head commit, and pstack pushes that commit. A commit the worker makes after its report is not published unreviewed.
+- **From a scratch repository.** The worker controls the worktree's git config and hooks, so a `git push` inside it could follow a planted `url.<x>.insteadOf` to another host, a `credential.helper`, or a pre-push hook. The host instead creates a temporary bare repository that borrows the worktree's objects read-only through `objects/info/alternates`, and pushes from there with a clean environment: no system or global config, hooks disabled, no credential helper, redirects off, and only the remote URL's protocol allowed.
+- **A scoped token, revoked after use.** For each push the server mints a fresh installation token for that one repository with only `contents: write`, and revokes it in a `finally` block when the push returns. The token reaches git only as an `http.<remote>.extraHeader` in `GIT_CONFIG_*` environment variables, so it never appears in argv, a URL, a file, or the worker's environment.
+- **Never a rewrite.** The host checks that `sha` descends from `expectedRemoteSha` first, then pushes with `--force-with-lease=refs/heads/<branch>:<expected>`. The lease makes the remote check atomic, and an empty expected value means the branch must not exist yet. A remote that moved fails the push as `stale-remote`.
 
-**No duplicate threads or GitHub writes.** An attempt row is stored as `issued` before `threads.spawn`. On a spawn error or restart, the service looks for the thread through `threads.list({ originPluginId })` and plugin metadata. If it finds the thread, it adopts it. If not, the job moves to `stuck` instead of risking a second worker. Every GitHub write is first stored in an outbox with an idempotency key, such as `pr:<job>`, `reply:<commentId>`, or `push:<job>:<sha>`. Before retrying, the service checks GitHub: it looks for an open pull request from the head branch, an existing App reply to the comment, or the remote branch at that commit.
+**Workers.** The service spawns a visible thread in the mapped project. Its environment is `{ type: "host", hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } }`. It sets `pluginMetadata: { pstackIssue: 1, jobId }` and uses the model of the `issue worker` role, which falls back to `feature, refactoring` until it is configured. The permission mode is the project's default execution mode, and the field is left out when the project has none. The service refuses a `host` that equals the server's `primaryHostId` and records the refusal as the repository's poll error.
 
-**Limits.** These are settings with defaults: 3 jobs at a time, 5 feedback rounds per pull request, 3 CI rounds, and 60 minutes per round. Past a limit the job moves to `stuck`, and the status comment mentions the user who added the label.
+**No duplicate threads or GitHub writes.** Every effect, the spawn included, is claimed before it runs. The engine writes `tries + 1` and a lease to the row, then makes the call, then settles the outcome. After a crash the lease expires and the next claim probes for the effect's trace before running it again. A pushed commit is found as the remote branch at that commit, a pull request as any pull request from the head branch, and a comment as an App comment that carries the effect's key in an HTML marker. A probe that finds nothing lets a push, a pull request, or a comment run again. A spawn never runs twice, because no SDK error proves the thread was not created. Its probe looks for a thread in the job's project whose plugin metadata names the job, created after the claim and not bound to another job. If none appears within 5 minutes of the first claim, the job moves to `stuck`. A thread that names a job not waiting for it is stopped. Metadata only points at a job. The store's thread binding, not metadata, decides who may report.
+
+**Limits.** Step 1 uses constants: 3 jobs in `starting`, `working`, or `publishing` at a time, 60 minutes per round, two reminders to an idle worker that has not reported, and two rejected reports. Past a limit the job moves to `stuck`, which stops the worker and removes `agent:working`. Later steps make the limits settings and add 5 feedback rounds per pull request and 3 CI rounds.
 
 **Draft and ready.** The pull request opens as a draft. The service marks it ready after the first round once CI on its head commit passes. This differs from Opening a PR, which opens every pull request ready. Here the service owns readiness, and a red first push is common.
 
-**Store.** New append-only migrations in `src/store.ts`:
+**Store.** Step 1 appends two tables to the migrations in `src/store.ts`:
 
-- `issue_repos`: repository, cursor, and ETags.
-- `issue_jobs`: repository, issue, project, host, branch, thread, pull request, state, round counters, and deadline.
-- `issue_rounds`: job, ordinal, kind (`initial`, `feedback`, `ci`, `conflict`, `answer`), start commit, listed comment ids, report, and result.
-- `issue_events`: GitHub event ids already consumed.
-- `issue_outbox`: idempotency key, action, payload, state, and attempts.
+- `issue_repos`: repository, the poll cursor (`since` and the ETag), the last poll time, and the last poll error.
+- `issue_jobs`: one row per label event, unique on the event id. It holds the trigger, the issue snapshot, project, host, branch, generation, state, the outbox and its claim bookkeeping (`effects_json`, `effect_tries`, `effect_first_at`, `effect_lease_until`, `effect_next_at`), thread, deadline, rejections, reminders, the accepted report, the pushed commit, the pull request, the last error, and a version for compare-and-set writes. Its `CHECK` state lists repeat `job.ts`, and a test fails when they disagree.
+
+A label from a user without write access becomes an `ignored` row with the reason, so `bb pstack issues list --all` explains why a label did nothing. Later steps add `issue_rounds` and `issue_events` for feedback rounds. There is no separate outbox table. The outbox has one writer, the job, so it lives on the job's row.
 
 **Modules.** The feature lives under `src/issues/`:
 
-- `github-auth.ts`: App JWT and cached installation tokens.
-- `github.ts`: the REST client.
-- `poller.ts`: turns responses into events.
-- `engine.ts`: `plan()` and `apply()`.
-- `report.ts`: the report schema, validation, and body assembly.
-- `prompts.ts`: the worker prompts.
-- `commands.ts`: `bb pstack issues`.
+- `job.ts`: the state machine, `plan`, `settle`, `acceptReport`, `EFFECT_POLICY`, the report schema, the pull request body, and the worker prompts. Pure.
+- `store.ts`: SQL for `issue_repos` and `issue_jobs`.
+- `github.ts`: the GitHub App client. It owns the App JWT, installation tokens, ETags, pagination, rate limits, and the permission cache, and maps responses to domain types and three error classes.
+- `engine.ts`: `createIssues()`, the one surface `server.ts` uses. It returns the CLI commands, `register()` for thread events and the `pstack-issues` service, `instructions(threadId)`, and `isWorker(threadId)`. Its `EFFECTS` table says how to perform and probe each effect; a missing entry fails the build.
+- `commands.ts`: `bb pstack issues` and the settings.
 
-The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. The UI panel comes last and reads jobs over RPC like the run views.
+The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. `src/thread-files.ts` reads a file on the invoking thread's machine for both `run start --file` and `issues report --file`. The UI panel comes last and reads jobs over RPC like the run views.
 
 ## Rollout
 
@@ -159,7 +174,9 @@ The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. 
 
 - We accept up to 60 s of latency plus a 2 minute debounce, in exchange for no public endpoint and no lost events after downtime.
 - We accept a job that stops at `stuck` after an ambiguous spawn failure, in exchange for never running two workers on one branch.
-- We accept that the token briefly exists in the host plugin process during a push, in exchange for a plain `git push` that handles binaries, renames, and file modes.
+- We accept that the token briefly exists in the host plugin process and the git child processes during a push, in exchange for a plain `git push` that handles binaries, renames, and file modes. The worker probably runs as the same OS user as the host daemon, so it could read the token from `/proc/<pid>/environ` while a push runs. The token is limited to one repository and `contents: write` and is revoked when the push returns, so the exposure is one repository's branches for the length of one push. Branch protection on the default branch limits it further.
+- We accept that a `stop` racing an in-flight effect drops that effect's result. A pull request opened in the race stays open but unrecorded.
+- We accept that recovery waits out a lease, up to 11 minutes after a crash during a push, in exchange for no in-memory record of in-flight work.
 - We accept that the worker judges whether feedback is mechanical, in exchange for cheaper rounds on small comments. Every round still needs verification evidence.
 - We accept the experimental host RPC API, isolated in one small module.
 
@@ -172,8 +189,9 @@ The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. 
 
 ## Open questions and risks
 
-- Should re-adding the `agent` label to a stopped or done issue resume the old job or start a new one?
 - An issue edited after work starts is sent to the worker as a note. Is that enough, or should a large edit restart the job?
 - Two jobs that touch the same files are not coordinated. Conflicts surface as conflict rounds.
-- What permission mode should worker threads use? Autonomous work needs one that does not block on approval prompts.
+- Workers use the project's default permission mode. A project whose default is `accept-edits` may stall an unattended worker on approval prompts until the round's 60 minutes run out.
+- Whether bb logs host RPC payloads, which carry the push token, is unverified.
+- The reminder to an idle worker compares the thread's `updatedAt` with the job's last write. If bb does not bump `updatedAt` when a turn ends, no reminder is sent and the job sticks at the round's deadline instead.
 - The host RPC API is experimental. A breaking SDK change affects only `src/host.ts` and its contract.
