@@ -363,6 +363,7 @@ test("feedback counts per the operator's rules: /agent conversation comments, an
   assert.equal(item("pr-comment", "  /Agent please add a test", null), true);
   assert.equal(item("pr-comment", "Looks good, but please add a test", null), false);
   assert.equal(item("pr-comment", "/agents", null), false);
+  assert.equal(item("pr-comment", "/agent stop", null), false, "a stop command is not feedback");
   assert.equal(item("review", "Rename the helper.", "CHANGES_REQUESTED"), true);
   assert.equal(item("review", "Nit: rename.", "COMMENTED"), true);
   assert.equal(item("review", "Ship it, but rename later.", "APPROVED"), false);

@@ -83,8 +83,8 @@ function stateLabel(job: JobView): string {
 
 /** A repository's last poll. `error` is why it failed, including setup problems such as an App that is not installed. */
 export type RepoView = { repo: RepoName; polledAt: number | null; error: string | null };
-/** A job with its pull request's last poll, which fails on its own when GitHub cannot read that one pull request. */
-type ListedJob = JobView & { prPoll: { polledAt: number | null; error: string | null } | null };
+/** A job with its last poll of its issue and pull request, which fails on its own when GitHub cannot read them. */
+type ListedJob = JobView & { poll: { polledAt: number | null; error: string | null } };
 
 function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now: number): string {
   if (repos.length === 0 && jobs.length === 0) return "No issue jobs.";
@@ -97,7 +97,7 @@ function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now:
           const parts = [`#${job.issue}`, stateLabel(job), job.pr ? `PR #${job.pr.number}` : null, job.threadId, job.id, age(job.createdAt, now)];
           const detail = job.state === "ignored" || job.state === "stuck" ? job.error : null;
           const row = `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
-          return job.prPoll?.error ? `${row}\n    pull request poll error: ${job.prPoll.error}` : row;
+          return job.poll.error ? `${row}\n    poll error: ${job.poll.error}` : row;
         });
       return [header, ...(error ? [`  poll error: ${error}`] : []), ...rows].join("\n");
     })
@@ -116,8 +116,8 @@ function formatShow(job: ListedJob, repo: RepoView, now: number): string {
     ["round", job.round > 1 ? `feedback round ${job.round - 1} of ${MAX_FEEDBACK_ROUNDS}` : null],
     ["summary", job.summary],
     ["error", job.error],
-    ["pr polled", job.prPoll && (job.prPoll.polledAt === null ? "not yet" : age(job.prPoll.polledAt, now))],
-    ["pr poll error", job.prPoll?.error ?? null],
+    ["polled", job.poll.polledAt === null ? "not yet" : age(job.poll.polledAt, now)],
+    ["poll error", job.poll.error],
     ["repo polled", repo.polledAt === null ? "not yet" : age(repo.polledAt, now)],
     ["repo error", repo.error],
   ];
@@ -141,7 +141,7 @@ export function issueCommands(deps: {
   };
   const listed = (job: Job): ListedJob => {
     const { polledAt, error } = store.jobPoll(job.id);
-    return { ...toView(job), prPoll: job.pr ? { polledAt, error } : null };
+    return { ...toView(job), poll: { polledAt, error } };
   };
 
   return {
@@ -161,7 +161,7 @@ export function issueCommands(deps: {
       },
     }),
     "issues show": cliCommand({
-      summary: "Show one issue job: thread, branch, pull request, pending GitHub write, last error, and the last polls of its pull request and repository",
+      summary: "Show one issue job: thread, branch, pull request, pending GitHub write, last error, and the last polls of its issue, pull request and repository",
       positionals: [{ name: "job", description: "Job id (psi_…)", required: true }],
       options: { json: { type: "boolean", description: "Emit the job view as JSON" } },
       run(input) {

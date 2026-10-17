@@ -160,7 +160,6 @@ test("feedback is stored once per GitHub item, and only for the job it was polle
   assert.equal(store.addFeedback(REPO, items), 0, "a repeated poll adds nothing");
   assert.deepEqual(store.pendingFeedback(job.id).map((item) => [item.kind, item.id]), [["review-comment", 2], ["review-comment", 1], ["review", 1]]);
   assert.deepEqual(store.pendingFeedback(job.id)[0], comment(2, 90));
-  assert.deepEqual(store.withPullRequest(REPO).map((open) => open.id), [job.id]);
 });
 
 test("a round start writes the job, the round's row and its feedback in one transaction, and feedback that arrives later waits for the next round", () => {

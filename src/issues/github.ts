@@ -50,8 +50,10 @@ export type LabeledIssue = { number: number; title: string; body: string; url: s
 export type LabelEvent = { id: number; actor: string; at: number };
 /** Opaque to callers, who store it and hand it back. */
 export type PollCursor = { readonly __brand: "PollCursor" };
-/** Opaque to callers, like PollCursor: one pull request's list cursors, ETags, and the last known review states. */
-export type FeedbackCursor = { readonly __brand: "FeedbackCursor" };
+/** Opaque to callers, like PollCursor: one job's list cursors, ETags, and its pull request's last known reviews. */
+export type ActivityCursor = { readonly __brand: "ActivityCursor" };
+/** A comment in an issue's conversation. */
+export type PolledComment = { id: number; author: string; body: string; createdAt: number };
 
 export type RepoClient = {
   readonly name: RepoName;
@@ -77,10 +79,14 @@ export type RepoClient = {
   /** An inline review comment by the App on pull request `pr` whose last line is `marker`, posted at or after `since`. */
   findReviewComment(pr: number, marker: string, since: number): Promise<{ id: number } | null>;
   /**
-   * One pull request's reviews, inline comments and conversation comments since the cursor, and its state. Unchanged
-   * lists answer 304 and cost no rate limit. Items can repeat across calls; callers dedupe on the id.
+   * One job's activity since the cursor: the issue's comments, from `since` on the first read, and, once the job has
+   * a pull request, its reviews, inline comments and conversation comments, and its state. Unchanged lists answer 304
+   * and cost no rate limit. Items can repeat across calls; callers dedupe on the id.
    */
-  pullActivity(pr: number, cursor: FeedbackCursor | null): Promise<{ state: PullState; items: PolledFeedback[]; next: FeedbackCursor }>;
+  activity(
+    target: { issue: number; since: number; pr: number | null },
+    cursor: ActivityCursor | null,
+  ): Promise<{ issueComments: PolledComment[]; pull: { state: PullState; items: PolledFeedback[] } | null; next: ActivityCursor }>;
   addLabels(issue: number, labels: readonly string[]): Promise<void>;
   /** A label that is not on the issue is success. */
   removeLabel(issue: number, label: string): Promise<void>;
@@ -106,6 +112,7 @@ export type GitHub = {
 type Cursor = { since: string | null; etag: string | null };
 /** A review as last listed: its state, and when it was submitted. */
 type KnownReview = { state: string; submittedAt: number };
+type JobCursor = { issue: Cursor | null; pull: PullCursor | null };
 type PullCursor = {
   reviewComments: Cursor | null;
   comments: Cursor | null;
@@ -327,6 +334,75 @@ export function createGitHub(options: GitHubOptions): GitHub {
       if (appSlug === null) appSlug = (await call<{ slug: string }>({ kind: "app", signal }, "GET", "/app")).json.slug;
       return `${appSlug}[bot]`;
     };
+    /** One pull request's feedback since its cursor, and its state. */
+    async function pullActivity(pr: number, cursor: PullCursor | null): Promise<{ state: PullState; items: PolledFeedback[]; next: PullCursor }> {
+      const was = cursor ?? { reviewComments: null, comments: null, reviews: null, pull: null };
+      const author = (user: RawUser) => user?.login ?? "ghost";
+      // Comments before reviews: a comment's review exists by the time the comment is listed, so the review list
+      // read after it knows that review's state.
+      const inline = await list<RawReviewComment>(auth, `${base}/pulls/${pr}/comments`, { sort: "updated", direction: "asc" }, was.reviewComments, true, INLINE_OVERLAP_MS);
+      const conversation = await list<RawComment>(auth, `${base}/issues/${pr}/comments`, { sort: "updated", direction: "asc" }, was.comments, true);
+      const reviews = await list<RawReview>(auth, `${base}/pulls/${pr}/reviews`, {}, was.reviews && { since: null, etag: was.reviews.etag }, false);
+      const before = was.reviews?.known ?? {};
+      const known: Record<string, KnownReview> = reviews
+        ? Object.fromEntries(reviews.items.flatMap((review) => (review.submitted_at ? [[review.id, { state: review.state, submittedAt: Date.parse(review.submitted_at) }]] : [])))
+        : before;
+      const pull = await request(auth, "GET", `${base}/pulls/${pr}`, { etag: was.pull?.etag ?? null });
+      let state: PullState;
+      if (pull.status === 304 && was.pull) state = was.pull.state;
+      else if (pull.status === 200) {
+        const json = pull.json as { state: string; merged?: boolean; merged_at?: string | null };
+        state = json.state === "open" ? "open" : json.merged || json.merged_at ? "merged" : "closed";
+      } else throw failure("GET", `${base}/pulls/${pr}`, pull);
+
+      // A new review's inline comments keep the times they were drafted at, which can be older than the inline
+      // cursor, so they are read through the review itself. The App's own reviews are its replies.
+      const login = await appLogin();
+      const fresh = (reviews?.items ?? []).filter((review) => review.submitted_at && !before[review.id] && review.user?.login !== login);
+      const drafted = (await Promise.all(fresh.map((review) => pages<RawReviewComment>(auth, `${base}/pulls/${pr}/reviews/${review.id}/comments?per_page=100`)))).flat();
+
+      const items: PolledFeedback[] = [];
+      const none = { path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null };
+      const seen = new Set<number>();
+      for (const comment of [...(inline?.items ?? []), ...drafted]) {
+        const reviewId = comment.pull_request_review_id ?? null;
+        const review = reviewId === null ? null : known[reviewId];
+        // A comment whose review is not listed yet cannot be classified; the overlapping cursor reads it again.
+        if (seen.has(comment.id) || review === undefined) continue;
+        seen.add(comment.id);
+        items.push({
+          kind: "review-comment",
+          id: comment.id,
+          pr,
+          author: author(comment.user),
+          body: comment.body,
+          path: comment.path,
+          line: comment.line ?? comment.original_line ?? null,
+          diffHunk: comment.diff_hunk,
+          inReplyTo: comment.in_reply_to_id ?? null,
+          reviewId,
+          createdAt: Date.parse(comment.created_at),
+          postedAt: review?.submittedAt ?? Date.parse(comment.updated_at),
+          reviewState: review?.state ?? null,
+        });
+      }
+      for (const comment of conversation?.items ?? []) {
+        items.push({ kind: "pr-comment", id: comment.id, pr, author: author(comment.user), body: comment.body ?? "", ...none, createdAt: Date.parse(comment.created_at), postedAt: Date.parse(comment.updated_at), reviewState: null });
+      }
+      for (const review of reviews?.items ?? []) {
+        if (!review.submitted_at) continue;
+        const submitted = Date.parse(review.submitted_at);
+        items.push({ kind: "review", id: review.id, pr, author: author(review.user), body: review.body ?? "", ...none, createdAt: submitted, postedAt: submitted, reviewState: review.state });
+      }
+      const next: PullCursor = {
+        reviewComments: inline?.next ?? was.reviewComments,
+        comments: conversation?.next ?? was.comments,
+        reviews: reviews ? { etag: reviews.next.etag, known } : was.reviews,
+        pull: { etag: pull.status === 200 ? pull.headers.get("etag") : (was.pull?.etag ?? null), state },
+      };
+      return { state, items, next };
+    }
+
     return {
       name,
       appLogin,
@@ -390,72 +466,13 @@ export function createGitHub(options: GitHubOptions): GitHub {
         const found = comments.find((comment) => comment.user?.login === login && endsWith(comment.body, marker));
         return found ? { id: found.id } : null;
       },
-      async pullActivity(pr, cursor) {
-        const was = (cursor as unknown as PullCursor | null) ?? { reviewComments: null, comments: null, reviews: null, pull: null };
-        const author = (user: RawUser) => user?.login ?? "ghost";
-        // Comments before reviews: a comment's review exists by the time the comment is listed, so the review list
-        // read after it knows that review's state.
-        const inline = await list<RawReviewComment>(auth, `${base}/pulls/${pr}/comments`, { sort: "updated", direction: "asc" }, was.reviewComments, true, INLINE_OVERLAP_MS);
-        const conversation = await list<RawComment>(auth, `${base}/issues/${pr}/comments`, { sort: "updated", direction: "asc" }, was.comments, true);
-        const reviews = await list<RawReview>(auth, `${base}/pulls/${pr}/reviews`, {}, was.reviews && { since: null, etag: was.reviews.etag }, false);
-        const before = was.reviews?.known ?? {};
-        const known: Record<string, KnownReview> = reviews
-          ? Object.fromEntries(reviews.items.flatMap((review) => (review.submitted_at ? [[review.id, { state: review.state, submittedAt: Date.parse(review.submitted_at) }]] : [])))
-          : before;
-        const pull = await request(auth, "GET", `${base}/pulls/${pr}`, { etag: was.pull?.etag ?? null });
-        let state: PullState;
-        if (pull.status === 304 && was.pull) state = was.pull.state;
-        else if (pull.status === 200) {
-          const json = pull.json as { state: string; merged?: boolean; merged_at?: string | null };
-          state = json.state === "open" ? "open" : json.merged || json.merged_at ? "merged" : "closed";
-        } else throw failure("GET", `${base}/pulls/${pr}`, pull);
-
-        // A new review's inline comments keep the times they were drafted at, which can be older than the inline
-        // cursor, so they are read through the review itself. The App's own reviews are its replies.
-        const login = await appLogin();
-        const fresh = (reviews?.items ?? []).filter((review) => review.submitted_at && !before[review.id] && review.user?.login !== login);
-        const drafted = (await Promise.all(fresh.map((review) => pages<RawReviewComment>(auth, `${base}/pulls/${pr}/reviews/${review.id}/comments?per_page=100`)))).flat();
-
-        const items: PolledFeedback[] = [];
-        const none = { path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null };
-        const seen = new Set<number>();
-        for (const comment of [...(inline?.items ?? []), ...drafted]) {
-          const reviewId = comment.pull_request_review_id ?? null;
-          const review = reviewId === null ? null : known[reviewId];
-          // A comment whose review is not listed yet cannot be classified; the overlapping cursor reads it again.
-          if (seen.has(comment.id) || review === undefined) continue;
-          seen.add(comment.id);
-          items.push({
-            kind: "review-comment",
-            id: comment.id,
-            pr,
-            author: author(comment.user),
-            body: comment.body,
-            path: comment.path,
-            line: comment.line ?? comment.original_line ?? null,
-            diffHunk: comment.diff_hunk,
-            inReplyTo: comment.in_reply_to_id ?? null,
-            reviewId,
-            createdAt: Date.parse(comment.created_at),
-            postedAt: review?.submittedAt ?? Date.parse(comment.updated_at),
-            reviewState: review?.state ?? null,
-          });
-        }
-        for (const comment of conversation?.items ?? []) {
-          items.push({ kind: "pr-comment", id: comment.id, pr, author: author(comment.user), body: comment.body ?? "", ...none, createdAt: Date.parse(comment.created_at), postedAt: Date.parse(comment.updated_at), reviewState: null });
-        }
-        for (const review of reviews?.items ?? []) {
-          if (!review.submitted_at) continue;
-          const submitted = Date.parse(review.submitted_at);
-          items.push({ kind: "review", id: review.id, pr, author: author(review.user), body: review.body ?? "", ...none, createdAt: submitted, postedAt: submitted, reviewState: review.state });
-        }
-        const next: PullCursor = {
-          reviewComments: inline?.next ?? was.reviewComments,
-          comments: conversation?.next ?? was.comments,
-          reviews: reviews ? { etag: reviews.next.etag, known } : was.reviews,
-          pull: { etag: pull.status === 200 ? pull.headers.get("etag") : (was.pull?.etag ?? null), state },
-        };
-        return { state, items, next: next as unknown as FeedbackCursor };
+      async activity(target, cursor) {
+        const was = (cursor as unknown as JobCursor | null) ?? { issue: null, pull: null };
+        const issue = await list<RawComment>(auth, `${base}/issues/${target.issue}/comments`, { sort: "updated", direction: "asc" }, was.issue ?? { since: new Date(target.since).toISOString(), etag: null }, true);
+        const issueComments = (issue?.items ?? []).map((comment) => ({ id: comment.id, author: comment.user?.login ?? "ghost", body: comment.body ?? "", createdAt: Date.parse(comment.created_at) }));
+        const pull = target.pr === null ? null : await pullActivity(target.pr, was.pull);
+        const next: JobCursor = { issue: issue?.next ?? was.issue, pull: pull?.next ?? was.pull };
+        return { issueComments, pull: pull && { state: pull.state, items: pull.items }, next: next as unknown as ActivityCursor };
       },
       async addLabels(issue, labels) {
         await call(auth, "POST", `${base}/issues/${issue}/labels`, { body: { labels } });

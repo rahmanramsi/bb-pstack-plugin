@@ -280,8 +280,8 @@ test("one pull request GitHub cannot read holds back no other, and shows its err
   assert.equal((await h.byIssue(42)).state, "addressing", "the healthy pull request's feedback starts its round");
   assert.equal((await h.byIssue(41)).state, "review");
   const shown = (await h.engine().run(["issues", "show", broken.job.id])).stdout!;
-  assert.match(shown, /pr poll error +GitHub GET \/repos\/acme\/web\/pulls\/\d+\/reviews\?per_page=100: 404/);
-  assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}review .*\n {4}pull request poll error: GitHub GET/);
+  assert.match(shown, /poll error +GitHub GET \/repos\/acme\/web\/pulls\/\d+\/reviews\?per_page=100: 404/);
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}review .*\n {4}poll error: GitHub GET/);
   assert.doesNotMatch((await h.engine().run(["issues", "show", healthy.job.id])).stdout!, /poll error/);
 
   h.gh().outages.length = 0;
@@ -461,4 +461,33 @@ test("a replacement worker whose worktree starts behind the branch on GitHub is 
   const note = h.sent.find((message) => message.threadId === addressing.threadId);
   assert.ok(note, "the replacement gets a note");
   assert.match(note.input[0].text, /starts at 2222222[\s\S]*is at 5555555[\s\S]*git fetch origin/);
+});
+
+test("`/agent stop` from someone with write access, on the issue or the pull request, stops the job and is never feedback", async () => {
+  const h = harness();
+  h.converse(41, "maya", "/agent stop");
+  h.clock.now += MIN;
+  h.label(41);
+  await h.engine().issues.sweep();
+  await h.settle();
+  const working = await h.only();
+  assert.equal(working.state, "working", "a stop written before the job started is not for it");
+  h.converse(41, "drive-by", "/agent stop");
+  await h.settle();
+  assert.equal((await h.only()).state, "working", "a user without write access cannot stop it");
+  h.converse(41, "lee", "/agent STOP please");
+  await h.settle();
+  const stopped = await h.only();
+  assert.equal(stopped.state, "stopped");
+  assert.equal(stopped.error, "stopped by @lee on GitHub");
+  assert.deepEqual(h.stopped, [working.threadId]);
+
+  const g = harness();
+  const { job, pr } = await g.toReview();
+  g.converse(pr, "maya", "/agent stop");
+  g.clock.now += FEEDBACK_QUIET_MS;
+  await g.settle();
+  assert.equal((await g.only()).state, "stopped");
+  assert.equal(g.sent.length, 0, "no round");
+  assert.deepEqual(g.stopped, [job.threadId]);
 });

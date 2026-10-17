@@ -75,8 +75,6 @@ export type IssueStore = {
    * records the accepted report, the pushed commit, and, once, when the change says the round finished.
    */
   write(id: JobId, version: number, change: Change, now: number): Job | null;
-  /** Open jobs in the repository that have a pull request, whose feedback the poller reads. */
-  withPullRequest(repo: RepoName): Job[];
   /** Stores feedback not seen before; an item already stored, sent or not, is left as it is. Returns how many were new. */
   addFeedback(repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number;
   /** Whether the item is stored already, sent or not. */
@@ -90,8 +88,8 @@ export type IssueStore = {
   repoPoll(repo: RepoName): { poll: unknown; polledAt: number | null; error: string | null };
   saveRepoPoll(repo: RepoName, poll: unknown, now: number, error: string | null): void;
   jobPoll(id: JobId): JobPoll;
-  /** A successful poll of the job's pull request: its new feedback, its state and the next cursor, in one transaction. */
-  recordPoll(id: JobId, poll: { cursor: unknown; prState: PullState; feedback: readonly Feedback[] }, now: number): void;
+  /** A successful poll of the job: its pull request's new feedback and state, and the next cursor, in one transaction. */
+  recordPoll(id: JobId, poll: { cursor: unknown; prState: PullState | null; feedback: readonly Feedback[] }, now: number): void;
   /** A failed poll keeps the last cursor and state, so the next poll starts where the last good one ended. */
   recordPollError(id: JobId, error: string, now: number): void;
 };
@@ -385,12 +383,6 @@ export function openIssueStore(db: Db): IssueStore {
       if (change.finishRound) db.prepare("UPDATE issue_rounds SET finished_at = ? WHERE job_id = ? AND ordinal = ? AND finished_at IS NULL").run(now, id, job.round);
       return job;
     }),
-    withPullRequest(repo) {
-      const rows = db
-        .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND pr_number IS NOT NULL AND state NOT IN (${placeholders(TERMINAL_LIST)}) ORDER BY created_at, id`)
-        .all(repo, ...TERMINAL_LIST) as JobRow[];
-      return rows.map(parse);
-    },
     addFeedback,
     hasFeedback(repo, ref) {
       return db.prepare("SELECT 1 FROM issue_feedback WHERE repo = ? AND kind = ? AND github_id = ?").get(repo, ref.kind, ref.id) !== undefined;
@@ -425,13 +417,14 @@ export function openIssueStore(db: Db): IssueStore {
         | undefined;
       return { cursor: row?.cursor_json ? JSON.parse(row.cursor_json) : null, prState: row?.pr_state ?? null, polledAt: row?.polled_at ?? null, error: row?.error ?? null };
     },
-    recordPoll: db.transaction((id: JobId, poll: { cursor: unknown; prState: PullState; feedback: readonly Feedback[] }, now: number) => {
+    recordPoll: db.transaction((id: JobId, poll: { cursor: unknown; prState: PullState | null; feedback: readonly Feedback[] }, now: number) => {
       const job = get(id);
-      if (!job?.pr) throw new Error(`issue job ${id} has no pull request to poll`);
+      if (!job) throw new Error(`no issue job ${id}`);
+      if (poll.feedback.length > 0 && !job.pr) throw new Error(`issue job ${id} has feedback but no pull request`);
       addFeedback(job.repo, poll.feedback.map((feedback) => ({ jobId: id, pr: job.pr!.number, feedback })));
       db.prepare(
         `INSERT INTO issue_job_polls (job_id, cursor_json, pr_state, polled_at, error) VALUES (?, ?, ?, ?, NULL)
-         ON CONFLICT (job_id) DO UPDATE SET cursor_json = excluded.cursor_json, pr_state = excluded.pr_state, polled_at = excluded.polled_at, error = NULL`,
+         ON CONFLICT (job_id) DO UPDATE SET cursor_json = excluded.cursor_json, pr_state = coalesce(excluded.pr_state, pr_state), polled_at = excluded.polled_at, error = NULL`,
       ).run(id, JSON.stringify(poll.cursor), poll.prState, now);
     }),
     recordPollError(id, error, now) {

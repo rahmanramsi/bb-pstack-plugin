@@ -14,7 +14,7 @@ import { z } from "zod";
 import type { HostPush } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
-import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type FeedbackCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
+import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
 import {
   CONCURRENCY,
   EFFECT_POLICY,
@@ -29,6 +29,7 @@ import {
   containsSha,
   isTransit,
   TRANSIT,
+  command,
   counts,
   moreFacts,
   isReasoningLevel,
@@ -609,26 +610,35 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   /**
-   * Polls each open job's pull request on its own, so one that GitHub cannot read holds back no other: it keeps its
-   * last cursor and state and records the error. Stores the feedback that counts: job.ts's rules pass, and its author
-   * has write access and is not the App.
+   * Polls each open job on its own, so one that GitHub cannot read holds back no other: it keeps its last cursor and
+   * pull request state and records the error. A `/agent stop` on the issue or the pull request stops the job. The
+   * pull request's feedback that counts is stored: job.ts's rules pass, and its author has write access and is not
+   * the App.
    */
-  async function pollFeedback(repo: RepoClient): Promise<void> {
-    const jobs = store.withPullRequest(repo.name);
+  async function pollJobs(repo: RepoClient): Promise<void> {
+    const jobs = store.list({ repo: repo.name, all: false });
     if (jobs.length === 0) return;
     const appLogin = await repo.appLogin();
+    const trusted = async (author: string) => author !== appLogin && CAN_TRIGGER.has(await repo.permission(author));
     await Promise.all(
       jobs.map(async (job) => {
         try {
-          const result = await repo.pullActivity(job.pr!.number, store.jobPoll(job.id).cursor as FeedbackCursor | null);
+          const target = { issue: job.issue, since: job.createdAt, pr: job.pr?.number ?? null };
+          const result = await repo.activity(target, store.jobPoll(job.id).cursor as ActivityCursor | null);
+          const comments = [...result.issueComments, ...(result.pull?.items.filter((item) => item.kind === "pr-comment") ?? [])];
+          let stopper: string | null = null;
+          for (const comment of comments) {
+            if (!stopper && command(comment.body) === "stop" && comment.createdAt >= job.createdAt && (await trusted(comment.author))) stopper = comment.author;
+          }
           const feedback: Feedback[] = [];
-          for (const item of result.items) {
-            if (!counts(item) || item.author === appLogin || !CAN_TRIGGER.has(await repo.permission(item.author))) continue;
+          for (const item of result.pull?.items ?? []) {
+            if (!counts(item) || !(await trusted(item.author))) continue;
             const { pr: _, reviewState: __, ...rest } = item;
             const parent = item.inReplyTo !== null && !store.hasFeedback(repo.name, item) ? await repo.reviewComment(item.inReplyTo) : null;
             feedback.push({ ...rest, parent });
           }
-          store.recordPoll(job.id, { cursor: result.next, prState: result.state, feedback }, clock());
+          store.recordPoll(job.id, { cursor: result.next, prState: result.pull?.state ?? null, feedback }, clock());
+          if (stopper) await stop(job.id, `@${stopper} on GitHub`);
         } catch (error) {
           store.recordPollError(job.id, message(error), clock());
         }
@@ -651,7 +661,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       errors.push(message(error));
     }
     try {
-      await pollFeedback(repo);
+      await pollJobs(repo);
     } catch (error) {
       errors.push(message(error));
     }

@@ -56,6 +56,14 @@ function setup(overrides: Partial<GitHubOptions> = {}) {
 
 const authOf = (request: Seen) => String(request.headers.authorization);
 
+/** Pull request 7's activity, read for issue 41, whose own comments are empty. */
+async function pullOf(repo: ReturnType<typeof setup>["repo"], cursor: Parameters<ReturnType<typeof setup>["repo"]["activity"]>[1]) {
+  routes["GET /repos/acme/web/issues/41/comments"] ??= () => ({ status: 200, json: [] });
+  const result = await repo.activity({ issue: 41, since: 0, pr: 7 }, cursor);
+  seen = seen.filter((request) => !request.path.startsWith("/repos/acme/web/issues/41/"));
+  return { state: result.pull!.state, items: result.pull!.items, next: result.next };
+}
+
 test("the App JWT is RS256 with GitHub's claims, and the installation token is cached until near expiry", async () => {
   const { repo, clock } = setup();
   routes["GET /repos/acme/web"] = () => ({ status: 200, json: { default_branch: "main" } });
@@ -243,7 +251,7 @@ test("feedback reads each pull request's inline comments, conversation comments,
   routes["GET /app"] = () => ({ status: 200, json: { slug: "pstack-dev" } });
   routes["GET /repos/acme/web/pulls/7/reviews/21/comments"] = () => ({ status: 200, json: inline.slice(0, 1) });
 
-  const first = await repo.pullActivity(7, null);
+  const first = await pullOf(repo, null);
   assert.equal(first.state, "open");
   assert.deepEqual(
     first.items.map((item) => [item.kind, item.id, item.reviewState]),
@@ -253,22 +261,22 @@ test("feedback reads each pull request's inline comments, conversation comments,
 
   seen = [];
   inline = [...inline, { ...inline[0]!, id: 13, body: "And this.", created_at: "2026-10-17T10:05:00Z", updated_at: "2026-10-17T10:05:00Z" }];
-  const second = await repo.pullActivity(7, first.next);
+  const second = await pullOf(repo, first.next);
   assert.match(seen.find((request) => request.path.startsWith("/repos/acme/web/pulls/7/comments"))!.path, /since=2026-10-17T09%3A50%3A00\.000Z/);
   assert.deepEqual(second.items.map((item) => item.id), [11, 13, 12], "items inside the overlap repeat; callers dedupe");
   assert.equal(second.items[1]!.reviewState, "CHANGES_REQUESTED", "a review answered 304 keeps its known state");
   assert.equal(second.state, "open", "a pull request answered 304 keeps its known state");
 
   seen = [];
-  const third = await repo.pullActivity(7, second.next);
+  const third = await pullOf(repo, second.next);
   assert.deepEqual(third.items.map((item) => item.id), [11, 13]);
   assert.deepEqual(seen.map((request) => request.headers["if-none-match"]), [undefined, '"i1"', '"r1"', '"p1"'], "a list whose since moved sends no stale tag");
 
   routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "closed", merged: true } });
-  const merged = await repo.pullActivity(7, second.next);
+  const merged = await pullOf(repo, second.next);
   assert.equal(merged.state, "merged");
   routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "closed", merged: false } });
-  assert.equal((await repo.pullActivity(7, merged.next)).state, "closed");
+  assert.equal((await pullOf(repo, merged.next)).state, "closed");
 });
 
 test("replies, review requests and pull request edits go to GitHub's endpoints; a reviewer GitHub refuses is dropped", async () => {
@@ -316,7 +324,7 @@ test("inline comments overlap the cursor, a new review's own comments are read, 
   routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "open" } });
   for (const id of [21, 22]) routes[`GET /repos/acme/web/pulls/7/reviews/${id}/comments`] = () => ({ status: 200, json: byReview[id] ?? [] });
 
-  const first = await repo.pullActivity(7, null);
+  const first = await pullOf(repo, null);
   assert.deepEqual(first.items.filter((item) => item.kind === "review-comment").map((item) => item.id), [11], "the comment of review 99, not listed yet, waits");
 
   const drafted = comment(13, 22, "2026-10-17T09:00:00Z", "lee");
@@ -324,10 +332,28 @@ test("inline comments overlap the cursor, a new review's own comments are read, 
   byReview[22] = [drafted];
   reviews = [...reviews, { id: 22, body: "", user: user("lee"), state: "CHANGES_REQUESTED", submitted_at: "2026-10-17T11:00:00Z" }, { id: 99, body: "", user: user("pstack-dev[bot]"), state: "COMMENTED", submitted_at: "2026-10-17T10:30:00Z" }];
   seen = [];
-  const second = await repo.pullActivity(7, first.next);
+  const second = await pullOf(repo, first.next);
   assert.match(seen.find((request) => request.path.startsWith("/repos/acme/web/pulls/7/comments?"))!.path, /since=2026-10-17T10%3A20%3A00\.000Z/, "ten minutes before the newest comment seen");
   const comments = second.items.filter((item) => item.kind === "review-comment");
   assert.deepEqual(comments.map((item) => [item.id, item.reviewState]), [[12, "COMMENTED"], [13, "CHANGES_REQUESTED"]], "the overlap re-reads the waiting comment, and review 22's drafted comment arrives through the review");
   assert.equal(comments[1]!.postedAt, Date.parse("2026-10-17T11:00:00Z"), "a review's comments count from its submission");
   assert.ok(!seen.some((request) => request.path.includes("/reviews/99/comments")), "the App's own review is not read");
+});
+
+test("a job's activity reads its issue's comments from when the job started, then from the cursor", async () => {
+  const { repo } = setup();
+  const comments = [
+    { id: 1, body: "/agent stop", user: { login: "maya" }, created_at: "2026-10-17T09:00:00Z", updated_at: "2026-10-17T09:00:00Z" },
+    { id: 2, body: "/agent stop", user: { login: "lee" }, created_at: "2026-10-17T11:00:00Z", updated_at: "2026-10-17T11:00:00Z" },
+  ];
+  routes["GET /repos/acme/web/issues/41/comments"] = (request) => {
+    const since = new URL(request.path, "http://x").searchParams.get("since");
+    return { status: 200, json: comments.filter((comment) => !since || comment.updated_at >= since) };
+  };
+  const first = await repo.activity({ issue: 41, since: Date.parse("2026-10-17T10:00:00Z"), pr: null }, null);
+  assert.deepEqual(first.issueComments, [{ id: 2, author: "lee", body: "/agent stop", createdAt: Date.parse("2026-10-17T11:00:00Z") }]);
+  assert.equal(first.pull, null, "no pull request yet, nothing else is read");
+  assert.equal(seen.filter((request) => request.path.includes("/pulls/")).length, 0);
+  await repo.activity({ issue: 41, since: 0, pr: null }, first.next);
+  assert.match(seen.at(-1)!.path, /since=2026-10-17T11%3A00%3A00Z/);
 });

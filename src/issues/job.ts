@@ -190,16 +190,22 @@ export type PolledFeedback = Omit<Feedback, "parent"> & { pr: number; reviewStat
 
 const COUNTED_REVIEWS: ReadonlySet<string> = new Set(["CHANGES_REQUESTED", "COMMENTED"]);
 const AGENT_COMMAND = /^\s*\/agent\b/i;
+const STOP_COMMAND = /^\s*\/agent\s+stop\b/i;
+
+/** The command a comment gives, whoever wrote it; only the poller knows whether its author may. */
+export function command(body: string): "stop" | null {
+  return STOP_COMMAND.test(body) ? "stop" : null;
+}
 
 /**
  * Whether polled feedback starts a round, before the author check. Conversation comments count only as `/agent`
- * commands; approved and dismissed reviews count for nothing, their inline comments included. A review without a
+ * requests, and `/agent stop` is a command, not feedback; approved and dismissed reviews count for nothing, their inline comments included. A review without a
  * body has nothing to answer: its inline comments arrive on their own.
  */
 export function counts(item: PolledFeedback): boolean {
   switch (item.kind) {
     case "pr-comment":
-      return AGENT_COMMAND.test(item.body);
+      return AGENT_COMMAND.test(item.body) && command(item.body) === null;
     case "review":
       return COUNTED_REVIEWS.has(item.reviewState ?? "") && item.body.trim() !== "";
     case "review-comment":
