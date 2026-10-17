@@ -515,6 +515,28 @@ test("a spawn that throws and never creates a thread sticks the job after the gr
   assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
 });
 
+test("stopping a job after a crash mid-spawn stops the thread the spawn created minutes earlier", async () => {
+  const h = harness();
+  h.label(41);
+  const spawning = h.holdAt("spawn", "sdk");
+  const sweeping = h.engine().issues.sweep();
+  await spawning.hit;
+  const [created] = [...h.threads.keys()];
+  h.restart();
+
+  h.clock.now += 5 * MIN;
+  const job = await h.only();
+  assert.equal(job.state, "starting");
+  assert.equal((await h.engine().run(["issues", "stop", job.id])).exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).state, "stopped");
+  assert.deepEqual(h.stopped, [created]);
+  assert.equal(h.spawned.length, 1);
+
+  spawning.free();
+  await sweeping;
+});
+
 test("a rejected report lists every reason and leaves the job working; a fixed report is accepted", async () => {
   const h = harness();
   h.label(41);

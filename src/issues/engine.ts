@@ -101,7 +101,7 @@ export function createIssues(deps: IssuesDeps): Issues {
 
   async function threadsNaming(job: Job): Promise<string[]> {
     const found: string[] = [];
-    const since = (("effects" in job.phase && job.phase.firstAt) || job.createdAt) - 60_000;
+    const since = job.createdAt - 60_000;
     for (let offset = 0; ; offset += 100) {
       const page = await bb.sdk.threads.list({ originPluginId: bb.pluginId, projectId: job.projectId, includeHidden: true, archived: false, limit: 100, offset });
       for (const thread of page) {
