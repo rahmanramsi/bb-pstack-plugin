@@ -123,6 +123,42 @@ export type EffectPatch = { threadId?: string; pushedSha?: Sha; pr?: { number: n
 
 export type IssueSnapshot = { title: string; body: string; url: string; author: string };
 
+export type FeedbackKind = "review" | "review-comment" | "pr-comment";
+/** What a reply answers. GitHub numbers reviews, inline comments and conversation comments separately. */
+export type FeedbackRef = { kind: FeedbackKind; id: number };
+/** A review body, an inline review comment, or an `/agent` comment on the job's pull request. */
+export type Feedback = FeedbackRef & {
+  author: string;
+  body: string;
+  path: string | null;
+  line: number | null;
+  diffHunk: string | null;
+  inReplyTo: number | null;
+  reviewId: number | null;
+  createdAt: number;
+};
+/** Feedback as polled, with the state of the review it is or belongs to, before the operator's rules filter it. */
+export type PolledFeedback = Feedback & { pr: number; reviewState: string | null };
+
+const COUNTED_REVIEWS: ReadonlySet<string> = new Set(["CHANGES_REQUESTED", "COMMENTED"]);
+const AGENT_COMMAND = /^\s*\/agent\b/i;
+
+/**
+ * Whether polled feedback starts a round, before the author check. Conversation comments count only as `/agent`
+ * commands; approved and dismissed reviews count for nothing, their inline comments included. A review without a
+ * body has nothing to answer: its inline comments arrive on their own.
+ */
+export function counts(item: PolledFeedback): boolean {
+  switch (item.kind) {
+    case "pr-comment":
+      return AGENT_COMMAND.test(item.body);
+    case "review":
+      return COUNTED_REVIEWS.has(item.reviewState ?? "") && item.body.trim() !== "";
+    case "review-comment":
+      return item.reviewState === null || COUNTED_REVIEWS.has(item.reviewState);
+  }
+}
+
 export type Phase =
   | { state: RestingState }
   | {

@@ -4,7 +4,7 @@
  * cache and the REST wire format stay in here. Callers see domain types and three error classes.
  */
 import { createHash, createPrivateKey, createSign } from "node:crypto";
-import { CONVENTIONAL_TITLE, type RepoName, type Sha } from "./job.ts";
+import { CONVENTIONAL_TITLE, type PolledFeedback, type RepoName, type Sha } from "./job.ts";
 
 export type GitHubCredentials = { appId: string; privateKey: string };
 
@@ -49,6 +49,9 @@ export type LabeledIssue = { number: number; title: string; body: string; url: s
 export type LabelEvent = { id: number; actor: string; at: number };
 /** Opaque to callers, who store it and hand it back. */
 export type PollCursor = { readonly __brand: "PollCursor" };
+/** Opaque to callers, like PollCursor: per pull request list cursors, ETags, and the last known review states. */
+export type FeedbackCursor = { readonly __brand: "FeedbackCursor" };
+export type PullState = "open" | "merged" | "closed";
 
 export type RepoClient = {
   readonly name: RepoName;
@@ -71,11 +74,23 @@ export type RepoClient = {
   findPull(branch: string): Promise<{ number: number; url: string } | null>;
   /** An issue comment by the App containing `marker`, posted at or after `since`. */
   findComment(issue: number, marker: string, since: number): Promise<{ id: number } | null>;
+  /** An inline review comment by the App on pull request `pr` containing `marker`, posted at or after `since`. */
+  findReviewComment(pr: number, marker: string, since: number): Promise<{ id: number } | null>;
+  /**
+   * Reviews, inline comments and conversation comments on each pull request since the cursor, and each one's state.
+   * Unchanged lists answer 304 and cost no rate limit. Items can repeat across calls; callers dedupe on the id.
+   */
+  feedback(cursor: FeedbackCursor | null, pulls: readonly number[]): Promise<{ items: PolledFeedback[]; pulls: { number: number; state: PullState }[]; next: FeedbackCursor }>;
   addLabels(issue: number, labels: readonly string[]): Promise<void>;
   /** A label that is not on the issue is success. */
   removeLabel(issue: number, label: string): Promise<void>;
   comment(issue: number, body: string): Promise<{ id: number }>;
   createDraftPull(input: { head: string; base: string; title: string; body: string }): Promise<{ number: number; url: string }>;
+  editPull(pr: number, input: { body: string }): Promise<void>;
+  /** Answers an inline review comment in its own thread. */
+  replyToReviewComment(pr: number, commentId: number, body: string): Promise<{ id: number }>;
+  /** Requests a review from each user who can be asked; a user GitHub refuses (422) is dropped, not an error. */
+  requestReviewers(pr: number, reviewers: readonly string[]): Promise<{ requested: string[]; dropped: string[] }>;
   /** A fresh token for this one repository with only `contents: write`, and the HTTPS remote. Revoke it after the push. */
   pushCredentials(): Promise<{ remoteUrl: string; token: string }>;
   revoke(token: string): Promise<void>;
@@ -87,7 +102,18 @@ export type GitHub = {
 };
 
 type Cursor = { since: string | null; etag: string | null };
+type PullCursor = {
+  reviewComments: Cursor | null;
+  comments: Cursor | null;
+  reviews: { etag: string | null; states: Record<string, string> } | null;
+  pull: { etag: string | null; state: PullState } | null;
+};
 type Cached<T> = { value: T; until: number };
+
+type RawUser = { login: string } | null;
+type RawReviewComment = { id: number; body: string; user: RawUser; path: string; line: number | null; original_line?: number | null; diff_hunk: string; in_reply_to_id?: number; pull_request_review_id: number | null; created_at: string; updated_at: string };
+type RawComment = { id: number; body: string | null; user: RawUser; created_at: string; updated_at: string };
+type RawReview = { id: number; body: string | null; user: RawUser; state: string; submitted_at?: string | null };
 
 const PERMISSION_TTL = 10 * 60_000;
 const REPO_TTL = 60 * 60_000;
@@ -255,6 +281,24 @@ export function createGitHub(options: GitHubOptions): GitHub {
     }
   }
 
+  /**
+   * A list read with the cursor's ETag. Null on 304. With `since`, the cursor moves to the newest `updated_at` seen; a
+   * new `since` makes a new URL, so the old tag would never match and is dropped. Without `since`, a list longer than
+   * one page keeps no tag: its first page stays the same while a later one grows.
+   */
+  async function list<T>(auth: Auth, path: string, query: Record<string, string>, cursor: Cursor | null, since: boolean): Promise<{ items: T[]; next: Cursor } | null> {
+    const params = new URLSearchParams({ ...query, per_page: "100" });
+    if (since && cursor?.since) params.set("since", cursor.since);
+    const url = `${path}?${params}`;
+    const first = await request(auth, "GET", url, { etag: cursor?.etag ?? null });
+    if (first.status === 304) return null;
+    const items = await pages<T>(auth, url, first);
+    const previous = cursor?.since ?? null;
+    const newest = since ? (items.map((item) => (item as { updated_at?: string }).updated_at ?? "").sort().at(-1) || previous) : null;
+    const keep = since ? newest === previous : nextLink(first.headers) === null;
+    return { items, next: { since: newest, etag: keep ? first.headers.get("etag") : null } };
+  }
+
   async function cached<T>(key: string, ttl: number, load: () => Promise<T>): Promise<T> {
     credentials();
     const hit = cache.get(key);
@@ -275,20 +319,13 @@ export function createGitHub(options: GitHubOptions): GitHub {
       name,
       appLogin,
       async labeledIssues(label, cursor) {
-        const previous = cursor as unknown as Cursor | null;
-        const query = new URLSearchParams({ labels: label, state: "open", sort: "updated", direction: "asc", per_page: "100" });
-        if (previous?.since) query.set("since", previous.since);
-        const path = `${base}/issues?${query}`;
-        const first = await request(auth, "GET", path, { etag: previous?.etag ?? null });
-        if (first.status === 304) return { changed: false };
-        const raw = await pages<{ number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; pull_request?: unknown }>(auth, path, first);
-        const issues = raw
+        type RawIssue = { number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; pull_request?: unknown };
+        const read = await list<RawIssue>(auth, `${base}/issues`, { labels: label, state: "open", sort: "updated", direction: "asc" }, cursor as unknown as Cursor | null, true);
+        if (!read) return { changed: false };
+        const issues = read.items
           .filter((item) => item.pull_request === undefined)
           .map((item) => ({ number: item.number, title: item.title, body: item.body ?? "", url: item.html_url, author: item.user.login, updatedAt: Date.parse(item.updated_at) }));
-        const newest = raw.map((item) => item.updated_at).sort().at(-1) ?? previous?.since ?? null;
-        // The ETag belongs to the URL it came from; a new `since` makes a new URL, so the old tag would never match.
-        const etag = newest === (previous?.since ?? null) ? first.headers.get("etag") : null;
-        return { changed: true, issues, next: { since: newest, etag } as unknown as PollCursor };
+        return { changed: true, issues, next: read.next as unknown as PollCursor };
       },
       async latestLabelEvent(issue, label) {
         const events = await pages<{ id: number; event: string; label?: { name: string }; actor: { login: string } | null; created_at: string }>(
@@ -335,6 +372,68 @@ export function createGitHub(options: GitHubOptions): GitHub {
         const found = comments.find((comment) => comment.user?.login === login && comment.body.includes(marker));
         return found ? { id: found.id } : null;
       },
+      async findReviewComment(pr, marker, since) {
+        const login = await appLogin();
+        const comments = await pages<{ id: number; body: string; user: RawUser }>(auth, `${base}/pulls/${pr}/comments?since=${new Date(since).toISOString()}&per_page=100`);
+        const found = comments.find((comment) => comment.user?.login === login && comment.body.includes(marker));
+        return found ? { id: found.id } : null;
+      },
+      async feedback(cursor, pulls) {
+        const previous = (cursor as unknown as Record<string, PullCursor> | null) ?? {};
+        const items: PolledFeedback[] = [];
+        const states: { number: number; state: PullState }[] = [];
+        const next: Record<string, PullCursor> = {};
+        const author = (user: RawUser) => user?.login ?? "ghost";
+        for (const pr of pulls) {
+          const was = previous[pr] ?? { reviewComments: null, comments: null, reviews: null, pull: null };
+          // Comments before reviews: a comment's review exists by the time the comment is listed, so the review list
+          // read after it knows that review's state.
+          const inline = await list<RawReviewComment>(auth, `${base}/pulls/${pr}/comments`, { sort: "updated", direction: "asc" }, was.reviewComments, true);
+          const conversation = await list<RawComment>(auth, `${base}/issues/${pr}/comments`, { sort: "updated", direction: "asc" }, was.comments, true);
+          const reviews = await list<RawReview>(auth, `${base}/pulls/${pr}/reviews`, {}, was.reviews && { since: null, etag: was.reviews.etag }, false);
+          const reviewStates = reviews ? Object.fromEntries(reviews.items.map((review) => [review.id, review.state])) : (was.reviews?.states ?? {});
+          const pull = await request(auth, "GET", `${base}/pulls/${pr}`, { etag: was.pull?.etag ?? null });
+          let state: PullState;
+          if (pull.status === 304 && was.pull) state = was.pull.state;
+          else if (pull.status === 200) {
+            const json = pull.json as { state: string; merged?: boolean; merged_at?: string | null };
+            state = json.state === "open" ? "open" : json.merged || json.merged_at ? "merged" : "closed";
+          } else throw failure("GET", `${base}/pulls/${pr}`, pull);
+
+          const none = { path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null };
+          for (const comment of inline?.items ?? []) {
+            items.push({
+              kind: "review-comment",
+              id: comment.id,
+              pr,
+              author: author(comment.user),
+              body: comment.body,
+              path: comment.path,
+              line: comment.line ?? comment.original_line ?? null,
+              diffHunk: comment.diff_hunk,
+              inReplyTo: comment.in_reply_to_id ?? null,
+              reviewId: comment.pull_request_review_id,
+              createdAt: Date.parse(comment.created_at),
+              reviewState: comment.pull_request_review_id === null ? null : (reviewStates[comment.pull_request_review_id] ?? null),
+            });
+          }
+          for (const comment of conversation?.items ?? []) {
+            items.push({ kind: "pr-comment", id: comment.id, pr, author: author(comment.user), body: comment.body ?? "", ...none, createdAt: Date.parse(comment.created_at), reviewState: null });
+          }
+          for (const review of reviews?.items ?? []) {
+            if (!review.submitted_at) continue;
+            items.push({ kind: "review", id: review.id, pr, author: author(review.user), body: review.body ?? "", ...none, createdAt: Date.parse(review.submitted_at), reviewState: review.state });
+          }
+          states.push({ number: pr, state });
+          next[pr] = {
+            reviewComments: inline?.next ?? was.reviewComments,
+            comments: conversation?.next ?? was.comments,
+            reviews: reviews ? { etag: reviews.next.etag, states: reviewStates } : was.reviews,
+            pull: { etag: pull.status === 200 ? pull.headers.get("etag") : (was.pull?.etag ?? null), state },
+          };
+        }
+        return { items, pulls: states, next: next as unknown as FeedbackCursor };
+      },
       async addLabels(issue, labels) {
         await call(auth, "POST", `${base}/issues/${issue}/labels`, { body: { labels } });
       },
@@ -347,6 +446,22 @@ export function createGitHub(options: GitHubOptions): GitHub {
       async createDraftPull(input) {
         const { json } = await call<{ number: number; html_url: string }>(auth, "POST", `${base}/pulls`, { body: { ...input, draft: true } });
         return { number: json.number, url: json.html_url };
+      },
+      async editPull(pr, input) {
+        await call(auth, "PATCH", `${base}/pulls/${pr}`, { body: input });
+      },
+      async replyToReviewComment(pr, commentId, body) {
+        return { id: (await call<{ id: number }>(auth, "POST", `${base}/pulls/${pr}/comments/${commentId}/replies`, { body: { body } })).json.id };
+      },
+      async requestReviewers(pr, reviewers) {
+        const ask = async (users: readonly string[]) =>
+          (await call(auth, "POST", `${base}/pulls/${pr}/requested_reviewers`, { body: { reviewers: users }, ok: [422] })).status !== 422;
+        if (reviewers.length === 0 || (await ask(reviewers))) return { requested: [...reviewers], dropped: [] };
+        // GitHub refuses the whole request when one reviewer cannot be asked, without saying which.
+        const requested: string[] = [];
+        const dropped: string[] = [];
+        for (const reviewer of reviewers) ((await ask([reviewer])) ? requested : dropped).push(reviewer);
+        return { requested, dropped };
       },
       async pushCredentials() {
         const { token } = await mintToken(name, signal, { repositories: [name.split("/")[1]], permissions: { contents: "write" } });

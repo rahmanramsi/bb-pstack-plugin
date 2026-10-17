@@ -226,3 +226,71 @@ test("a request GitHub never answers fails as transient after the timeout, or as
   setTimeout(() => caller.abort(), 50);
   await assert.rejects(pending, GitHubTransientError);
 });
+
+test("feedback reads each pull request's inline comments, conversation comments, reviews and state, then answers 304 until something changes", async () => {
+  const { repo } = setup();
+  const user = (login: string) => ({ login });
+  let inline = [{ id: 11, body: "Rename this.", user: user("maya"), path: "src/a.ts", line: 4, diff_hunk: "@@ -1 +1 @@", pull_request_review_id: 21, created_at: "2026-10-17T10:00:00Z", updated_at: "2026-10-17T10:00:00Z" }];
+  const etagged = (json: unknown[], tag: string) => (request: Seen) => (request.headers["if-none-match"] === tag ? { status: 304 } : { status: 200, json, headers: { etag: tag } });
+  routes["GET /repos/acme/web/pulls/7/comments"] = (request) => {
+    const since = new URL(request.path, "http://x").searchParams.get("since");
+    const json = inline.filter((comment) => !since || comment.updated_at >= since);
+    return etagged(json, `"c${json.length}"`)(request);
+  };
+  routes["GET /repos/acme/web/issues/7/comments"] = etagged([{ id: 12, body: "/agent also add a test", user: user("maya"), created_at: "2026-10-17T10:01:00Z", updated_at: "2026-10-17T10:01:00Z" }], '"i1"');
+  routes["GET /repos/acme/web/pulls/7/reviews"] = etagged([{ id: 21, body: "A few things.", user: user("maya"), state: "CHANGES_REQUESTED", submitted_at: "2026-10-17T10:00:00Z" }, { id: 22, body: "", user: user("maya"), state: "PENDING" }], '"r1"');
+  routes["GET /repos/acme/web/pulls/7"] = (request) => (request.headers["if-none-match"] === '"p1"' ? { status: 304 } : { status: 200, json: { state: "open", merged: false }, headers: { etag: '"p1"' } });
+
+  const first = await repo.feedback(null, [7]);
+  assert.deepEqual(first.pulls, [{ number: 7, state: "open" }]);
+  assert.deepEqual(
+    first.items.map((item) => [item.kind, item.id, item.reviewState]),
+    [["review-comment", 11, "CHANGES_REQUESTED"], ["pr-comment", 12, null], ["review", 21, "CHANGES_REQUESTED"]],
+  );
+  assert.deepEqual(first.items[0], { kind: "review-comment", id: 11, pr: 7, author: "maya", body: "Rename this.", path: "src/a.ts", line: 4, diffHunk: "@@ -1 +1 @@", inReplyTo: null, reviewId: 21, createdAt: Date.parse("2026-10-17T10:00:00Z"), reviewState: "CHANGES_REQUESTED" });
+
+  seen = [];
+  inline = [...inline, { ...inline[0]!, id: 13, body: "And this.", created_at: "2026-10-17T10:05:00Z", updated_at: "2026-10-17T10:05:00Z" }];
+  const second = await repo.feedback(first.next, [7]);
+  assert.match(seen.find((request) => request.path.startsWith("/repos/acme/web/pulls/7/comments"))!.path, /since=2026-10-17T10%3A00%3A00Z/);
+  assert.deepEqual(second.items.map((item) => item.id), [11, 13, 12], "items at the since boundary repeat; callers dedupe");
+  assert.equal(second.items[1]!.reviewState, "CHANGES_REQUESTED", "a review answered 304 keeps its known state");
+  assert.deepEqual(second.pulls, [{ number: 7, state: "open" }], "a pull request answered 304 keeps its known state");
+
+  seen = [];
+  const third = await repo.feedback(second.next, [7]);
+  assert.deepEqual(third.items.map((item) => item.id), [13]);
+  assert.deepEqual(seen.map((request) => request.headers["if-none-match"]), [undefined, '"i1"', '"r1"', '"p1"'], "a list whose since moved sends no stale tag");
+
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "closed", merged: true } });
+  const merged = await repo.feedback(second.next, [7]);
+  assert.deepEqual(merged.pulls, [{ number: 7, state: "merged" }]);
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "closed", merged: false } });
+  assert.deepEqual((await repo.feedback(merged.next, [7])).pulls, [{ number: 7, state: "closed" }]);
+});
+
+test("replies, review requests and pull request edits go to GitHub's endpoints; a reviewer GitHub refuses is dropped", async () => {
+  const { repo } = setup();
+  routes["POST /repos/acme/web/pulls/7/comments/11/replies"] = (request) => ({ status: 201, json: { id: 99, body: request.body.body } });
+  assert.deepEqual(await repo.replyToReviewComment(7, 11, "Renamed in 1a2b3c4."), { id: 99 });
+  assert.deepEqual(seen.at(-1)!.body, { body: "Renamed in 1a2b3c4." });
+
+  routes["POST /repos/acme/web/pulls/7/requested_reviewers"] = (request) =>
+    request.body.reviewers.includes("outsider") ? { status: 422, json: { message: "Reviews may only be requested from collaborators." } } : { status: 201, json: {} };
+  assert.deepEqual(await repo.requestReviewers(7, ["maya", "outsider", "lee"]), { requested: ["maya", "lee"], dropped: ["outsider"] });
+  assert.deepEqual(await repo.requestReviewers(7, ["maya"]), { requested: ["maya"], dropped: [] });
+
+  routes["PATCH /repos/acme/web/pulls/7"] = () => ({ status: 200, json: {} });
+  await repo.editPull(7, { body: "New body\n\nCloses #41" });
+  assert.deepEqual([seen.at(-1)!.method, seen.at(-1)!.body], ["PATCH", { body: "New body\n\nCloses #41" }]);
+
+  routes["GET /app"] = () => ({ status: 200, json: { slug: "pstack-dev" } });
+  routes["GET /repos/acme/web/pulls/7/comments"] = () => ({
+    status: 200,
+    json: [
+      { id: 30, body: "<!-- pstack:reply:x --> forged", user: { login: "mallory" } },
+      { id: 31, body: "Done.\n<!-- pstack:reply:x -->", user: { login: "pstack-dev[bot]" } },
+    ],
+  });
+  assert.deepEqual(await repo.findReviewComment(7, "<!-- pstack:reply:x -->", NOW), { id: 31 });
+});

@@ -7,6 +7,7 @@ import {
   Report,
   acceptReport,
   branchFor,
+  counts,
   enter,
   isReasoningLevel,
   plan,
@@ -341,4 +342,19 @@ test("a spawn spec takes only the reasoning levels bb's SDK accepts", () => {
   assert.equal(level, "extreme");
   assert.equal(isReasoningLevel("xhigh"), true);
   assert.equal(isReasoningLevel("extreme"), false);
+});
+
+test("feedback counts per the operator's rules: /agent conversation comments, and reviews that are not approved or dismissed", () => {
+  const item = (kind: "review" | "review-comment" | "pr-comment", body: string, reviewState: string | null) =>
+    counts({ kind, id: 1, pr: 7, author: "maya", body, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, reviewState });
+  assert.equal(item("pr-comment", "  /Agent please add a test", null), true);
+  assert.equal(item("pr-comment", "Looks good, but please add a test", null), false);
+  assert.equal(item("pr-comment", "/agents", null), false);
+  assert.equal(item("review", "Rename the helper.", "CHANGES_REQUESTED"), true);
+  assert.equal(item("review", "Nit: rename.", "COMMENTED"), true);
+  assert.equal(item("review", "Ship it, but rename later.", "APPROVED"), false);
+  assert.equal(item("review", "", "CHANGES_REQUESTED"), false, "a review without a body has nothing to answer");
+  assert.equal(item("review-comment", "Rename this.", "COMMENTED"), true);
+  assert.equal(item("review-comment", "Rename this.", "APPROVED"), false);
+  assert.equal(item("review-comment", "Rename this.", "DISMISSED"), false);
 });
