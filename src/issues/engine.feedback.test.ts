@@ -174,3 +174,26 @@ for (const point of ROUND_CRASH_POINTS) {
     await inflight;
   });
 }
+
+test("a feedback round's report follows the round contract: replies are required, and a pull request title or a question is a schema error", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  const reply = { kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." };
+  for (const bad of [
+    roundReport([reply], { pr: { title: "fix(login): rename x", body: "## Why\nRenamed." } }),
+    { outcome: "no-change", verification: ["read it"], summary: "Explained." },
+    { outcome: "needs-info", questions: ["Which x?"], replies: [reply], verification: ["read it"] },
+  ]) {
+    const refused = await h.report(job.threadId!, bad, { headSha: SHA3 });
+    assert.equal(refused.exitCode, 1);
+    assert.match(refused.stderr!, /does not match the contract/, JSON.stringify(bad));
+  }
+  const still = await h.only();
+  assert.equal(still.state, "addressing");
+  assert.equal(still.error, null, "schema errors are not rejections");
+  assert.equal((await h.report(job.threadId!, roundReport([reply]), { headSha: SHA3 })).exitCode, 0);
+});

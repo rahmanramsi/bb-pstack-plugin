@@ -4,7 +4,9 @@ import { AGENT_BRANCH } from "../host-contract.ts";
 import {
   EFFECT_POLICY,
   MAX_EFFECT_TRIES,
-  Report,
+  InitialReport,
+  RoundReport,
+  parseReport,
   TRANSIT,
   acceptReport,
   branchFor,
@@ -230,22 +232,25 @@ test("stop replaces a pending outbox, stops a worker that may exist, and is null
   for (const state of ["done", "stopped", "stuck", "ignored"] as const) assert.equal(stop(job({ phase: { state } }), "maya"), null);
 });
 
-const REPORT = Report.parse({
+const first = (value: unknown) => ({ round: "initial", report: InitialReport.parse(value) }) as const;
+const later = (value: unknown) => ({ round: "feedback", report: RoundReport.parse(value) }) as const;
+
+const REPORT = InitialReport.parse({
   outcome: "changes",
   pr: { title: "fix(login): keep the submit button above the footer", body: "## Why\nThe footer covered the button on small screens.\n\nFixes #41, thanks @maya." },
   verification: ["npm test -- login: 14 passed"],
   summary: "Footer overlap fixed.",
-}) as Extract<Report, { outcome: "changes" }>;
+}) as Extract<InitialReport, { outcome: "changes" }>;
 
 const reasonsOf = (verdict: ReturnType<typeof acceptReport>) => (verdict.ok ? [] : verdict.reasons);
 
 function reportFacts(overrides: Partial<ReportFacts> = {}): ReportFacts {
-  return { now: NOW, worktree: { headSha: HEAD, dirty: false }, newCommit: true, gate: { pass: true }, titleConvention: "conventional", listed: [], ...overrides };
+  return { now: NOW, worktree: { headSha: HEAD, dirty: false, ahead: 1 }, gate: { pass: true }, titleConvention: "conventional", listed: [], ...overrides };
 }
 
 test("an accepted changes report publishes the reported commit: push, draft PR, PR label, issue relabel", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w", deadline: NOW + MIN, rejections: 1 });
-  const verdict = acceptReport(working, REPORT, reportFacts());
+  const verdict = acceptReport(working, first(REPORT), reportFacts());
   assert.ok(verdict.ok);
   const published = apply(working, verdict.change);
   assert.equal(published.phase.state, "publishing");
@@ -262,42 +267,41 @@ test("an accepted changes report publishes the reported commit: push, draft PR, 
 
 test("needs-info and no-change reports post on the issue and must not add commits", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
-  const asking = acceptReport(working, Report.parse({ outcome: "needs-info", questions: ["Should @design approve the new spacing?"], verification: ["read the layout code"] }), reportFacts({ newCommit: false }));
+  const asking = acceptReport(working, first({ outcome: "needs-info", questions: ["Should @design approve the new spacing?"], verification: ["read the layout code"] }), reportFacts({ worktree: { headSha: HEAD, dirty: false, ahead: 0 } }));
   assert.ok(asking.ok);
   assert.ok(asking.change.phase && "effects" in asking.change.phase);
   assert.equal(asking.change.phase.state, "asking");
   assert.deepEqual(asking.change.phase.effects[0], { op: "comment", key: `comment:${working.id}:questions`, body: "- Should `@design` approve the new spacing?" });
 
-  const closing = acceptReport(working, Report.parse({ outcome: "no-change", summary: "Already fixed in 1.4.", verification: ["checked main"] }), reportFacts({ newCommit: true }));
+  const closing = acceptReport(working, first({ outcome: "no-change", summary: "Already fixed in 1.4.", verification: ["checked main"] }), reportFacts());
   assert.equal(closing.ok, false);
   assert.match(reasonsOf(closing)[0]!, /must not add commits/);
 });
 
 test("a report is rejected with every reason, and the second rejection sticks the job", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
-  const bad = Report.parse({
+  const bad = first({
     outcome: "changes",
     pr: { title: "Fixed it", body: "I ran /poteto-mode and closed the checklist." },
-    replies: [{ kind: "review-comment", commentId: 7, body: "done" }],
     verification: ["npm test"],
     summary: "s",
   });
-  const verdict = acceptReport(working, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true }, newCommit: false, gate: { pass: false, reason: "2 open steps block the pr gate." } }));
+  const verdict = acceptReport(working, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true, ahead: 0 }, gate: { pass: false, reason: "2 open steps block the pr gate." } }));
   assert.equal(verdict.ok, false);
   const reasons = reasonsOf(verdict).join("\n");
-  for (const expected of [/uncommitted/, /needs a new commit/, /gate pr` fails: 2 open steps/, /not listed.*review-comment 7/, /10 to 72/, /Conventional Commits/, /describes the process \("\/poteto-mode"\)/]) {
+  for (const expected of [/uncommitted/, /needs a new commit/, /gate pr` fails: 2 open steps/, /10 to 72/, /Conventional Commits/, /describes the process \("\/poteto-mode"\)/]) {
     assert.match(reasons, expected);
   }
   assert.deepEqual(verdict.change, { rejections: 1, error: `report rejected: ${reasonsOf(verdict).join("; ")}` });
 
-  const second = acceptReport({ ...working, rejections: 1 }, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true } }));
+  const second = acceptReport({ ...working, rejections: 1 }, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true, ahead: 1 } }));
   assert.equal(second.change.phase?.state, "sticking");
   assert.equal(second.change.rejections, 2);
 });
 
 test("process phrases are rejected but ordinary words that contain them pass", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
-  const withBody = (body: string) => acceptReport(working, { ...REPORT, pr: { ...REPORT.pr, body } }, reportFacts());
+  const withBody = (body: string) => acceptReport(working, first({ ...REPORT, pr: { ...REPORT.pr, body } }), reportFacts());
   for (const body of ["Use a thread pool for uploads.", "Send the user agent header.", "Round the timestamp to seconds.", "The gate closes when the queue drains."]) {
     assert.ok(withBody(body).ok, body);
   }
@@ -308,7 +312,7 @@ test("process phrases are rejected but ordinary words that contain them pass", (
 
 test("free title conventions accept any 10 to 72 character line", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
-  assert.ok(acceptReport(working, { ...REPORT, pr: { ...REPORT.pr, title: "Keep the submit button visible" } }, reportFacts({ titleConvention: "free" })).ok);
+  assert.ok(acceptReport(working, first({ ...REPORT, pr: { ...REPORT.pr, title: "Keep the submit button visible" } }), reportFacts({ titleConvention: "free" })).ok);
 });
 
 test("the PR body keeps code untouched and strips every closing keyword form", () => {
@@ -472,7 +476,7 @@ test("a running round times out, nudges and sticks like the first one", () => {
   assert.equal((plan({ ...addressing, deadline: NOW }, facts({ ...open, thread: { kind: "active" } })) as { change: Change }).change.phase?.state, "sticking");
 });
 
-const ROUND_FACTS = (overrides: Partial<ReportFacts> = {}) => reportFacts({ worktree: { headSha: NEXT, dirty: false }, listed: [reviewBody, inline(1, NOW - 5 * MIN)], gate: { pass: false, reason: "3 open steps" }, ...overrides });
+const ROUND_FACTS = (overrides: Partial<ReportFacts> = {}) => reportFacts({ worktree: { headSha: NEXT, dirty: false, ahead: 2 }, listed: [reviewBody, inline(1, NOW - 5 * MIN)], gate: { pass: false, reason: "3 open steps" }, ...overrides });
 const REPLIES = [
   { kind: "review", commentId: 500, body: "Renamed both helpers in ccccccc." },
   { kind: "review-comment", commentId: 1, body: "Renamed to `parseInput` in ccccccc, cc @lee." },
@@ -480,7 +484,7 @@ const REPLIES = [
 
 test("a feedback round's changes report pushes on top of the pushed commit, answers every item, edits the body, and re-requests review, in that order", () => {
   const addressing = inReview({ phase: { state: "addressing" }, round: 2 });
-  const report = Report.parse({ outcome: "changes", pr: { title: "ignored after the first round", body: "## Why\nRenamed helpers." }, replies: REPLIES, verification: ["npm test: 15 passed"], summary: "Renamed the helpers." });
+  const report = later({ outcome: "changes", pr: { body: "## Why\nRenamed helpers." }, replies: REPLIES, verification: ["npm test: 15 passed"], summary: "Renamed the helpers." });
   const verdict = acceptReport(addressing, report, ROUND_FACTS());
   assert.ok(verdict.ok, reasonsOf(verdict).join("; "));
   const republishing = apply(addressing, verdict.change);
@@ -496,7 +500,7 @@ test("a feedback round's changes report pushes on top of the pushed commit, answ
   ]);
   assert.equal(TRANSIT_OF(republishing), "review");
 
-  const noChange = acceptReport(addressing, Report.parse({ outcome: "no-change", replies: REPLIES, verification: ["read the code"], summary: "Explained the naming." }), ROUND_FACTS({ newCommit: false, worktree: { headSha: PUSHED, dirty: false } }));
+  const noChange = acceptReport(addressing, later({ outcome: "no-change", replies: REPLIES, verification: ["read the code"], summary: "Explained the naming." }), ROUND_FACTS({ worktree: { headSha: PUSHED, dirty: false, ahead: 1 } }));
   assert.ok(noChange.ok);
   const replying = apply(addressing, noChange.change);
   assert.ok("effects" in replying.phase);
@@ -504,26 +508,26 @@ test("a feedback round's changes report pushes on top of the pushed commit, answ
   assert.deepEqual(replying.phase.effects.map((effect) => effect.op), ["reply", "reply", "request-review", "labels"]);
 });
 
-test("a feedback round's report must answer exactly the listed items, add a commit only with changes, and never ask for info", () => {
+test("a feedback round's report must answer exactly the listed items, add a commit only with changes, and follow the round's contract", () => {
   const addressing = inReview({ phase: { state: "addressing" }, round: 2 });
-  const changes = (replies: readonly unknown[]) => Report.parse({ outcome: "changes", replies, verification: ["npm test"], summary: "s" });
+  const changes = (replies: readonly unknown[]) => later({ outcome: "changes", replies, verification: ["npm test"], summary: "s" });
 
   assert.ok(acceptReport(addressing, changes(REPLIES), ROUND_FACTS()).ok, "the gate and the pull request title are first-round checks");
   const partial = reasonsOf(acceptReport(addressing, changes([REPLIES[0], { kind: "pr-comment", commentId: 1, body: "x" }]), ROUND_FACTS())).join("\n");
   assert.match(partial, /missing: review-comment 1/);
   assert.match(partial, /not listed, remove their replies: pr-comment 1/);
   assert.match(reasonsOf(acceptReport(addressing, changes([...REPLIES, REPLIES[1]]), ROUND_FACTS())).join("\n"), /repeated: review-comment 1/);
-  assert.match(reasonsOf(acceptReport(addressing, changes(REPLIES), ROUND_FACTS({ newCommit: false }))).join("\n"), /needs a new commit on top of the pushed commit/);
-  const noChange = Report.parse({ outcome: "no-change", replies: REPLIES, verification: ["read it"], summary: "s" });
+  assert.match(reasonsOf(acceptReport(addressing, changes(REPLIES), ROUND_FACTS({ worktree: { headSha: PUSHED, dirty: false, ahead: 1 } }))).join("\n"), /needs a new commit on top of the pushed commit/);
+  const noChange = later({ outcome: "no-change", replies: REPLIES, verification: ["read it"], summary: "s" });
   assert.match(reasonsOf(acceptReport(addressing, noChange, ROUND_FACTS())).join("\n"), /`no-change` must not add commits/);
-  const asking = Report.parse({ outcome: "needs-info", questions: ["Which helper?"], replies: REPLIES, verification: ["read it"] });
-  assert.match(reasonsOf(acceptReport(addressing, asking, ROUND_FACTS({ newCommit: false }))).join("\n"), /`needs-info` is not an outcome in a feedback round/);
   const process = changes([REPLIES[0], { kind: "review-comment", commentId: 1, body: "Done in this round." }]);
   assert.match(reasonsOf(acceptReport(addressing, process, ROUND_FACTS())).join("\n"), /reply to review-comment 1 describes the process \("this round"\)/);
-  const badBody = Report.parse({ outcome: "changes", pr: { body: "Ran the playbook." }, replies: REPLIES, verification: ["npm test"], summary: "s" });
+  const badBody = later({ outcome: "changes", pr: { body: "Ran the playbook." }, replies: REPLIES, verification: ["npm test"], summary: "s" });
   assert.match(reasonsOf(acceptReport(addressing, badBody, ROUND_FACTS())).join("\n"), /body describes the process/);
 
-  const first = job({ phase: { state: "working" }, threadId: "thr_w" });
-  const titleless = Report.parse({ outcome: "changes", verification: ["npm test"], summary: "s" });
-  assert.match(reasonsOf(acceptReport(first, titleless, reportFacts())).join("\n"), /first `changes` report needs `pr.title` and `pr.body`/);
+  const working = job({ phase: { state: "working" }, threadId: "thr_w" });
+  assert.equal(parseReport(working, { outcome: "changes", verification: ["npm test"], summary: "s" }).ok, false, "the first round's changes need pr.title and pr.body");
+  assert.equal(parseReport(addressing, { outcome: "needs-info", questions: ["Which helper?"], replies: REPLIES, verification: ["read it"] }).ok, false, "a question goes in a reply");
+  assert.equal(parseReport(addressing, { outcome: "changes", pr: { title: "fix: x is renamed", body: "b" }, replies: REPLIES, verification: ["npm test"], summary: "s" }).ok, false, "the title is set once");
+  assert.equal(parseReport(addressing, { outcome: "no-change", verification: ["read it"], summary: "s" }).ok, false, "replies are required");
 });

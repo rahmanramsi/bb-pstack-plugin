@@ -517,49 +517,48 @@ export function enter(state: TransitState, effects: readonly Effect[]): Phase {
 }
 
 const Line = z.string().trim().min(1);
-const Replies = z
-  .array(z.strictObject({ kind: z.enum(["review", "review-comment", "pr-comment"]), commentId: z.number().int().positive(), body: Line }))
-  .default([]);
 const Verification = z.array(Line).min(1, "list at least one check you ran and its result");
+const Reply = z.strictObject({ kind: z.enum(["review", "review-comment", "pr-comment"]), commentId: z.number().int().positive(), body: Line });
 
-/**
- * What the worker writes to the file it passes to `bb pstack issues report --file`. The first round needs `pr.title`
- * and `pr.body`; later rounds ignore the title and replace the description only when `pr.body` is set.
- */
-export const Report = z.discriminatedUnion("outcome", [
-  z.strictObject({
-    outcome: z.literal("changes"),
-    pr: z.strictObject({ title: z.string(), body: z.string() }).partial().optional(),
-    replies: Replies,
-    verification: Verification,
-    summary: Line,
-  }),
-  z.strictObject({ outcome: z.literal("no-change"), replies: Replies, verification: Verification, summary: Line }),
-  z.strictObject({
-    outcome: z.literal("needs-info"),
-    questions: z.array(Line).min(1).max(10),
-    replies: Replies,
-    verification: Verification,
-    summary: Line.optional(),
-  }),
+/** The first round's report, which the worker writes to the file it passes to `bb pstack issues report --file`. */
+export const InitialReport = z.discriminatedUnion("outcome", [
+  z.strictObject({ outcome: z.literal("changes"), pr: z.strictObject({ title: z.string(), body: z.string() }), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("no-change"), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("needs-info"), questions: z.array(Line).min(1).max(10), verification: Verification, summary: Line.optional() }),
 ]);
-export type Report = z.infer<typeof Report>;
+export type InitialReport = z.infer<typeof InitialReport>;
+
+/** A feedback round's report. `pr.body`, when set, replaces the pull request description. */
+export const RoundReport = z.discriminatedUnion("outcome", [
+  z.strictObject({ outcome: z.literal("changes"), pr: z.strictObject({ body: z.string() }).optional(), replies: z.array(Reply), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("no-change"), replies: z.array(Reply), verification: Verification, summary: Line }),
+]);
+export type RoundReport = z.infer<typeof RoundReport>;
+
+export type Report = InitialReport | RoundReport;
+/** A report checked against the contract of the job's current round. */
+export type ParsedReport = { round: "initial"; report: InitialReport } | { round: "feedback"; report: RoundReport };
+
+export function parseReport(job: Job, value: unknown): { ok: true; parsed: ParsedReport } | { ok: false; error: z.ZodError } {
+  if (job.round === 1) {
+    const result = InitialReport.safeParse(value);
+    return result.success ? { ok: true, parsed: { round: "initial", report: result.data } } : { ok: false, error: result.error };
+  }
+  const result = RoundReport.safeParse(value);
+  return result.success ? { ok: true, parsed: { round: "feedback", report: result.data } } : { ok: false, error: result.error };
+}
 
 /** A report that passed every check, with the commit it was made at. That commit, not HEAD, is what gets pushed. */
 export type AcceptedReport = Report & { headSha: Sha; acceptedAt: number };
 
 export type ReportFacts = {
   now: number;
-  worktree: { headSha: Sha; dirty: boolean };
-  /**
-   * HEAD is new this round. First round: the worktree is ahead of `origin/<base>` (mergeBase.aheadCount > 0). Later
-   * rounds: HEAD differs from the pushed commit.
-   */
-  newCommit: boolean;
+  /** `ahead`: commits on HEAD that `origin/<base>` does not have. */
+  worktree: { headSha: Sha; dirty: boolean; ahead: number };
   /** `gate pr` on the worker thread's checklist. Only the first round checks it. */
   gate: GateFact;
   titleConvention: "conventional" | "free";
-  /** The feedback the round sent. The replies answer each item exactly once; the first round lists none. */
+  /** The feedback the round sent. The replies answer each item exactly once. */
   listed: readonly Feedback[];
 };
 
@@ -569,19 +568,61 @@ export type Verdict =
 
 const refKey = (ref: FeedbackRef) => `${ref.kind} ${ref.id}`;
 
-export function acceptReport(job: Job, report: Report, facts: ReportFacts): Verdict {
-  const reasons: string[] = [];
-  const initial = job.round === 1;
-  if (facts.worktree.dirty) reasons.push("the worktree has uncommitted or untracked changes: commit or remove every change before reporting");
-  if (!initial && report.outcome === "needs-info") {
-    reasons.push("`needs-info` is not an outcome in a feedback round: ask the question in a reply and report `changes` or `no-change`");
-  }
-  if (report.outcome === "changes" && !facts.newCommit) {
-    reasons.push(`outcome \`changes\` needs a new commit on top of ${initial ? "the base branch" : "the pushed commit"}`);
-  }
-  if (report.outcome !== "changes" && facts.newCommit) reasons.push(`outcome \`${report.outcome}\` must not add commits; report \`changes\` instead`);
-  if (report.outcome === "changes" && initial && !facts.gate.pass) reasons.push(`\`bb pstack gate pr\` fails: ${facts.gate.reason}`);
+/** HEAD is new this round: ahead of the base branch in the first round, past the pushed commit in a later one. */
+function newCommit(job: Job, worktree: ReportFacts["worktree"]): boolean {
+  return job.round === 1 ? worktree.ahead > 0 : worktree.headSha !== job.pushedSha;
+}
 
+function commitProblems(job: Job, outcome: Report["outcome"], worktree: ReportFacts["worktree"], base: string): string[] {
+  const problems: string[] = [];
+  if (worktree.dirty) problems.push("the worktree has uncommitted or untracked changes: commit or remove every change before reporting");
+  const added = newCommit(job, worktree);
+  if (outcome === "changes" && !added) problems.push(`outcome \`changes\` needs a new commit on top of ${base}`);
+  if (outcome !== "changes" && added) problems.push(`outcome \`${outcome}\` must not add commits; report \`changes\` instead`);
+  return problems;
+}
+
+function phraseProblems(texts: readonly string[], where: string): string[] {
+  return texts.flatMap((text) => {
+    const phrase = processPhrase(text);
+    return phrase ? [`${where} describes the process ("${phrase}"); describe the code instead`] : [];
+  });
+}
+
+function verdict(job: Job, reasons: readonly string[], accepted: () => Change): Verdict {
+  if (reasons.length === 0) return { ok: true, change: { ...accepted(), rejections: 0, nudges: 0, deadline: null, error: null } };
+  const rejections = job.rejections + 1;
+  const change =
+    rejections >= MAX_REJECTIONS
+      ? { ...stick(job, `${rejections} reports were rejected: ${reasons.join("; ")}`), rejections }
+      : { rejections, error: `report rejected: ${reasons.join("; ")}` };
+  return { ok: false, reasons, change };
+}
+
+export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts): Verdict {
+  return parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
+}
+
+function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts): Verdict {
+  const reasons = commitProblems(job, report.outcome, facts.worktree, "the base branch");
+  switch (report.outcome) {
+    case "changes":
+      if (!facts.gate.pass) reasons.push(`\`bb pstack gate pr\` fails: ${facts.gate.reason}`);
+      reasons.push(...titleProblems(report.pr.title, facts.titleConvention), ...bodyProblems(report.pr.body));
+      break;
+    case "needs-info":
+      reasons.push(...phraseProblems(report.questions, "text posted on the issue"));
+      break;
+    case "no-change":
+      reasons.push(...phraseProblems([report.summary], "text posted on the issue"));
+      break;
+  }
+  const accepted: AcceptedReport = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
+  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted }));
+}
+
+function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
+  const reasons = commitProblems(job, report.outcome, facts.worktree, "the pushed commit");
   const listed = new Set(facts.listed.map(refKey));
   const replied = report.replies.map((reply) => refKey({ kind: reply.kind, id: reply.commentId }));
   const missing = [...listed].filter((key) => !replied.includes(key));
@@ -590,51 +631,17 @@ export function acceptReport(job: Job, report: Report, facts: ReportFacts): Verd
   if (missing.length > 0) reasons.push(`reply to every listed comment; missing: ${missing.join(", ")}`);
   if (extra.length > 0) reasons.push(`these comments were not listed, remove their replies: ${extra.join(", ")}`);
   if (repeated.length > 0) reasons.push(`reply to each comment once; repeated: ${[...new Set(repeated)].join(", ")}`);
-
-  if (report.outcome === "changes") {
-    const { title, body } = report.pr ?? {};
-    if (initial && (title === undefined || body === undefined)) reasons.push("the first `changes` report needs `pr.title` and `pr.body`");
-    if (initial && title !== undefined) reasons.push(...titleProblems(title, facts.titleConvention));
-    if (body !== undefined) reasons.push(...bodyProblems(body));
-  }
-  const posted = !initial ? [] : report.outcome === "needs-info" ? report.questions : report.outcome === "no-change" ? [report.summary] : [];
-  for (const text of posted) {
-    const phrase = processPhrase(text);
-    if (phrase) reasons.push(`text posted on the issue describes the process ("${phrase}"); describe the code instead`);
-  }
-  for (const reply of report.replies) {
-    const phrase = processPhrase(reply.body);
-    if (phrase) reasons.push(`the reply to ${refKey({ kind: reply.kind, id: reply.commentId })} describes the process ("${phrase}"); describe the code instead`);
-  }
-
-  if (reasons.length > 0) {
-    const rejections = job.rejections + 1;
-    const change =
-      rejections >= MAX_REJECTIONS
-        ? { ...stick(job, `${rejections} reports were rejected: ${reasons.join("; ")}`), rejections }
-        : { rejections, error: `report rejected: ${reasons.join("; ")}` };
-    return { ok: false, reasons, change };
-  }
-
-  const accepted: AcceptedReport = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
-  return {
-    ok: true,
-    change: {
-      phase: enter(...(initial ? publication(job, accepted) : republication(job, accepted, facts.listed))),
-      report: accepted,
-      rejections: 0,
-      nudges: 0,
-      deadline: null,
-      error: null,
-    },
-  };
+  if (report.outcome === "changes" && report.pr) reasons.push(...bodyProblems(report.pr.body));
+  for (const reply of report.replies) reasons.push(...phraseProblems([reply.body], `the reply to ${refKey({ kind: reply.kind, id: reply.commentId })}`));
+  const accepted = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
+  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted }));
 }
 
 /**
  * The end of a feedback round: push the new commit if there is one, answer every listed item, update the description
  * when the report replaced it, ask the reviewers to look again, and show the issue as in review.
  */
-function republication(job: Job, report: AcceptedReport, listed: readonly Feedback[]): [TransitState, Effect[]] {
+function republication(job: Job, report: RoundReport & AcceptedReport, listed: readonly Feedback[]): [TransitState, Effect[]] {
   const replies: Effect[] = report.replies.map((reply) => {
     const target = { kind: reply.kind, id: reply.commentId };
     const item = listed.find((candidate) => refKey(candidate) === refKey(target))!;
@@ -643,7 +650,7 @@ function republication(job: Job, report: AcceptedReport, listed: readonly Feedba
   const reviewers = [...new Set(listed.map((item) => item.author))];
   const after: Effect[] = [
     ...replies,
-    ...(report.outcome === "changes" && report.pr?.body !== undefined ? [{ op: "edit-pr", key: `edit-pr:${job.id}:${job.round}`, body: prBody(report.pr.body, job.issue) } as const] : []),
+    ...(report.outcome === "changes" && report.pr ? [{ op: "edit-pr", key: `edit-pr:${job.id}:${job.round}`, body: prBody(report.pr.body, job.issue) } as const] : []),
     ...(reviewers.length > 0 ? [{ op: "request-review", key: `request-review:${job.id}:${job.round}`, reviewers } as const] : []),
     { op: "labels", key: `labels:${job.id}:review:${job.round}`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
   ];
@@ -651,14 +658,14 @@ function republication(job: Job, report: AcceptedReport, listed: readonly Feedba
   return ["republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: job.pushedSha }, ...after]];
 }
 
-function publication(job: Job, report: AcceptedReport): [TransitState, Effect[]] {
+function publication(job: Job, report: InitialReport & AcceptedReport): [TransitState, Effect[]] {
   switch (report.outcome) {
     case "changes":
       return [
         "publishing",
         [
           { op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: job.pushedSha },
-          ...(job.pr === null ? [{ op: "open-pr", key: `pr:${job.id}`, title: (report.pr?.title ?? "").trim(), body: prBody(report.pr?.body ?? "", job.issue) } as const] : []),
+          ...(job.pr === null ? [{ op: "open-pr", key: `pr:${job.id}`, title: report.pr.title.trim(), body: prBody(report.pr.body, job.issue) } as const] : []),
           { op: "labels", key: `labels:${job.id}:pr`, on: "pr", add: [LABEL.trigger], remove: [] },
           { op: "labels", key: `labels:${job.id}:review`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
         ],

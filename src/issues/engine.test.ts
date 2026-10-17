@@ -504,3 +504,18 @@ test("a worker that reports before its spawn is confirmed is told to try again, 
   assert.equal((await h.report(threadId!, GOOD)).exitCode, 0);
   await h.settle();
 });
+
+test("a first-round changes report without a pull request title and body is a schema error, which does not count as a rejection", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  const { pr: _, ...titleless } = GOOD;
+  const refused = await h.report(working.threadId!, titleless);
+  assert.equal(refused.exitCode, 1);
+  assert.match(refused.stderr!, /does not match the contract[\s\S]*pr/);
+  const still = await h.only();
+  assert.equal(still.state, "working");
+  assert.equal(still.error, null, "not a rejection");
+  assert.equal((await h.report(working.threadId!, GOOD)).exitCode, 0);
+});

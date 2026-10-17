@@ -22,9 +22,9 @@ import {
   LABEL,
   MAX_REJECTIONS,
   REPORTING,
-  Report,
   TERMINAL,
   acceptReport,
+  parseReport,
   awaitingThread,
   counts,
   isReasoningLevel,
@@ -41,6 +41,7 @@ import {
   type Feedback,
   type GateFact,
   type Job,
+  type ParsedReport,
   type JobId,
   type PullState,
   type RepoName,
@@ -479,8 +480,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!tree.ok) return { unavailable: tree.error };
       return {
         now: clock(),
-        worktree: { headSha: tree.headSha, dirty: tree.dirty },
-        newCommit: job.pushedSha === null ? tree.ahead > 0 : tree.headSha !== job.pushedSha,
+        worktree: { headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead },
         gate: job.threadId ? deps.prGate(job.threadId) : { pass: false, reason: "the job has no worker thread" },
         titleConvention: await github.repo(job.repo).titleConvention(),
         listed: store.roundFeedback(job.id, job.round),
@@ -509,11 +509,11 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     if (bound.phase.state === "sending") return { ok: false, code: "unavailable", message: "pstack is still starting this round, try again shortly" };
     if (!REPORTING.has(bound.phase.state)) return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report` };
-    let parsed: Report;
+    let parsed: ParsedReport;
     try {
-      const result = Report.safeParse(JSON.parse(text));
-      if (!result.success) return { ok: false, code: "invalid_report", message: `the report does not match the contract:\n${z.prettifyError(result.error)}` };
-      parsed = result.data;
+      const result = parseReport(bound, JSON.parse(text));
+      if (!result.ok) return { ok: false, code: "invalid_report", message: `the report does not match the contract:\n${z.prettifyError(result.error)}` };
+      parsed = result.parsed;
     } catch (error) {
       return { ok: false, code: "invalid_report", message: `the report is not JSON: ${message(error)}` };
     }
@@ -541,8 +541,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       };
     }
     const sha = short(facts.worktree.headSha);
-    if (bound.round > 1) {
-      const push = parsed.outcome === "changes" ? `pushes ${sha} to ${bound.branch}, ` : "";
+    if (parsed.round === "feedback") {
+      const push = parsed.report.outcome === "changes" ? `pushes ${sha} to ${bound.branch}, ` : "";
       return { ok: true, message: `Report accepted. pstack ${push}posts your replies, and asks the reviewers to look again.` };
     }
     const messages = {
@@ -550,7 +550,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       "needs-info": "Report accepted. pstack posts your questions on the issue.",
       "no-change": "Report accepted. pstack posts your reason on the issue and ends the job.",
     } as const;
-    return { ok: true, message: messages[parsed.outcome] };
+    return { ok: true, message: messages[parsed.report.outcome] };
   }
 
   async function stop(id: JobId, by: string): Promise<boolean> {
