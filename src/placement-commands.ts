@@ -1,7 +1,7 @@
 import { isAbsolute, join } from "node:path";
 import { cliCommand, PluginCliError, type BbPluginApi, type PluginCliContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { pressured, type AskResult, type Checkouts } from "./checkouts.ts";
+import { NO_REMOTE, pressured, type AskResult, type Checkouts } from "./checkouts.ts";
 import { hostId, NO_CHECKOUT, type HostId, type Need, type Placement } from "./placement.ts";
 
 const Flags = z.object({
@@ -188,8 +188,14 @@ export function createPlacementCommands({ bb, placement, checkouts }: { bb: BbPl
           const board = await placement.board(needFromFlags(flags, { ...invoking, model: null }, null));
           const askClone = input.options["ask-clone"] ? await checkouts.ask(ctx.threadId!, invoking.projectId) : null;
           const consent = { allow: "clone allowed", deny: "clone denied", undecided: "clone undecided, ask with --ask-clone" };
+          const remoteProblem = board.hosts.some((row) => row.blocker === NO_CHECKOUT)
+            ? await checkouts.remote(invoking.projectId).then((url) => url === null ? NO_REMOTE : null, (error) => `git remote unknown (${error instanceof Error ? error.message : String(error)})`)
+            : null;
           const lines = await Promise.all(board.hosts.map(async (row) => {
-            const blocker = row.blocker === NO_CHECKOUT ? `${NO_CHECKOUT}; ${consent[await checkouts.verdict(invoking.projectId, row.id) ?? "undecided"]}` : row.blocker;
+            const clone = row.blocker !== NO_CHECKOUT ? null
+              : remoteProblem === NO_REMOTE ? NO_REMOTE
+              : [consent[await checkouts.verdict(invoking.projectId, row.id) ?? "undecided"], remoteProblem].filter(Boolean).join("; ");
+            const blocker = clone === null ? row.blocker : `${NO_CHECKOUT}; ${clone}`;
             return `${row.id}  ${row.name}  ${row.running}+${row.held}/${row.limit ?? "?"}  ${blocker ?? `${row.free} free`}`;
           }));
           lines.push(`global ${board.global.running}/${board.global.limit ?? "unlimited"}`, `next ${board.next ?? "none"}`);

@@ -212,3 +212,12 @@ test("machines shows clone consent for machines without a checkout and asks on r
   assert.match(asked.stdout!, /opened the checkout form in this thread for Box/);
   assert.deepEqual(JSON.parse((await h.run(["machines", "--ask-clone", "--json"])).stdout!).askClone.kind, "opened");
 });
+
+test("machines names the missing git remote instead of clone consent", async () => {
+  const none = harness({ sources: [HERE], remote: async () => null });
+  const stdout = (await none.run(["machines"])).stdout!;
+  assert.match(stdout, /host_away.*no checkout of this project; no git remote to clone from\n/);
+  assert.doesNotMatch(stdout, /clone undecided/);
+  const unreachable = harness({ sources: [HERE], remote: async () => { throw new Error("Host is not connected"); } });
+  assert.match((await unreachable.run(["machines"])).stdout!, /host_away.*clone undecided, ask with --ask-clone; git remote unknown \(Host is not connected\)/);
+});
