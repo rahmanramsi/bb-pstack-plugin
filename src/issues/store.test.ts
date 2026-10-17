@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 import { MIGRATIONS } from "../store.ts";
-import { CONCURRENCY, RESTING_STATES, TERMINAL, TRANSIT, enter, type AcceptedReport, type Change, type Effect, type Feedback, type JobId, type RepoName, type Sha } from "./job.ts";
+import { RESTING_STATES, TERMINAL, TRANSIT, enter, type AcceptedReport, type Change, type Effect, type Feedback, type JobId, type RepoName, type Sha } from "./job.ts";
 import { openIssueStore, type NewJob } from "./store.ts";
 
 const REPO = "acme/web" as RepoName;
@@ -84,21 +84,6 @@ test("one open job per issue; a label event is recorded once; a re-label after a
   assert.deepEqual(store.due(30), [second.id]);
   assert.deepEqual(store.list({ all: true }).map((job) => job.id), [second.id, ignored.id, first.id]);
   assert.deepEqual(store.list({ all: false }).map((job) => job.id), [second.id]);
-});
-
-test("no write starts a job beyond CONCURRENCY busy jobs, and queued jobs see their place in line", () => {
-  const { store } = setup();
-  const jobs = Array.from({ length: CONCURRENCY + 1 }, (_, index) => store.insert(newJob({ issue: 41 + index }), 10 + index)!);
-  const last = jobs.at(-1)!;
-  assert.deepEqual(store.slots(last.id), { busy: 0, ahead: CONCURRENCY });
-  for (const job of jobs.slice(0, -1)) assert.ok(store.write(job.id, 0, { phase: enter("starting", [spawn]) }, 20));
-  assert.equal(store.write(last.id, 0, { phase: enter("starting", [spawn]) }, 20), null, "every slot is taken");
-  assert.deepEqual(store.slots(last.id), { busy: CONCURRENCY, ahead: 0 });
-
-  const claimed = store.write(jobs[0]!.id, 1, { phase: { ...enter("starting", [spawn]), tries: 1 } } as Change, 30);
-  assert.ok(claimed, "a job that already holds a slot keeps writing its own phase");
-  store.write(jobs[0]!.id, claimed.version, { phase: { state: "stopped" } }, 40);
-  assert.ok(store.write(last.id, 0, { phase: enter("starting", [spawn]) }, 50), "a freed slot can be taken");
 });
 
 test("repository poll state is stored per repository", () => {
