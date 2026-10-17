@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { choose, createPlacement, HOLD_GRACE_MS, hostId, REFRESH_MS, type Facts, type Hold, type Need, type Target } from "./placement.ts";
+import { choose, createPlacement, HOLD_GRACE_MS, hostId, NO_CHECKOUT, REFRESH_MS, type Facts, type Hold, type Need, type Target } from "./placement.ts";
 
 const HOME = hostId.parse("local");
 const BOX = hostId.parse("box");
@@ -15,7 +15,7 @@ function facts(overrides: Partial<Facts> = {}): Facts {
     hosts: [HOME, BOX].map((id) => ({ id, name: id, connected: true, phase: "active" })),
     limits: { perHost: new Map([[HOME, 4], [BOX, 4]]), global: null },
     occupancy: { requestedAt: 0, threads: [] },
-    worktrees: new Map([[HOME, null], [BOX, null]]), models: new Map([[HOME, null], [BOX, null]]), branches: new Map(),
+    checkouts: null, worktrees: new Map([[HOME, null], [BOX, null]]), models: new Map([[HOME, null], [BOX, null]]), branches: new Map(),
     ...overrides,
   };
 }
@@ -142,7 +142,23 @@ test("a pinned branch must be verified at the requested SHA", () => {
     { type: "host", hostId: BOX, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "main" } } });
 });
 
-function service(options: { badLimits?: boolean } = {}) {
+test("a host without a checkout of the project is blocked and flagged as needing only a clone", () => {
+  const full = { requestedAt: 0, threads: threads(HOME, 4) };
+  const missing = pick(facts({ checkouts: new Set([HOME]), occupancy: full }));
+  assert.equal(missing.target.where, "home");
+  assert.deepEqual([missing.board.hosts[1].blocker, missing.board.hosts[1].onlyNeedsCheckout], [NO_CHECKOUT, true]);
+  assert.equal(missing.board.hosts[0].onlyNeedsCheckout, false);
+  assert.equal(pick(facts({ checkouts: new Set([HOME, BOX]), occupancy: full })).target.where, "away");
+  for (const other of [
+    facts({ checkouts: new Set([HOME]), occupancy: { requestedAt: 0, threads: [...threads(HOME, 4), ...threads(BOX, 4)] } }),
+    facts({ checkouts: new Set([HOME]), occupancy: full, models: new Map([[BOX, "codex has no m"]]) }),
+    facts({ checkouts: new Set([HOME]), occupancy: full, hosts: [HOME, BOX].map((id) => ({ id, name: id, connected: id === HOME, phase: "active" })) }),
+  ]) {
+    assert.equal(pick(other).board.hosts[1].onlyNeedsCheckout, false);
+  }
+});
+
+function service(options: { badLimits?: boolean; sources?: string[] } = {}) {
   let now = 0;
   let rows: { id: string; hostId: string | null }[] = threads(HOME, 4);
   const execCalls: { file: string; args: readonly string[] }[] = [];
@@ -151,6 +167,7 @@ function service(options: { badLimits?: boolean } = {}) {
     sdk: {
       hosts: { list: async () => [HOME, BOX].map((id) => ({ id, name: id, status: "connected", lifecycle: { phase: "active" } })) },
       threads: { listRunning: async () => rows },
+      projects: { get: async () => { if (!options.sources) throw new Error("no project"); return { sources: options.sources.map((id) => ({ hostId: id })) }; } },
       environments: { listProviders: async () => [{ id: "git-worktree", availability: { status: "available" } }] },
       providers: {
         list: async (route: unknown) => { routes.push(route); return [{ id: "codex", available: true }]; },
@@ -255,4 +272,10 @@ test("malformed external limit data falls back home", async () => {
   const result = await h.placement.place(need, async () => "worker");
   assert.equal(result.target.where, "home");
   assert.match(result.target.why, /unknown/);
+});
+
+test("project sources decide which machines have a checkout", async () => {
+  const board = await service({ sources: [HOME] }).placement.board(need);
+  assert.deepEqual([board.hosts[1].blocker, board.hosts[1].onlyNeedsCheckout], [NO_CHECKOUT, true]);
+  assert.equal((await service({ sources: [HOME, BOX] }).placement.board(need)).hosts[1].blocker, null);
 });
