@@ -2,7 +2,7 @@
  * Text the issue feature writes: the worker's prompts and reminders, and everything posted on GitHub with the checks
  * and sanitizing it gets first. Pure.
  */
-import { MAX_FEEDBACK_ROUNDS, MAX_NUDGES, type Feedback, type FeedbackFact, type GateFact, type Job, type ReportFacts } from "./job.ts";
+import { MAX_FEEDBACK_ROUNDS, MAX_NUDGES, type Feedback, type GateFact, type Job, type RoundSummary, type ReportFacts } from "./job.ts";
 
 /**
  * Phrases that describe how a change was made instead of the change. Whole phrases, so "thread pool", "user agent"
@@ -176,9 +176,9 @@ const FEEDBACK_HEADINGS = { review: "Review", "review-comment": "Inline comment"
  * A feedback round's message. It stands alone, so a worker after compaction or a replacement thread can act on it:
  * the pull request, the issue, every item with its kind and id, and what earlier rounds did.
  */
-export function roundPrompt(job: Job, ordinal: number, feedback: FeedbackFact): string {
+export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedback[], rounds: readonly RoundSummary[]): string {
   const round = ordinal - 1;
-  const items = feedback.pending.flatMap((item) => [
+  const items = pending.flatMap((item) => [
     `### ${FEEDBACK_HEADINGS[item.kind]} by @${item.author}: \`{ "kind": "${item.kind}", "commentId": ${item.id} }\``,
     "",
     ...(item.path ? [`On \`${item.path}\`${item.line === null ? "" : ` line ${item.line}`}:`, "", fenced(item.diffHunk ?? "", "diff"), ""] : []),
@@ -186,7 +186,7 @@ export function roundPrompt(job: Job, ordinal: number, feedback: FeedbackFact): 
     fenced(item.body.trim() || "(no text)"),
     "",
   ]);
-  const earlier = feedback.rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Feedback round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
+  const earlier = rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Feedback round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
   return [
     `Feedback round ${round} of ${MAX_FEEDBACK_ROUNDS} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
     "",

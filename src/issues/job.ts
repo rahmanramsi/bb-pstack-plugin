@@ -290,9 +290,9 @@ export type PullState = "open" | "merged" | "closed";
 export type FeedbackFact = {
   /** Feedback not yet sent in a round, oldest first. */
   pending: readonly Feedback[];
-  /** Every round so far with its accepted report's summary, for the next round message. */
-  rounds: readonly { ordinal: number; summary: string | null }[];
 };
+/** A round so far with its accepted report's summary, for the next round message. */
+export type RoundSummary = { ordinal: number; summary: string | null };
 
 /** Observations the row does not own. The engine gathers only those FACTS_FOR names for the state. */
 export type Facts = {
@@ -308,7 +308,8 @@ export type Facts = {
   /** For an idle worker: `gate pr` on its checklist, which the nudge names when it fails. */
   gate: GateFact | null;
   feedback: FeedbackFact | null;
-  /** The pull request's state as last polled; null until the first poll since the service started. */
+  rounds: readonly RoundSummary[] | null;
+  /** The pull request's state as last polled; null until the job's first successful poll. */
   pr: { state: PullState } | null;
 };
 
@@ -322,7 +323,7 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   publishing: [],
   asking: [],
   "needs-info": [],
-  review: ["slotFree", "feedback", "pr", "thread"],
+  review: ["feedback", "pr"],
   addressing: ["thread", "waiting", "pr"],
   closing: [],
   done: [],
@@ -330,11 +331,28 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   stopped: [],
   sticking: [],
   stuck: [],
-  sending: [],
-  respawning: [],
+  sending: ["pr"],
+  respawning: ["pr"],
   republishing: [],
   replying: [],
 };
+
+/**
+ * What `review` needs once a round is due, and only then: a pull request can wait days for review, and these cost a bb
+ * call and store reads per job on every sweep.
+ */
+export const ROUND_FACTS: readonly FactName[] = ["slotFree", "thread", "rounds"];
+
+/** The facts to gather after FACTS_FOR's, given what those showed. */
+export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
+  if (job.phase.state !== "review" || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.round > MAX_FEEDBACK_ROUNDS) return [];
+  return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
+}
+
+/** When a round may start: the newest pending item has been visible for FEEDBACK_QUIET_MS. */
+function quietAt(pending: readonly Feedback[]): number {
+  return Math.max(...pending.map((item) => item.postedAt)) + FEEDBACK_QUIET_MS;
+}
 
 /** Resting states whose next action depends on facts outside the row, so the sweep reconciles them every pass. */
 export const WATCHED: readonly RestingState[] = RESTING_STATES.filter((state) => FACTS_FOR[state].length > 0);
@@ -376,6 +394,8 @@ export function plan(job: Job, facts: Facts): Action | null {
 function next(job: Job, facts: Facts): Action | null {
   const { phase } = job;
   const { now } = facts;
+  // A round handed to the worker for a pull request that has since closed would be a wasted turn or spawn.
+  if ((phase.state === "sending" || phase.state === "respawning") && facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job) };
   if (isTransit(phase.state) && "effects" in phase) {
     const head = phase.effects[0];
     const policy = EFFECT_POLICY[head.op];
@@ -405,12 +425,12 @@ function next(job: Job, facts: Facts): Action | null {
       if (job.round > MAX_FEEDBACK_ROUNDS) {
         return { type: "change", change: stick(job, `new feedback after ${MAX_FEEDBACK_ROUNDS} feedback rounds; the pull request needs a person now`) };
       }
-      const quietAt = Math.max(...feedback.pending.map((item) => item.postedAt)) + FEEDBACK_QUIET_MS;
-      if (quietAt > now) return { type: "sleep", until: quietAt };
-      if (!facts.slotFree || !facts.thread) return null;
+      const quiet = quietAt(feedback.pending);
+      if (quiet > now) return { type: "sleep", until: quiet };
+      if (!facts.slotFree || !facts.thread || !facts.rounds) return null;
       // A failed thread cannot take the round's message; it is replaced like a gone one.
       const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
-      return { type: "change", change: startRound(job, feedback, respawn, now) };
+      return { type: "change", change: startRound(job, feedback.pending, facts.rounds, respawn, now) };
     }
     case "addressing":
     case "working": {
@@ -484,12 +504,12 @@ export function start(job: Job, worker: WorkerSettings, now: number): Change {
  * review → sending, or respawning when the worker thread is gone or failed: relabel the issue, then hand the worker every pending
  * item in one message. The round's row and its feedback are written with this change, so no item is sent twice.
  */
-function startRound(job: Job, feedback: FeedbackFact, respawn: boolean, now: number): Change {
+function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], respawn: boolean, now: number): Change {
   const ordinal = job.round + 1;
-  const text = roundPrompt(job, ordinal, feedback);
+  const text = roundPrompt(job, ordinal, pending, rounds);
   const relabel: Effect = { op: "labels", key: `labels:${job.id}:working:${ordinal}`, on: "issue", add: [LABEL.working], remove: [LABEL.review] };
   const round = {
-    startRound: { ordinal, kind: "feedback", baseSha: job.pushedSha, feedback: feedback.pending.map(({ kind, id }) => ({ kind, id })) },
+    startRound: { ordinal, kind: "feedback", baseSha: job.pushedSha, feedback: pending.map(({ kind, id }) => ({ kind, id })) },
     deadline: now + ROUND_MS,
     rejections: 0,
     nudges: 0,

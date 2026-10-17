@@ -158,8 +158,8 @@ test("feedback is stored once per GitHub item, and only for the job it was polle
   const items = [comment(1, 100), comment(2, 90), comment(1, 100, "review")].map((feedback) => ({ jobId: job.id, pr: 7, feedback }));
   assert.equal(store.addFeedback(REPO, items), 3, "an inline comment and a review may share an id");
   assert.equal(store.addFeedback(REPO, items), 0, "a repeated poll adds nothing");
-  assert.deepEqual(store.feedback(job.id).pending.map((item) => [item.kind, item.id]), [["review-comment", 2], ["review-comment", 1], ["review", 1]]);
-  assert.deepEqual(store.feedback(job.id).pending[0], comment(2, 90));
+  assert.deepEqual(store.pendingFeedback(job.id).map((item) => [item.kind, item.id]), [["review-comment", 2], ["review-comment", 1], ["review", 1]]);
+  assert.deepEqual(store.pendingFeedback(job.id)[0], comment(2, 90));
   assert.deepEqual(store.withPullRequest(REPO).map((open) => open.id), [job.id]);
 });
 
@@ -172,17 +172,17 @@ test("a round start writes the job, the round's row and its feedback in one tran
   const refused = { phase: { state: "stopped" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [...listed, { kind: "review", id: 9 }] } } as const;
   assert.throws(() => store.write(job.id, job.version, refused, 200), /review 9 is not pending feedback/);
   assert.equal(store.get(job.id)!.version, job.version, "a failed round start leaves the job as it was");
-  assert.equal(store.feedback(job.id).pending.length, 2);
+  assert.equal(store.pendingFeedback(job.id).length, 2);
   assert.deepEqual(db.prepare("SELECT count(*) AS n FROM issue_rounds WHERE ordinal = 2").get(), { n: 0 });
 
   const started = store.write(job.id, job.version, { phase: { state: "addressing" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: listed } }, 200)!;
   assert.equal(started.round, 2);
-  assert.deepEqual(store.feedback(job.id).pending, []);
+  assert.deepEqual(store.pendingFeedback(job.id), []);
   assert.deepEqual(store.roundFeedback(job.id, 2).map((item) => item.id), [1, 2]);
   assert.deepEqual(db.prepare("SELECT kind, started_at, base_sha FROM issue_rounds WHERE job_id = ? AND ordinal = 2").get(job.id), { kind: "feedback", started_at: 200, base_sha: SHA });
 
   store.addFeedback(REPO, [comment(3, 250)].map((feedback) => ({ jobId: job.id, pr: 7, feedback })));
-  assert.deepEqual(store.feedback(job.id).pending.map((item) => item.id), [3], "feedback that arrives during a round waits for the next one");
+  assert.deepEqual(store.pendingFeedback(job.id).map((item) => item.id), [3], "feedback that arrives during a round waits for the next one");
   assert.deepEqual(store.roundFeedback(job.id, 2).map((item) => item.id), [1, 2]);
 });
 
@@ -203,7 +203,7 @@ test("the current round's row records its report, its pushed commit, and when th
   current = store.write(job.id, current.version, { phase: { state: "review" }, error: null }, 330)!;
   store.write(job.id, current.version, { phase: { state: "done" }, finishRound: true }, 400);
   assert.deepEqual(rounds().map((round) => (round as { finished_at: number }).finished_at), [12, 320], "only the write that ends a round stamps it, and only once");
-  assert.deepEqual(store.feedback(job.id).rounds, [{ ordinal: 1, summary: null }, { ordinal: 2, summary: "Explained the naming." }]);
+  assert.deepEqual(store.roundSummaries(job.id), [{ ordinal: 1, summary: null }, { ordinal: 2, summary: "Explained the naming." }]);
 });
 
 test("a step 1 database migrates its jobs to round 1 with their history", () => {
@@ -220,7 +220,7 @@ test("a step 1 database migrates its jobs to round 1 with their history", () => 
   const job = store.get("psi_old" as JobId)!;
   assert.equal(job.round, 1);
   assert.equal(job.phase.state, "review");
-  assert.deepEqual(store.feedback(job.id).rounds, [{ ordinal: 1, summary: "Fixed." }]);
+  assert.deepEqual(store.roundSummaries(job.id), [{ ordinal: 1, summary: "Fixed." }]);
   assert.throws(() => db.prepare("UPDATE issue_jobs SET state = 'addressing', thread_id = NULL WHERE id = 'psi_old'").run(), /CHECK/);
 });
 
@@ -229,7 +229,7 @@ test("a job's poll stores its feedback, state and cursor together, and a failed 
   const job = inReview(store);
   assert.deepEqual(store.jobPoll(job.id), { cursor: null, prState: null, polledAt: null, error: null });
   store.recordPoll(job.id, { cursor: { at: 1 }, prState: "open", feedback: [comment(1, 100)] }, 50);
-  assert.deepEqual(store.feedback(job.id).pending.map((item) => item.id), [1]);
+  assert.deepEqual(store.pendingFeedback(job.id).map((item) => item.id), [1]);
   store.recordPollError(job.id, "GitHub GET /repos/acme/web/pulls/7: 404", 60);
   assert.deepEqual(store.jobPoll(job.id), { cursor: { at: 1 }, prState: "open", polledAt: 60, error: "GitHub GET /repos/acme/web/pulls/7: 404" });
   store.recordPoll(job.id, { cursor: { at: 2 }, prState: "merged", feedback: [] }, 70);

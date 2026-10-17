@@ -262,6 +262,7 @@ export function harness() {
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
+  const threadReads = { count: 0 };
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
   const held = async (key: string) => {
@@ -282,6 +283,7 @@ export function harness() {
   const sdk = {
     threads: {
       async get({ threadId }: { threadId: string }) {
+        threadReads.count++;
         const thread = threads.get(threadId);
         if (!thread) throw missing();
         return { ...thread };
@@ -515,6 +517,7 @@ export function harness() {
     threads,
     late,
     calls,
+    threadReads,
     spawned,
     sent,
     stopped,

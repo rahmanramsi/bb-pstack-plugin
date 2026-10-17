@@ -27,6 +27,7 @@ import {
   parseReport,
   awaitingThread,
   counts,
+  moreFacts,
   isReasoningLevel,
   plan,
   settle,
@@ -371,13 +372,15 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function gather(job: Job): Promise<Facts> {
-    const wanted = FACTS_FOR[job.phase.state];
-    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, pr: null };
-    if (wanted.includes("feedback")) facts.feedback = store.feedback(job.id);
-    if (wanted.includes("pr")) {
+    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, pr: null };
+    const first = FACTS_FOR[job.phase.state];
+    if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
+    if (first.includes("pr")) {
       const { prState } = store.jobPoll(job.id);
       facts.pr = prState ? { state: prState } : null;
     }
+    const wanted = [...first, ...moreFacts(job, facts)];
+    if (wanted.includes("rounds")) facts.rounds = store.roundSummaries(job.id);
     if (wanted.includes("slotFree")) {
       const { busy, ahead } = store.slots(job.id);
       facts.slotFree = ahead < CONCURRENCY - busy;

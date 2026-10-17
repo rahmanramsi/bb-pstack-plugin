@@ -69,7 +69,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, pr: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, pr: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);
@@ -391,7 +391,8 @@ const inline = (id: number, createdAt: number, author = "maya"): Feedback => ({
 const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A few things.\nSee inline.", path: null, line: null, diffHunk: null, inReplyTo: null, parent: null, reviewId: null, createdAt: NOW - 3 * MIN, postedAt: NOW - 3 * MIN };
 const inReview = (overrides: Partial<Job> = {}) =>
   job({ phase: { state: "review" }, threadId: "thr_w", pushedSha: PUSHED, pr: PR, worker: WORKER, report: { ...REPORT, headSha: PUSHED, acceptedAt: NOW - 60 * MIN }, ...overrides });
-const pending = (items: Feedback[]) => ({ feedback: { pending: items, rounds: [{ ordinal: 1, summary: "Footer overlap fixed." }] }, pr: { state: "open" as const }, slotFree: true, thread: { kind: "idle" as const, since: NOW - MIN } });
+const ROUNDS = [{ ordinal: 1, summary: "Footer overlap fixed." }];
+const pending = (items: Feedback[]) => ({ feedback: { pending: items }, rounds: ROUNDS, pr: { state: "open" as const }, slotFree: true, thread: { kind: "idle" as const, since: NOW - MIN } });
 
 test("a round starts only once the newest pending feedback has been quiet for two minutes, with every pending item", () => {
   const review = inReview();
@@ -413,11 +414,11 @@ test("a round starts only once the newest pending feedback has been quiet for tw
   assert.deepEqual(sending.phase.effects[0], { op: "labels", key: `labels:${review.id}:working:2`, on: "issue", add: ["agent:working"], remove: ["agent:review"] });
   const send = sending.phase.effects[1];
   assert.equal(send?.op, "send-round");
-  assert.equal(send?.op === "send-round" && send.text, roundPrompt(review, 2, pending(items).feedback));
+  assert.equal(send?.op === "send-round" && send.text, roundPrompt(review, 2, items, ROUNDS));
 });
 
 test("the round message stands alone: the pull request, the issue, every item with its id and diff, earlier rounds, and the rules", () => {
-  const text = roundPrompt(inReview(), 3, { pending: [reviewBody, inline(1, NOW)], rounds: [{ ordinal: 1, summary: "Footer overlap fixed." }, { ordinal: 2, summary: "Renamed the parser." }] });
+  const text = roundPrompt(inReview(), 3, [reviewBody, inline(1, NOW)], [{ ordinal: 1, summary: "Footer overlap fixed." }, { ordinal: 2, summary: "Renamed the parser." }]);
   assert.match(text, /^Feedback round 2 of 5 on pull request https:\/\/github\.com\/acme\/web\/pull\/7 \(branch `agent\/issue-41-/);
   assert.match(text, /```text\nSubmit button hides behind the footer\n\nOn 375px/);
   assert.match(text, /- The first round: Footer overlap fixed\.\n- Feedback round 1: Renamed the parser\./);
@@ -572,4 +573,13 @@ test("a reply too long for GitHub once quoted and marked is a rejection the work
   assert.match(reasonsOf(acceptReport(addressing, long, ROUND_FACTS())).join("\n"), /the reply to review-comment 1 is 655\d\d characters as posted; GitHub's limit is 65536/);
   const fits = later({ outcome: "changes", replies: [REPLIES[0], { ...REPLIES[1], body: "x".repeat(65_000) }], verification: ["npm test"], summary: "s" });
   assert.ok(acceptReport(addressing, fits, ROUND_FACTS()).ok);
+});
+
+test("a pull request merged while a round is being handed over ends the job instead of sending or spawning", () => {
+  const send: Effect = { op: "send-round", key: "send-round:x:2", text: "t" };
+  for (const current of [inReview({ phase: transit("sending", [send]), round: 2 }), inReview({ phase: transit("respawning", [spawnEffect]), round: 2 })]) {
+    assert.equal(plan(current, facts({ pr: { state: "open" } }))?.type, "effect");
+    const merged = plan(current, facts({ pr: { state: "merged" } }));
+    assert.equal((merged as { change: Change }).change.phase?.state, "closing", current.phase.state);
+  }
 });

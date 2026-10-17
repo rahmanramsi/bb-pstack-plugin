@@ -25,6 +25,7 @@ import {
   type Phase,
   type PullState,
   type RepoName,
+  type RoundSummary,
   type Sha,
   type BranchName,
   type WorkerSettings,
@@ -79,8 +80,10 @@ export type IssueStore = {
   addFeedback(repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number;
   /** Whether the item is stored already, sent or not. */
   hasFeedback(repo: RepoName, ref: FeedbackRef): boolean;
-  /** The job's feedback not yet sent in a round, oldest first, and each earlier round's summary. */
-  feedback(id: JobId): { pending: Feedback[]; rounds: { ordinal: number; summary: string | null }[] };
+  /** The job's feedback not yet sent in a round, oldest first. */
+  pendingFeedback(id: JobId): Feedback[];
+  /** Each of the job's rounds so far with its accepted report's summary. */
+  roundSummaries(id: JobId): RoundSummary[];
   /** The feedback a round sent, which its report must answer. */
   roundFeedback(id: JobId, ordinal: number): Feedback[];
   repoPoll(repo: RepoName): { poll: unknown; polledAt: number | null; error: string | null };
@@ -382,13 +385,13 @@ export function openIssueStore(db: Db): IssueStore {
     hasFeedback(repo, ref) {
       return db.prepare("SELECT 1 FROM issue_feedback WHERE repo = ? AND kind = ? AND github_id = ?").get(repo, ref.kind, ref.id) !== undefined;
     },
-    feedback(id) {
-      const pending = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round IS NULL ORDER BY created_at, github_id").all(id) as FeedbackRow[];
+    pendingFeedback(id) {
+      const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round IS NULL ORDER BY created_at, github_id").all(id) as FeedbackRow[];
+      return rows.map(parseFeedback);
+    },
+    roundSummaries(id) {
       const rounds = db.prepare("SELECT ordinal, report_json FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(id) as { ordinal: number; report_json: string | null }[];
-      return {
-        pending: pending.map(parseFeedback),
-        rounds: rounds.map((round) => ({ ordinal: round.ordinal, summary: round.report_json === null ? null : ((JSON.parse(round.report_json) as AcceptedReport).summary ?? null) })),
-      };
+      return rounds.map((round) => ({ ordinal: round.ordinal, summary: round.report_json === null ? null : ((JSON.parse(round.report_json) as AcceptedReport).summary ?? null) }));
     },
     roundFeedback(id, ordinal) {
       const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round = ? ORDER BY created_at, github_id").all(id, ordinal) as FeedbackRow[];

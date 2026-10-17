@@ -378,3 +378,18 @@ test("a reply is dropped only when GitHub confirms its comment is gone; another 
     }
   }
 });
+
+test("a pull request waiting for review costs no worker thread reads until a round is due", async () => {
+  const h = harness();
+  const { pr } = await h.toReview();
+  h.threadReads.count = 0;
+  await h.settle();
+  assert.equal(h.threadReads.count, 0, "nothing pending");
+  h.review(pr, { author: "maya", body: "Rename `x`." });
+  await h.settle();
+  assert.equal(h.threadReads.count, 0, "pending, but not quiet yet");
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  assert.ok(h.threadReads.count > 0);
+});
