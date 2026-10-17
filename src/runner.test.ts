@@ -7,6 +7,7 @@ import {
   classifyFailure,
   compile,
   deriveStatus,
+  localPath,
   plan,
   toView,
   type Action,
@@ -148,6 +149,37 @@ test("compile gives every slice a verifier that waits on that slice only and kee
     ],
   );
   assert.match(jobs[0]!.prompt, /check\.sh[\s\S]*Your slice: packages\/api/);
+});
+
+test("compile gives every job the reads its plan declares, defaulting to origin", () => {
+  const panel = compiled({ ...PANEL, seats: [{ ...PANEL.seats[0], reads: "commit" }], judge: { ...PANEL.judge, reads: "prompt" } });
+  assert.deepEqual(panel.map((job) => job.reads), ["commit", "commit", "prompt"]);
+  assert.deepEqual(compiled(PANEL).map((job) => job.reads), ["origin", "origin", "origin"]);
+  const swarm = compiled({ ...SWARM, reads: "commit", slices: ["a", { name: "b", reads: "origin" }], verify: { prompt: "Re-run.", reads: "prompt" } });
+  assert.deepEqual(swarm.map((job) => [job.key, job.reads]), [["slice-1", "commit"], ["verify-1", "prompt"], ["slice-2", "origin"], ["verify-2", "prompt"]]);
+});
+
+test("compile rejects a job that may leave this machine when its prompt names a local path", () => {
+  const error = (input: unknown) => {
+    const result = compile(RunPlan.parse(input), resolveRole, ORIGIN);
+    return result.ok ? null : result.error;
+  };
+  const seat = (reads: string) => ({ ...PANEL, judge: undefined, seats: [{ label: "R", model: { tuple: "codex/gpt-6.1-sol/high" }, prompt: "Your brief is at /Users/me/brief.md.", reads }] });
+  assert.match(error(seat("commit"))!, /R reads "commit", but its prompt names \/Users\/me\/brief\.md/);
+  assert.match(error(seat("prompt"))!, /\/Users\/me\/brief\.md/);
+  assert.equal(error(seat("origin")), null);
+  assert.match(error({ ...SWARM, reads: "commit", brief: "Read $BB_THREAD_STORAGE/brief.md." })!, /\$BB_THREAD_STORAGE\/brief\.md/);
+});
+
+test("localPath finds home, temp, and thread-storage paths but not repo paths or URLs", () => {
+  for (const [text, path] of [
+    ["see /Users/me/x.md", "/Users/me/x.md"],
+    ["`/tmp/arena-1/candidate-2/`", "/tmp/arena-1/candidate-2/"],
+    ["(/home/bb/notes.txt)", "/home/bb/notes.txt"],
+    ["read ~/notes.md", "~/notes.md"],
+    ["at ${BB_THREAD_STORAGE}/brief.md", "${BB_THREAD_STORAGE}/brief.md"],
+  ] as const) assert.equal(localPath(text), path);
+  for (const text of ["src/runner.ts:120", "https://example.com/home/x", "the /api/v1 route", "a and/or b"]) assert.equal(localPath(text), null);
 });
 
 type PlanCase = { name: string; snapshot: RunSnapshot; now?: number; expect: string[]; check?: (actions: Action[]) => void };

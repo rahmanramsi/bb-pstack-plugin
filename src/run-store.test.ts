@@ -17,8 +17,8 @@ const ORIGIN: Origin = {
 
 const MODEL = { kind: "tuple", provider: "codex", model: "gpt-6.1-sol", reasoningLevel: "high" } as const;
 const JOBS: JobDraft[] = [
-  { key: "seat-1", kind: "seat", label: "A", model: MODEL, prompt: "p", result: "text", after: [], quorum: 0, slice: null },
-  { key: "judge", kind: "judge", label: "Judge", model: MODEL, prompt: "judge it", result: "text", after: ["seat-1"], quorum: 1, slice: null },
+  { key: "seat-1", kind: "seat", label: "A", model: MODEL, prompt: "p", result: "text", reads: "origin", after: [], quorum: 0, slice: null },
+  { key: "judge", kind: "judge", label: "Judge", model: MODEL, prompt: "judge it", result: "text", reads: "origin", after: ["seat-1"], quorum: 1, slice: null },
 ];
 const RUN = "psr_11111111-1111-1111-1111-111111111111" as RunId;
 

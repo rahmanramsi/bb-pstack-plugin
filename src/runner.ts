@@ -19,7 +19,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { RESULT_SCHEMAS, STATE_CHANNEL, type ResultKind, type RunPlan, type RunView } from "./contract.ts";
+import { RESULT_SCHEMAS, STATE_CHANNEL, type Reads, type ResultKind, type RunPlan, type RunView } from "./contract.ts";
 import { formatChoice, parseChoice, type ModelChoice } from "./models.ts";
 import type { RunStore } from "./run-store.ts";
 
@@ -48,6 +48,7 @@ export type JobDraft = {
   model: Tuple;
   prompt: string;
   result: ResultKind;
+  reads: Reads;
   /** Keys this job waits on. Empty means ready at start. A judge waits on every seat; a verifier on its slice. */
   after: readonly string[];
   /** For a judge: how many of `after` must succeed. Ignored otherwise. */
@@ -88,7 +89,14 @@ export function compile(
   };
 
   try {
-    return { ok: true, jobs: plan.kind === "panel" ? compilePanel(plan, models, origin) : compileSwarm(plan, models) };
+    const jobs = plan.kind === "panel" ? compilePanel(plan, models, origin) : compileSwarm(plan, models);
+    for (const job of jobs) {
+      const path = job.reads === "origin" ? null : localPath(job.prompt);
+      if (path !== null) {
+        throw new CompileError(`${job.label} reads "${job.reads}", but its prompt names ${path}, which exists only on this machine; put the content in the prompt or read "origin"`);
+      }
+    }
+    return { ok: true, jobs };
   } catch (error) {
     if (error instanceof CompileError) return { ok: false, error: error.message };
     throw error;
@@ -96,6 +104,14 @@ export function compile(
 }
 
 type Models = (ref: { role: string } | { tuple: string }) => Tuple[];
+
+const LOCAL_PATH = /(?:^|[\s"'`(=:])((?:\/(?:Users|home|root|tmp|private|var|Volumes|mnt)\/|~\/|\$\{?(?:BB_THREAD_STORAGE|TMPDIR|HOME)\b)[^\s"'`)]*)/;
+
+/** Pure: the first path in `text` under a home, temp, or thread-storage directory, which another machine does not have. */
+export function localPath(text: string): string | null {
+  return LOCAL_PATH.exec(text)?.[1] ?? null;
+}
+
 
 function compilePanel(plan: Extract<RunPlan, { kind: "panel" }>, models: Models, origin: Origin): JobDraft[] {
   const expanded = plan.seats.flatMap((seat) => models(seat.model).map((model) => ({ seat, model })));
@@ -107,6 +123,7 @@ function compilePanel(plan: Extract<RunPlan, { kind: "panel" }>, models: Models,
     model,
     prompt: seat.prompt,
     result: seat.result,
+    reads: seat.reads,
     after: [],
     quorum: 0,
     slice: null,
@@ -127,6 +144,7 @@ function compilePanel(plan: Extract<RunPlan, { kind: "panel" }>, models: Models,
     model: pool.find((model) => model.provider !== origin.providerId) ?? pool[0]!,
     prompt: plan.judge.prompt,
     result: plan.judge.result,
+    reads: plan.judge.reads,
     after: seats.map((seat) => seat.key),
     quorum,
     slice: null,
@@ -147,6 +165,7 @@ function compileSwarm(plan: Extract<RunPlan, { kind: "swarm" }>, models: Models)
       model: models(slice.model ?? plan.model)[0]!,
       prompt: [plan.brief, `Your slice: ${slice.name}`, slice.brief].filter(Boolean).join("\n\n"),
       result: "report",
+      reads: slice.reads ?? plan.reads,
       after: [],
       quorum: 0,
       slice: slice.name,
@@ -159,6 +178,7 @@ function compileSwarm(plan: Extract<RunPlan, { kind: "swarm" }>, models: Models)
       model: models(plan.verify.model ?? plan.model)[0]!,
       prompt: plan.verify.prompt,
       result: "verdict",
+      reads: plan.verify.reads,
       after: [key],
       quorum: 1,
       slice: slice.name,

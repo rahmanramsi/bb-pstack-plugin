@@ -147,7 +147,8 @@ export function openRunStore(db: Db, clock: () => number = Date.now): RunStore {
         .prepare("SELECT job_key, ordinal, state, thread_id, issued_at, finished_at FROM attempts WHERE run_id = ? ORDER BY ordinal")
         .all(runId) as AttemptRow[];
       const jobs = (db.prepare("SELECT * FROM jobs WHERE run_id = ? ORDER BY ord").all(runId) as JobRow[]).map((row): JobSnapshot => {
-        const draft = JSON.parse(row.draft_json) as JobDraft;
+        // Drafts stored before `reads` existed read the origin worktree.
+        const draft = { reads: "origin", ...JSON.parse(row.draft_json) } as JobDraft;
         return {
           ...draft,
           prompt: row.released_prompt ?? draft.prompt,

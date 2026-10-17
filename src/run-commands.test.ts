@@ -106,7 +106,7 @@ test("run start --plan-json prints the run id, a summary, the directive on its o
     "",
   ]);
   assert.equal(h.started[0]!.threadId, "thr_origin");
-  assert.deepEqual(h.started[0]!.plan, { ...PLAN, model: { role: "swarm workers" } });
+  assert.deepEqual(h.started[0]!.plan, { ...PLAN, reads: "origin", model: { role: "swarm workers" } });
 
   const json = await h.run(["run", "start", "--plan-json", JSON.stringify(PLAN), "--json"]);
   const parsed = JSON.parse(json.stdout!);
