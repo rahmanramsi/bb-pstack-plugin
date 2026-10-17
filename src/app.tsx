@@ -8,20 +8,12 @@ import type { rpcContract } from "./rpc.ts";
 import { CHECKOUT_RENDERER } from "./checkout-form.ts";
 import { CheckoutConsent } from "./ui/consent.tsx";
 import { bannerSummary, directiveRunId, panelRunId } from "./ui/layout.ts";
+import { ISSUES_PATH, IssuesHeader, IssuesPage, WorkerIssue } from "./ui/issues.tsx";
 import { useRunView, useThreadView } from "./ui/live.ts";
-import { Agreement, ChecklistPanel, Disclosure, Findings, LoadMessage, PanelFlow, RunHeading, RunOverview, Timeline, Workers } from "./ui/views.tsx";
+import { Agreement, ChecklistPanel, Disclosure, Findings, LoadMessage, PanelFlow, RunHeading, RunOverview, Timeline, Workers, useNow } from "./ui/views.tsx";
 import "./ui/styles.css";
 
 const PANEL_ACTION = "pstack-run";
-
-function useNow() {
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = setInterval(() => { if (document.visibilityState !== "hidden") setNow(Date.now()); }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-  return now;
-}
 
 function StopRun({ threadId, runId, refresh }: { threadId: string; runId: string; refresh: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -107,6 +99,7 @@ function ThreadInspector({ threadId, runId }: { threadId: string; runId: string 
     else if (state.status === "ready") setSelected((current) => current ?? state.value.activeRuns[0]?.id ?? null);
   }, [runId, state]);
   return <div className="pstack ps-inspector">
+    <WorkerIssue threadId={threadId} />
     <LoadMessage state={state} />
     {state.status !== "ready" ? null : <>
       {state.value.activeRuns.length === 0 ? null : <nav className="ps-run-options" aria-label="Active pstack runs">{state.value.activeRuns.map((run) => <Button type="button" size="sm" variant="ghost" className="ps-action" aria-pressed={selected === run.id} key={run.id} onClick={() => setSelected(run.id)}>{run.title}</Button>)}</nav>}
@@ -133,4 +126,5 @@ export default definePluginApp((app) => {
   app.composer.customize({ id: "pstack-status", scopes: ["thread"], banners: [{ id: "runs-and-checklist", chrome: "bare", component: ComposerBanner }] });
   app.slots.pendingInteraction({ id: CHECKOUT_RENDERER, component: CheckoutConsent });
   app.slots.threadPanelAction({ id: PANEL_ACTION, title: "pstack runs and checklist", icon: "Layers", layout: "flush", component: Inspector });
+  app.slots.navPanel({ id: "pstack-issues", title: "Issue workers", icon: "CircleDot", path: ISSUES_PATH, component: IssuesPage, headerContent: IssuesHeader });
 });

@@ -202,3 +202,17 @@
 .ps-consent-name { min-width: 0; overflow-wrap: anywhere; }
 .ps-consent-choice { display: inline-flex; gap: 4px; flex-shrink: 0; }
 .pstack .ps-consent-choice button[aria-pressed=true] { background: var(--secondary); color: var(--foreground); }
+.ps-issues { height: 100%; overflow-y: auto; background: var(--background); }
+.ps-repo-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; margin-bottom: 8px; }
+.ps-section .ps-repo-heading h3 { margin-bottom: 0; overflow-wrap: anywhere; }
+.ps-issue { display: grid; gap: 4px; }
+.ps-task-list > li.ps-issue { padding: 10px 0; }
+.ps-issue p { overflow-wrap: anywhere; }
+.ps-issue-line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 16px; }
+.ps-issue-title { min-width: 0; overflow-wrap: anywhere; }
+.ps-issue-links { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: -9px; }
+.ps-issue-links .ps-stop, .ps-confirm { margin-left: auto; }
+.ps-issue-links > p { flex-basis: 100%; padding-left: 9px; }
+.ps-confirm { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.ps-confirm .ps-stop { margin-left: 0; }
+.pstack .ps-toggle[aria-pressed=true] { background: var(--secondary); color: var(--foreground); }
