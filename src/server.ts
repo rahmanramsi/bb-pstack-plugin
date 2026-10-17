@@ -6,9 +6,11 @@ import { openChecklistStore } from "./checklist-store.ts";
 import { evidenceFreshnessError } from "./checklist.ts";
 import { ISSUES_CHANNEL, STATE_CHANNEL } from "./contract.ts";
 import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
+import { issueBoard } from "./issues/board.ts";
 import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
 import { createIssues } from "./issues/engine.ts";
 import { GitHubSetupError, createGitHub, decodePrivateKey } from "./issues/github.ts";
+import type { JobId } from "./issues/job.ts";
 import { openIssueStore } from "./issues/store.ts";
 import { rpcContract } from "./rpc.ts";
 import { createRunFeature } from "./run-commands.ts";
@@ -211,6 +213,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }, ISSUE_SIGNAL_MS);
   });
+  const issueRepos = () => {
+    if (!current.githubAppId || !current.githubPrivateKey) return [];
+    const parsed = parseIssueRepos(current.issueRepos);
+    return parsed.ok ? parsed.repos : [];
+  };
   const hosts = bb.hosts.experimental_client({ contract: hostContract });
   const issues = createIssues({
     bb,
@@ -224,11 +231,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
     }),
     hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),
-    repos: () => {
-      if (!current.githubAppId || !current.githubPrivateKey) return [];
-      const parsed = parseIssueRepos(current.issueRepos);
-      return parsed.ok ? parsed.repos : [];
-    },
+    repos: issueRepos,
     resolveRole,
     prGate: (threadId) => {
       const state = checklistStore.checklist(threadId);
@@ -304,6 +307,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
     pstackStopRun: async ({ threadId, runId }) => ({ stopped: await runner.stop(runId as RunId, threadId) }),
     pstackCheckoutProof: async ({ formId }) => ({ sent: checkouts.publishProof(formId) }),
+    pstackIssueBoard: async (filter) => issueBoard(issueStore, issueRepos().map((mapping) => mapping.repo), filter),
+    pstackStopIssueJob: async ({ id }) => ({ stopped: await issues.stop(id as JobId, "the bb app") }),
   });
 
   bb.cli.register(

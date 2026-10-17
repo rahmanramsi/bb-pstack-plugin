@@ -4,7 +4,8 @@ import Database from "better-sqlite3";
 import type { BbPluginApi, PluginCliRegistration } from "@get-bb/plugin-sdk";
 import plugin from "./server.ts";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { openIssueStore } from "./issues/store.ts";
+import { ISSUES_CHANNEL } from "./contract.ts";
+import { openIssueStore, type NewJob } from "./issues/store.ts";
 import type { JobId, RepoName } from "./issues/job.ts";
 import { openChecklistStore } from "./checklist-store.ts";
 
@@ -102,5 +103,65 @@ test("an unusable GitHub App private key shows as the repository's poll error", 
   service.controller.abort();
   await service.done;
   assert.match(await listed(), /poll error: githubPrivateKey is not a base64-encoded PEM private key/);
+  await harness.dispose();
+});
+
+const ISSUE_SETUP = {
+  githubAppId: "123",
+  githubPrivateKey: Buffer.from("not a key").toString("base64"),
+  issueRepos: "acme/web project=prj_web host=host_worker\nacme/api project=prj_api host=host_worker",
+};
+
+function queuedJob(id: string, issue: number, eventId: number): NewJob {
+  return {
+    id: id as JobId,
+    repo: "acme/web" as RepoName,
+    issue,
+    trigger: { eventId, actor: "maya", at: 1 },
+    snapshot: { title: `Issue ${issue}`, body: "", url: `https://github.com/acme/web/issues/${issue}`, author: "maya" },
+    projectId: "prj_web",
+    hostId: "host_worker",
+    baseBranch: "main",
+    state: "queued",
+    error: null,
+  };
+}
+
+test("the app's issue board is the board `bb pstack issues list --json` prints, and a worker thread's board holds its job", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "pstack", settings: ISSUE_SETUP });
+  await plugin(bb);
+  const store = openIssueStore(bb.storage.database(), () => {});
+  const working = store.insert(queuedJob("psi_00000000-0000-0000-0000-000000000001", 41, 1), 1)!;
+  store.write(working.id, working.version, { phase: { state: "working" }, threadId: "thr_worker" }, 2);
+  const ended = store.insert(queuedJob("psi_00000000-0000-0000-0000-000000000002", 42, 2), 3)!;
+  store.write(ended.id, ended.version, { phase: { state: "stopped" } }, 4);
+  const listed = async (...flags: string[]) => JSON.parse((await harness.runCli(["issues", "list", "--json", ...flags], { cwd: "/tmp" })).stdout);
+
+  const open = await harness.callRpc("pstackIssueBoard", { all: false });
+  assert.deepEqual(open, await listed());
+  assert.deepEqual((open as { repos: { repo: string }[] }).repos.map((repo) => repo.repo), ["acme/web", "acme/api"]);
+  assert.deepEqual(await harness.callRpc("pstackIssueBoard", { all: true }), await listed("--all"));
+  const worker = (await harness.callRpc("pstackIssueBoard", { threadId: "thr_worker" })) as { jobs: { id: string; title: string }[] };
+  assert.deepEqual(worker.jobs.map((job) => [job.id, job.title]), [[working.id, "Issue 41"]]);
+  assert.deepEqual(await harness.callRpc("pstackIssueBoard", { threadId: "thr_person" }), { repos: [], jobs: [] });
+  await harness.dispose();
+});
+
+test("stopping an issue job from the app moves it to stopping once, and signals the issue channel", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "pstack" });
+  await plugin(bb);
+  const store = openIssueStore(bb.storage.database(), () => {});
+  const job = store.insert(queuedJob("psi_00000000-0000-0000-0000-000000000003", 43, 3), 1)!;
+  store.write(job.id, job.version, { phase: { state: "working" }, threadId: "thr_worker" }, 2);
+
+  assert.deepEqual(await harness.callRpc("pstackStopIssueJob", { id: job.id }), { stopped: true });
+  assert.equal(store.get(job.id)!.phase.state, "stopping");
+  assert.deepEqual(await harness.callRpc("pstackStopIssueJob", { id: job.id }), { stopped: false });
+  await assert.rejects(harness.callRpc("pstackStopIssueJob", { id: "psi_not-an-id" }));
+
+  while (!harness.realtimeSignals.some((signal) => signal.channel === ISSUES_CHANNEL)) await new Promise((resolve) => setTimeout(resolve, 20));
+  const signal = harness.realtimeSignals.find((candidate) => candidate.channel === ISSUES_CHANNEL)!;
+  assert.ok(Number.isInteger((signal.payload as { revision: unknown }).revision));
+  assert.deepEqual(Object.keys(signal.payload as object), ["revision"]);
   await harness.dispose();
 });
