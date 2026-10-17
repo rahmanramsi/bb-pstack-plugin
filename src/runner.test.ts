@@ -8,6 +8,7 @@ import {
   compile,
   deriveStatus,
   localPath,
+  pinOf,
   plan,
   toView,
   type Action,
@@ -22,6 +23,8 @@ const ORIGIN: Origin = {
   threadId: "thr_origin",
   projectId: "prj_1",
   environmentId: "env_1",
+  hostId: "host_home",
+  pin: null,
   providerId: "claude-code",
   model: "claude-opus-5-5",
   reasoningLevel: "high",
@@ -66,8 +69,8 @@ function run(jobs: JobDraft[], states: Record<string, Partial<JobSnapshot>> = {}
   };
 }
 
-const attached = (threadId: string) => ({ ordinal: 1, state: "attached" as const, threadId, issuedAt: NOW - 10, finishedAt: null });
-const finished = (ordinal: number) => ({ ordinal, state: "finished" as const, threadId: `thr_${ordinal}`, issuedAt: NOW - 10, finishedAt: NOW - 5 });
+const attached = (threadId: string) => ({ ordinal: 1, state: "attached" as const, threadId, issuedAt: NOW - 10, finishedAt: null, host: null });
+const finished = (ordinal: number) => ({ ordinal, state: "finished" as const, threadId: `thr_${ordinal}`, issuedAt: NOW - 10, finishedAt: NOW - 5, host: null });
 const review = (...titles: string[]) => ({
   findings: titles.map((title) => ({ severity: "warning" as const, title, location: "src/a.ts:1", detail: "detail" })),
 });
@@ -180,6 +183,21 @@ test("localPath finds home, temp, and thread-storage paths but not repo paths or
     ["at ${BB_THREAD_STORAGE}/brief.md", "${BB_THREAD_STORAGE}/brief.md"],
   ] as const) assert.equal(localPath(text), path);
   for (const text of ["src/runner.ts:120", "https://example.com/home/x", "the /api/v1 route", "a and/or b"]) assert.equal(localPath(text), null);
+});
+
+test("pinOf pins only a clean branch whose HEAD is already on origin", () => {
+  const status = (checkout: unknown, state = "clean", baseRef: string | null = "abc") => ({
+    outcome: "available",
+    workspace: { checkout, workingTree: { state }, mergeBase: { mergeBaseBranch: "origin/feature", baseRef } },
+  }) as unknown as Parameters<typeof pinOf>[0];
+  const branch = { kind: "branch", branchName: "feature", headSha: "abc" };
+  assert.deepEqual(pinOf(status(branch)), { branch: "feature", sha: "abc" });
+  assert.equal(pinOf(status(branch, "dirty_uncommitted")), null);
+  assert.equal(pinOf(status(branch, "untracked")), null);
+  assert.equal(pinOf(status(branch, "clean", null)), null, "origin/feature does not exist");
+  assert.equal(pinOf(status(branch, "clean", "older")), null, "HEAD is ahead of origin/feature");
+  assert.equal(pinOf(status({ kind: "detached", headSha: "abc" })), null);
+  assert.equal(pinOf(status({ ...branch, branchName: "other" })), null, "the merge base is for another branch");
 });
 
 type PlanCase = { name: string; snapshot: RunSnapshot; now?: number; expect: string[]; check?: (actions: Action[]) => void };
@@ -311,17 +329,17 @@ const PLAN_CASES: PlanCase[] = [
   },
   {
     name: "past the deadline every open job fails and nothing spawns",
-    snapshot: run(compiled(SWARM), { "slice-1": { state: "running", attempts: [attached("thr_1")] }, "slice-2": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null }] } }, NOW),
+    snapshot: run(compiled(SWARM), { "slice-1": { state: "running", attempts: [attached("thr_1")] }, "slice-2": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null, host: null }] } }, NOW),
     expect: ["fail:slice-1", "fail:verify-1", "fail:slice-2", "fail:verify-2"],
   },
   {
     name: "restart: an issued attempt with no thread never spawns again",
-    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "running", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null }] } }),
+    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "running", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null, host: null }] } }),
     expect: [],
   },
   {
     name: "restart: an uncertain job never spawns again before the deadline",
-    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null }] } }),
+    snapshot: run(compiled({ ...SWARM, verify: undefined, slices: ["a"] }), { "slice-1": { state: "uncertain", attempts: [{ ordinal: 1, state: "issued", threadId: null, issuedAt: NOW, finishedAt: null, host: null }] } }),
     expect: [],
   },
   {
@@ -380,7 +398,7 @@ test("deriveStatus marks a swarm partial when a verifier rejects a report or a s
 });
 
 test("classifyFailure", () => {
-  for (const error of ["Provider overloaded", "HTTP 503 from upstream", "rate limit exceeded", "read ECONNRESET", "socket hang up", "api error 529"]) {
+  for (const error of ["Provider overloaded", "HTTP 503 from upstream", "rate limit exceeded", "read ECONNRESET", "socket hang up", "api error 529", "workspace mismatch: the worker's HEAD on box is abc", "workspace unverified: could not read the worker's HEAD"]) {
     assert.equal(classifyFailure(error), "transient", error);
   }
   for (const error of ["model not found", "permission denied", "the run deadline passed", "status 400"]) {

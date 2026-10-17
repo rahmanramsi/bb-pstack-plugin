@@ -16,8 +16,8 @@ const VIEW: RunView = {
   createdAt: 1,
   finishedAt: null,
   jobs: [
-    { key: "slice-1", kind: "slice", label: "packages/api", model: "codex/gpt-6.1-sol/high", state: "succeeded", attempt: 1, threadId: "thr_w1", startedAt: 1, finishedAt: 2, error: null, summary: "PASS", slice: "packages/api" },
-    { key: "verify-1", kind: "verifier", label: "Verify packages/api", model: "codex/gpt-6.1-sol/high", state: "running", attempt: 1, threadId: "thr_w2", startedAt: 2, finishedAt: null, error: null, summary: null, slice: "packages/api" },
+    { key: "slice-1", kind: "slice", label: "packages/api", model: "codex/gpt-6.1-sol/high", state: "succeeded", attempt: 1, threadId: "thr_w1", host: { id: "host_box", name: "box" }, startedAt: 1, finishedAt: 2, error: null, summary: "PASS", slice: "packages/api" },
+    { key: "verify-1", kind: "verifier", label: "Verify packages/api", model: "codex/gpt-6.1-sol/high", state: "running", attempt: 1, threadId: "thr_w2", host: null, startedAt: 2, finishedAt: null, error: null, summary: null, slice: "packages/api" },
   ],
   findings: [],
   matrix: null,

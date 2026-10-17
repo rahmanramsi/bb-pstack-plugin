@@ -70,6 +70,8 @@ export const MIGRATIONS: readonly string[] = [
      CHECK (status = 'open' OR (status = 'done' AND evidence_json IS NOT NULL) OR (status = 'skipped' AND length(trim(reason)) > 0)),
      PRIMARY KEY (thread_id, id)
    )`,
+  `ALTER TABLE attempts ADD COLUMN host_id TEXT`,
+  `ALTER TABLE attempts ADD COLUMN host_name TEXT`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

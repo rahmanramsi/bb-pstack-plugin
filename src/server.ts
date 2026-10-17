@@ -127,13 +127,17 @@ export default async function plugin(bb: BbPluginApi) {
   const placement = createPlacement(bb);
   registerDispatchGuard(bb, placement, () => placementGuard);
   const checklistStore = openChecklistStore(db);
-  const runner = createRunner(bb, runStore, resolveRole, Date.now, async (tuples, environmentId) => {
-    const ids = [...new Set(tuples.map((tuple) => tuple.split("/")[0]!))];
-    const catalog = await loadCatalog(bb, environmentId, ids);
-    return tuples.flatMap((tuple) => {
-      const check = checkTuple(tuple, catalog);
-      return check.ok ? [] : [`${tuple}: ${check.detail}`];
-    });
+  const runner = createRunner(bb, runStore, {
+    resolveRole,
+    placement,
+    async modelProblems(tuples, environmentId) {
+      const ids = [...new Set(tuples.map((tuple) => tuple.split("/")[0]!))];
+      const catalog = await loadCatalog(bb, environmentId, ids);
+      return tuples.flatMap((tuple) => {
+        const check = checkTuple(tuple, catalog);
+        return check.ok ? [] : [`${tuple}: ${check.detail}`];
+      });
+    },
   });
 
   const checklist = createChecklistFeature({

@@ -9,6 +9,8 @@ const ORIGIN: Origin = {
   threadId: "thr_origin",
   projectId: "prj_1",
   environmentId: "env_1",
+  hostId: "host_home",
+  pin: null,
   providerId: "claude-code",
   model: "claude-opus-5-5",
   reasoningLevel: "high",
@@ -20,6 +22,7 @@ const JOBS: JobDraft[] = [
   { key: "seat-1", kind: "seat", label: "A", model: MODEL, prompt: "p", result: "text", reads: "origin", after: [], quorum: 0, slice: null },
   { key: "judge", kind: "judge", label: "Judge", model: MODEL, prompt: "judge it", result: "text", reads: "origin", after: ["seat-1"], quorum: 1, slice: null },
 ];
+const HOME = { id: "host_home", name: "Mac Mini" };
 const RUN = "psr_11111111-1111-1111-1111-111111111111" as RunId;
 
 function setup() {
@@ -60,11 +63,11 @@ test("transitionJobAndAttempt is a compare-and-set, and releasing stores the mat
 test("an attempt is claimed once per ordinal, only while its job runs, and attached once", () => {
   const { store, create } = setup();
   create();
-  assert.equal(store.claimAttempt(RUN, "seat-1", 1, 5), false, "queued job cannot claim");
+  assert.equal(store.claimAttempt(RUN, "seat-1", 1, 5, HOME), false, "queued job cannot claim");
   store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
-  assert.equal(store.claimAttempt(RUN, "seat-1", 1, 5), true);
-  assert.equal(store.claimAttempt(RUN, "seat-1", 1, 6), false);
-  assert.deepEqual(store.snapshot(RUN)!.jobs[0]!.attempts, [{ ordinal: 1, state: "issued", threadId: null, issuedAt: 5, finishedAt: null }]);
+  assert.equal(store.claimAttempt(RUN, "seat-1", 1, 5, HOME), true);
+  assert.equal(store.claimAttempt(RUN, "seat-1", 1, 6, { id: "host_box", name: "box" }), false);
+  assert.deepEqual(store.snapshot(RUN)!.jobs[0]!.attempts, [{ ordinal: 1, state: "issued", threadId: null, issuedAt: 5, finishedAt: null, host: HOME }], "an issued attempt keeps its machine");
 
   assert.equal(store.attachAttempt(RUN, "seat-1", 1, "thr_w1"), true);
   assert.equal(store.attachAttempt(RUN, "seat-1", 1, "thr_w2"), false);
@@ -76,7 +79,7 @@ test("leaving the live states finishes the open attempt; uncertain keeps it open
   const { store, create, tick } = setup();
   create();
   store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
-  store.claimAttempt(RUN, "seat-1", 1, 5);
+  store.claimAttempt(RUN, "seat-1", 1, 5, HOME);
   store.transitionJobAndAttempt(RUN, "seat-1", "running", "uncertain");
   assert.equal(store.snapshot(RUN)!.jobs[0]!.attempts[0]!.state, "issued");
   tick(500);
@@ -89,11 +92,11 @@ test("one thread cannot be attached to two attempts", () => {
   const { store, create } = setup();
   create();
   store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
-  store.claimAttempt(RUN, "seat-1", 1, 5);
+  store.claimAttempt(RUN, "seat-1", 1, 5, HOME);
   store.attachAttempt(RUN, "seat-1", 1, "thr_w1");
   store.transitionJobAndAttempt(RUN, "seat-1", "running", "queued", { providerRetries: 1 });
   store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
-  store.claimAttempt(RUN, "seat-1", 2, 6);
+  store.claimAttempt(RUN, "seat-1", 2, 6, HOME);
   assert.equal(store.attachAttempt(RUN, "seat-1", 2, "thr_w1"), false);
 });
 
@@ -122,7 +125,7 @@ test("cancelRun cancels the run, its open jobs and their attempts together, and 
   const { store, create } = setup();
   create();
   store.transitionJobAndAttempt(RUN, "seat-1", "queued", "running");
-  store.claimAttempt(RUN, "seat-1", 1, 5);
+  store.claimAttempt(RUN, "seat-1", 1, 5, HOME);
   store.attachAttempt(RUN, "seat-1", 1, "thr_w1");
   assert.deepEqual(store.pendingCleanup(RUN), [], "a live attempt is not cleaned up");
 

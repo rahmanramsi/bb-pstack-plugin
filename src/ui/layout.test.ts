@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { agreementMatrix, bannerSummary, checklistGroups, directiveRunId, ganttLayout, panelFlow, panelRunId, runProgress, severityCounts, swarmGrid, type Job } from "./layout.ts";
 
 function job(key: string, overrides: Partial<Job> = {}): Job {
-  return { key, kind: "seat", label: key, model: "codex/model/high", state: "queued", attempt: 0, threadId: null, startedAt: null, finishedAt: null, error: null, summary: null, slice: null, ...overrides };
+  return { key, kind: "seat", label: key, model: "codex/model/high", state: "queued", attempt: 0, threadId: null, host: null, startedAt: null, finishedAt: null, error: null, summary: null, slice: null, ...overrides };
 }
 
 test("directive and inspector reject malformed identifiers and extra parameters", () => {

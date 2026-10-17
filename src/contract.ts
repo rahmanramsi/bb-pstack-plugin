@@ -147,6 +147,8 @@ const JobView = z.object({
   state: JobState,
   attempt: z.number().int(),
   threadId: z.string().nullable(),
+  /** The machine the latest attempt was issued on. */
+  host: z.object({ id: z.string(), name: z.string() }).nullable(),
   startedAt: z.number().nullable(),
   finishedAt: z.number().nullable(),
   error: z.string().nullable(),
