@@ -686,6 +686,24 @@ test("a worker role bb cannot run sticks the job at once with the reason, before
   }
 });
 
+test("queued jobs that cannot resolve their worker yet do not hold back a job that can", async () => {
+  const h = harness();
+  h.setRepo({ repo: REPO, projectId: "prj_offline", hostId: "host_worker" });
+  for (const issue of [41, 42, 43]) h.label(issue);
+  await h.engine().issues.sweep();
+  const waiting = await h.views();
+  assert.deepEqual(waiting.map((job) => job.state), ["queued", "queued", "queued"]);
+  for (const job of waiting) assert.match(job.error!, /project settings are unavailable/);
+
+  h.setRepo({ repo: REPO, projectId: "prj_web", hostId: "host_worker" });
+  h.clock.now += MIN;
+  h.label(44);
+  await h.engine().issues.sweep();
+  const [newest] = await h.views();
+  assert.equal(newest!.issue, 44);
+  assert.equal(newest!.state, "working");
+});
+
 test("an effect's handler has a probe exactly when its policy looks for a trace before running it again", () => {
   const perform = async () => ({ kind: "absent" }) as const;
   // @ts-expect-error labels are replayed, so a probe would never run

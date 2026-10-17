@@ -50,7 +50,10 @@ export type IssueStore = {
   due(): JobId[];
   /** Newest first; terminal jobs only with `all`. */
   list(filter: { repo?: RepoName; all: boolean }): Job[];
-  /** Jobs holding a worker slot, and how many queued jobs were created before this one. */
+  /**
+   * Jobs holding a worker slot, and how many queued jobs created before this one could start. A queued job's error is
+   * why its worker could not be resolved, so one with an error does not hold back the jobs behind it.
+   */
   slots(id: JobId): { busy: number; ahead: number };
   /**
    * The one write. Returns the new row, or null when the version moved (re-read and replan) or when the change would
@@ -245,7 +248,7 @@ export function openIssueStore(db: Db): IssueStore {
         .get(...BUSY_LIST) as { busy: number };
       const { ahead } = db
         .prepare(
-          `SELECT count(*) AS ahead FROM issue_jobs q, issue_jobs me WHERE me.id = ? AND q.state = 'queued'
+          `SELECT count(*) AS ahead FROM issue_jobs q, issue_jobs me WHERE me.id = ? AND q.state = 'queued' AND q.error IS NULL
              AND (q.created_at < me.created_at OR (q.created_at = me.created_at AND q.id < me.id))`,
         )
         .get(id) as { ahead: number };
