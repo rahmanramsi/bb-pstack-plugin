@@ -6,8 +6,8 @@ import { MIGRATIONS } from "./store.ts";
 import type { Resolution, StepDraft } from "./checklist.ts";
 
 const drafts: StepDraft[] = [
-  { section: "playbook", text: "1. Read the design.", afterPr: false },
-  { section: "pr", text: "**Readiness.** Check the PR.", afterPr: true },
+  { section: "playbook", text: "1. Read the design.", skipPolicy: "agent", afterPr: false },
+  { section: "pr", text: "**Readiness.** Check the PR.", skipPolicy: "agent", afterPr: true },
 ];
 const done = { kind: "done", evidence: [{ kind: "path", path: "src/checklist.ts" }] } satisfies Resolution;
 
@@ -94,4 +94,19 @@ test("only one caller can mark a revision nudged and stale revisions cannot mark
   assert.equal(other.markNudged("thr_test", 1), true);
   assert.equal(store.markNudged("thr_test", 1), false);
   assert.equal(store.checklist("thr_test")?.nudgedAtRevision, 1);
+});
+
+test("a step opens only after its prerequisite closes and inserted current steps receive a timestamp", (t) => {
+  const { db } = fixture(t);
+  let now = 200;
+  const store = openChecklistStore(db, () => now);
+  store.createChecklist("thr_order", "feature", [drafts[0], drafts[0], drafts[1]], 100);
+  assert.deepEqual(store.checklist("thr_order")?.steps.map((step) => step.openedAt), [100, null, 100]);
+  assert.ok("error" in store.resolveStep("thr_order", 2, done));
+  store.resolveStep("thr_order", 1, done);
+  assert.deepEqual(store.checklist("thr_order")?.steps.map((step) => step.openedAt), [100, 200, 100]);
+  now = 300;
+  store.addStep("thr_order", "Inserted first", 1);
+  assert.equal(store.checklist("thr_order")?.steps[1].openedAt, 300);
+  assert.ok("error" in store.resolveStep("thr_order", 2, done));
 });

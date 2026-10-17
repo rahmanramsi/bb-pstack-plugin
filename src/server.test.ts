@@ -32,7 +32,7 @@ test("pstack delegates receive checklist nudges while run workers do not", async
   assert.ok(cli);
   const store = openChecklistStore(db);
   for (const id of ["thr_delegate", "thr_worker"]) {
-    store.createChecklist(id, "feature", [{ section: "playbook", text: "Verify the change.", afterPr: false }], 0);
+    store.createChecklist(id, "feature", [{ section: "playbook", text: "Verify the change.", afterPr: false, skipPolicy: "agent" }], 0);
   }
   db.prepare("INSERT INTO attempts (run_id, job_key, ordinal, state, thread_id, issued_at) VALUES (?, ?, ?, ?, ?, ?)")
     .run("psr_run", "seat-a", 1, "attached", "thr_worker", 0);

@@ -7,10 +7,10 @@ import { cliCommand, PluginCliError } from "@get-bb/plugin-sdk";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { activatesPoteto, potetoCharter, revivalDecision, type PotetoDispatch } from "./poteto.ts";
+import { activatesPoteto, isPotetoUser, potetoControl, potetoCharter, revivalDecision, type PotetoDispatch } from "./poteto.ts";
 import {
   extractSteps, gate, parseEvidence, parseReason, playbookSources, renderOpenSteps, shouldNudge,
-  type Evidence, type Resolution,
+  closeStep, type Evidence, type Resolution,
 } from "./checklist.ts";
 import type { ChecklistStore } from "./checklist-store.ts";
 
@@ -37,7 +37,7 @@ export function createChecklistFeature(deps: {
   activeWork(threadId: string): Promise<{ activeRuns: number; activeChildren: number }>;
   /** Called after every committed change so the UI refetches. */
   publish(threadId: string): void;
-  evidenceError(evidence: Evidence, threadId: string): Promise<string | null>;
+  evidenceError(evidence: Evidence, threadId: string, openedAt: number): Promise<string | null>;
   clock?: () => number;
 }): ChecklistFeature {
   const { bb, store, publish } = deps;
@@ -45,6 +45,7 @@ export function createChecklistFeature(deps: {
   const clock = deps.clock ?? Date.now;
   const charter = potetoCharter(join(deps.skillsDir, "poteto-mode", "SKILL.md"));
   const reconciling = new Set<string>();
+  const pendingPublications = new Set<string>();
   function potetoStatus(id: string): string {
     const state = store.poteto(id);
     if (!state) return "";
@@ -56,6 +57,7 @@ export function createChecklistFeature(deps: {
     if (reconciling.has(id)) return;
     reconciling.add(id);
     try {
+      if (pendingPublications.delete(id)) publish(id);
       const state = store.poteto(id);
       if (!state) return;
       const decision = revivalDecision(state, idle);
@@ -159,12 +161,21 @@ export function createChecklistFeature(deps: {
         const invalid = references.find((reference) => "error" in reference);
         if (invalid && "error" in invalid) return output(id, invalid.error, 1);
         const evidence = references.filter((reference): reference is Evidence => !("error" in reference));
-        for (const reference of evidence) {
-          const problem = await deps.evidenceError(reference, id);
-          if (problem) return output(id, problem, 1);
-        }
+        const parsedId = stepId(input.positionals.id);
+        if (typeof parsedId !== "number") return output(id, parsedId.error, 1);
+        const checklist = store.checklist(id);
+        if (!checklist) return output(id, "Begin a playbook checklist first.", 1);
         const [first, ...rest] = evidence;
         if (!first) return output(id, "At least one evidence reference is required.", 1);
+        const check = closeStep(checklist, parsedId, { kind: "done", evidence: [first, ...rest] });
+        if (!check.ok) return output(id, check.error, 1);
+        if (!check.changed) return output(id, `Step ${parsedId} already closed.`);
+        // Checklists begun before opened_at existed never got one; the backfill migration opens their current step at createdAt.
+        const openedAt = checklist.steps.find((step) => step.id === parsedId)?.openedAt ?? checklist.createdAt;
+        for (const reference of evidence) {
+          const problem = await deps.evidenceError(reference, id, openedAt);
+          if (problem) return output(id, problem, 1);
+        }
         return resolve(id, input.positionals.id, { kind: "done", evidence: [first, ...rest] });
       },
     }),
@@ -206,11 +217,20 @@ export function createChecklistFeature(deps: {
   return {
     commands, footer, reconcile,
     dispatch(context) {
-      if (activatesPoteto(context, bb.pluginId)) store.activate(context.thread.id, `poteto:${context.thread.id}`, clock());
+      if (!isPotetoUser(context, bb.pluginId)) return { action: "proceed" };
+      const control = potetoControl(context.input.text);
+      if (control) {
+        if (control.kind === "invalid") return { action: "reject", message: "Use /poteto-mode waive <step> <reason>, with a reason of 1 to 500 characters." };
+        const result = store.resolveStep(context.thread.id, control.stepId, { kind: "skipped", reason: control.reason }, "user");
+        if (!("error" in result) && result.changed) pendingPublications.add(context.thread.id);
+        return { action: "reject", message: "error" in result ? result.error : `Step ${control.stepId} waived. Run bb pstack checklist show to see the next step.` };
+      }
+      if (activatesPoteto(context, bb.pluginId) && store.activate(context.thread.id, `poteto:${context.thread.id}`, clock())) pendingPublications.add(context.thread.id);
       return { action: "proceed" };
     },
     async serve(signal) {
       while (!signal.aborted) {
+        for (const id of pendingPublications) { pendingPublications.delete(id); publish(id); }
         for (const id of store.potetoThreads()) {
           if (signal.aborted) break;
           try {

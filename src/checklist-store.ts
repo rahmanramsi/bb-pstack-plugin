@@ -16,13 +16,18 @@ export type ChecklistStore = {
   createChecklist(threadId: string, playbook: string, steps: readonly StepDraft[], now: number): { created: boolean };
   checklist(threadId: string): Checklist | null;
   /** CAS on the step's current resolution; bumps the checklist revision when it changes. */
-  resolveStep(threadId: string, stepId: number, resolution: Exclude<Resolution, { kind: "open" }>): { changed: boolean } | { error: string };
+  resolveStep(threadId: string, stepId: number, resolution: Exclude<Resolution, { kind: "open" }>, actor?: "agent" | "user"): { changed: boolean } | { error: string };
   addStep(threadId: string, text: string, afterId: number | null): { id: number } | { error: string };
   /** Records the nudge for the current revision; returns false if another caller already did. */
   markNudged(threadId: string, revision: number): boolean;
 };
 
-export function openChecklistStore(db: Db): ChecklistStore {
+export function openChecklistStore(db: Db, clock: () => number = Date.now): ChecklistStore {
+  function openCurrent(threadId: string, now: number) {
+    db.prepare(`UPDATE steps SET opened_at = ? WHERE thread_id = ? AND opened_at IS NULL AND status = 'open'
+      AND (section = 'pr' OR id = (SELECT id FROM steps WHERE thread_id = ? AND section = 'playbook' AND status = 'open' ORDER BY position, id LIMIT 1))`)
+      .run(now, threadId, threadId);
+  }
   const potetoSchema = z.object({
     thread_id: z.string(), activated_at: z.number(), phase: z.enum(["activated", "routed", "stalled", "complete"]),
     charter_state: z.enum(["pending", "sent"]), charter_attempts: z.number(), charter_next_at: z.number(), revivals: z.number(),
@@ -36,10 +41,12 @@ export function openChecklistStore(db: Db): ChecklistStore {
   ]);
   const rowSchema = z.object({
     thread_id: z.string(), playbook: z.string(), revision: z.number(), nudged_at_revision: z.number().nullable(),
+    created_at: z.number(),
   });
   const stepSchema = z.object({
     id: z.number(), section: z.enum(["playbook", "pr"]), after_pr: z.number(), text: z.string(),
     status: z.enum(["open", "done", "skipped"]), evidence_json: z.string().nullable(), reason: z.string().nullable(),
+    skip_policy: z.enum(["agent", "user", "never"]), opened_at: z.number().nullable(),
   });
   const doneEvidence = z.tuple([evidence], evidence);
   const reason = z.string().trim().min(1).max(500);
@@ -56,9 +63,10 @@ export function openChecklistStore(db: Db): ChecklistStore {
       const resolution: Resolution = step.status === "open" ? { kind: "open" }
         : step.status === "done" ? { kind: "done", evidence: doneEvidence.parse(JSON.parse(step.evidence_json ?? "null")) }
         : { kind: "skipped", reason: reason.parse(step.reason) };
-      return { id: step.id, section: step.section, text: step.text, afterPr: step.after_pr !== 0, resolution };
+      return { id: step.id, section: step.section, text: step.text, afterPr: step.after_pr !== 0, skipPolicy: step.skip_policy, openedAt: step.opened_at, resolution };
     });
-    return { threadId, playbook: row.playbook as PlaybookName, revision: row.revision, nudgedAtRevision: row.nudged_at_revision, steps };
+    return { threadId, playbook: row.playbook as PlaybookName, revision: row.revision, nudgedAtRevision: row.nudged_at_revision,
+      createdAt: row.created_at, steps };
   });
   return {
     activate(threadId, dispatchKey, now) {
@@ -97,24 +105,26 @@ export function openChecklistStore(db: Db): ChecklistStore {
       const created = db.prepare("INSERT OR IGNORE INTO checklists (thread_id, playbook, created_at) VALUES (?, ?, ?)")
         .run(threadId, playbook, now).changes === 1;
       if (created) {
-        const insert = db.prepare("INSERT INTO steps (thread_id, id, position, section, after_pr, text) VALUES (?, ?, ?, ?, ?, ?)");
-        for (const [index, step] of steps.entries()) insert.run(threadId, index + 1, index, step.section, Number(step.afterPr), step.text);
+        const insert = db.prepare("INSERT INTO steps (thread_id, id, position, section, after_pr, text, skip_policy) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        for (const [index, step] of steps.entries()) insert.run(threadId, index + 1, index, step.section, Number(step.afterPr), step.text, step.skipPolicy);
+        openCurrent(threadId, now);
         db.prepare("UPDATE poteto_threads SET phase = 'routed', stalled_at = NULL WHERE thread_id = ? AND phase IN ('activated','stalled')").run(threadId);
       }
       return { created };
     }).immediate,
-    resolveStep: db.transaction((threadId: string, stepId: number, resolution: Exclude<Resolution, { kind: "open" }>) => {
+    resolveStep: db.transaction((threadId: string, stepId: number, resolution: Exclude<Resolution, { kind: "open" }>, actor: "agent" | "user" = "agent") => {
       const parsed = closedResolution.safeParse(resolution);
       if (!parsed.success) return { error: "A step needs evidence or a non-blank reason of at most 500 characters." };
       const checklist = read(threadId);
       if (!checklist) return { error: "Begin a playbook checklist first." };
-      const result = closeStep(checklist, stepId, parsed.data);
+      const result = closeStep(checklist, stepId, parsed.data, actor);
       if (!result.ok) return { error: result.error };
       if (!result.changed) return { changed: false };
       const changed = db.prepare("UPDATE steps SET status = ?, evidence_json = ?, reason = ? WHERE thread_id = ? AND id = ? AND status = 'open'")
         .run(parsed.data.kind, parsed.data.kind === "done" ? JSON.stringify(parsed.data.evidence) : null,
           parsed.data.kind === "skipped" ? parsed.data.reason : null, threadId, stepId).changes === 1;
       if (changed) db.prepare("UPDATE checklists SET revision = revision + 1 WHERE thread_id = ?").run(threadId);
+      if (changed) openCurrent(threadId, clock());
       return { changed };
     }).immediate,
     addStep: db.transaction((threadId: string, text: string, afterId: number | null) => {
@@ -126,6 +136,7 @@ export function openChecklistStore(db: Db): ChecklistStore {
         .run(threadId, result.step.id, 0, result.step.section, Number(result.step.afterPr), result.step.text);
       const position = db.prepare("UPDATE steps SET position = ? WHERE thread_id = ? AND id = ?");
       for (const [index, step] of result.checklist.steps.entries()) position.run(index, threadId, step.id);
+      openCurrent(threadId, clock());
       db.prepare("UPDATE checklists SET revision = revision + 1 WHERE thread_id = ?").run(threadId);
       return { id: result.step.id };
     }).immediate,
