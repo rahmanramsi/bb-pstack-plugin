@@ -5,6 +5,7 @@
 import type { Db } from "../store.ts";
 import {
   BUSY,
+  CONCURRENCY,
   TERMINAL,
   branchFor,
   isTransit,
@@ -52,10 +53,10 @@ export type IssueStore = {
   /** Jobs holding a worker slot, and how many queued jobs were created before this one. */
   slots(id: JobId): { busy: number; ahead: number };
   /**
-   * The one write. Returns the new row, or null when the version moved (re-read and replan). A change that enters
-   * `starting` also requires fewer than `limit` busy jobs, in the same statement.
+   * The one write. Returns the new row, or null when the version moved (re-read and replan) or when the change would
+   * make the job BUSY while CONCURRENCY other jobs already are. Both checks are in the same statement.
    */
-  write(id: JobId, version: number, change: Change, now: number, limit?: number): Job | null;
+  write(id: JobId, version: number, change: Change, now: number): Job | null;
   repoPoll(repo: RepoName): { poll: unknown; polledAt: number | null; error: string | null };
   saveRepoPoll(repo: RepoName, poll: unknown, now: number, error: string | null): void;
 };
@@ -250,19 +251,19 @@ export function openIssueStore(db: Db): IssueStore {
         .get(id) as { ahead: number };
       return { busy, ahead };
     },
-    write(id, version, change, now, limit) {
+    write(id, version, change, now) {
       const set = columns(change);
       const names = Object.keys(set);
       const slotGuard =
-        change.phase?.state === "starting" && limit !== undefined
-          ? ` AND (SELECT count(*) FROM issue_jobs WHERE state IN (${placeholders(BUSY_LIST)})) < ?`
+        change.phase && BUSY.has(change.phase.state)
+          ? ` AND (state IN (${placeholders(BUSY_LIST)}) OR (SELECT count(*) FROM issue_jobs WHERE state IN (${placeholders(BUSY_LIST)})) < ?)`
           : "";
       const params = [
         ...Object.values(set),
         now,
         id,
         version,
-        ...(slotGuard ? [...BUSY_LIST, limit] : []),
+        ...(slotGuard ? [...BUSY_LIST, ...BUSY_LIST, CONCURRENCY] : []),
       ];
       const assignments = [...names.map((name) => `${name} = ?`), "version = version + 1", "updated_at = ?"].join(", ");
       const changed = db.prepare(`UPDATE issue_jobs SET ${assignments} WHERE id = ? AND version = ?${slotGuard}`).run(...params).changes;

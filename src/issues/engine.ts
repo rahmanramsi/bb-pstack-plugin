@@ -16,6 +16,7 @@ import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type GitHub, type PollCursor } from "./github.ts";
 import {
+  CONCURRENCY,
   EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
@@ -45,7 +46,6 @@ import {
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
-export const CONCURRENCY = 3;
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
 const MAX_STEPS = 20;
@@ -297,7 +297,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   async function apply(job: Job, action: Exclude<Action, { type: "sleep" }>): Promise<void> {
     switch (action.type) {
       case "change":
-        store.write(job.id, job.version, action.change, clock(), CONCURRENCY);
+        store.write(job.id, job.version, action.change, clock());
         return;
       case "nudge": {
         if (!store.write(job.id, job.version, action.change, clock()) || !job.threadId) return;

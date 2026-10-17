@@ -44,6 +44,8 @@ export type JobState = TransitState | RestingState;
 export const TERMINAL: ReadonlySet<JobState> = new Set(["ignored", "done", "stopped", "stuck"]);
 /** States that hold one of the worker slots. A worker waiting in review or needs-info does not. */
 export const BUSY: ReadonlySet<JobState> = new Set(["starting", "working", "publishing"]);
+/** At most this many jobs are BUSY at once. */
+export const CONCURRENCY = 3;
 
 export function isTransit(state: JobState): state is TransitState {
   return Object.hasOwn(TRANSIT, state);
