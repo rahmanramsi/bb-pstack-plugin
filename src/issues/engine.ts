@@ -27,12 +27,10 @@ import {
   acceptReport,
   awaitingThread,
   counts,
-  effectMarker,
   isReasoningLevel,
   plan,
   settle,
   stop as stopChange,
-  workerInstructions,
   type Action,
   type Change,
   type Effect,
@@ -52,6 +50,7 @@ import {
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
+import { effectMarker, workerInstructions } from "./text.ts";
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;

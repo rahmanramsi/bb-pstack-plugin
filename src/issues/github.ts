@@ -4,7 +4,8 @@
  * cache and the REST wire format stay in here. Callers see domain types and three error classes.
  */
 import { createHash, createPrivateKey, createSign } from "node:crypto";
-import { CONVENTIONAL_TITLE, type PolledFeedback, type PullState, type RepoName, type Sha } from "./job.ts";
+import type { PolledFeedback, PullState, RepoName, Sha } from "./job.ts";
+import { CONVENTIONAL_TITLE } from "./text.ts";
 
 export type GitHubCredentials = { appId: string; privateKey: string };
 

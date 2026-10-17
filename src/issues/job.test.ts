@@ -12,14 +12,11 @@ import {
   MAX_FEEDBACK_ROUNDS,
   counts,
   enter,
-  roundPrompt,
   isReasoningLevel,
   plan,
-  prBody,
   settle,
   stop,
   toView,
-  workerPrompt,
   type Change,
   type Effect,
   type Facts,
@@ -33,6 +30,7 @@ import {
   type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
+import { prBody, roundPrompt, workerPrompt } from "./text.ts";
 
 const NOW = 10_000_000;
 const MIN = 60_000;
