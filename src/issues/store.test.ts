@@ -81,7 +81,7 @@ test("one open job per issue; a label event is recorded once; a re-label after a
   assert.equal(second.generation, 2);
   assert.equal(second.branch, "agent/issue-41-submit-button-hides-2");
   assert.equal(store.open(REPO, 41)!.id, second.id);
-  assert.deepEqual(store.due(), [second.id]);
+  assert.deepEqual(store.due(30), [second.id]);
   assert.deepEqual(store.list({ all: true }).map((job) => job.id), [second.id, ignored.id, first.id]);
   assert.deepEqual(store.list({ all: false }).map((job) => job.id), [second.id]);
 });
@@ -115,4 +115,16 @@ test("the migration's state lists match job.ts", () => {
   assert.deepEqual(list(/state IN \(\s*([^)]*)\)\),/), new Set([...RESTING_STATES, ...Object.keys(TRANSIT)]));
   assert.deepEqual(list(/CHECK \(\(state IN \(([^)]*)\)\) = \(effects_json/), new Set(Object.keys(TRANSIT)));
   assert.deepEqual(list(/issue_jobs_open[\s\S]*?state NOT IN \(([^)]*)\)/), new Set(TERMINAL));
+});
+
+test("due lists only jobs that can act now: not a job resting in review, nor an effect under a lease or a backoff", () => {
+  const { store } = setup();
+  const [queued, review, leased, backoff, ready] = [41, 42, 43, 44, 45].map((issue, index) => store.insert(newJob({ issue }), 10 + index)!);
+  const sha = "a".repeat(40) as Sha;
+  store.write(review!.id, 0, { phase: { state: "review" }, threadId: "thr_r", pushedSha: sha, pr: { number: 3, url: "u" } }, 20);
+  store.write(leased!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, leaseUntil: 200 } } as Change, 20);
+  store.write(backoff!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 200 } } as Change, 20);
+  store.write(ready!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 100 } } as Change, 20);
+  assert.deepEqual(store.due(150), [queued!.id, ready!.id]);
+  assert.deepEqual(store.due(200), [queued!.id, leased!.id, backoff!.id, ready!.id]);
 });

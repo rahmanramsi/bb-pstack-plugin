@@ -51,6 +51,9 @@ import type { IssueStore } from "./store.ts";
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
 const MAX_STEPS = 20;
+const SETTLE_MARGIN_MS = 5_000;
+/** Kept back from the push so the token can still be revoked before the lease ends. */
+const REVOKE_MS = 30_000;
 
 /** Agents can write their own metadata, so it only points at a job; the store decides. */
 export const IssueMetadata = z.object({ pstackIssue: z.literal(1), jobId: z.string() });
@@ -81,7 +84,7 @@ export type Issues = {
   register(): void;
   /** Standing instructions for a thread bound to an open job, else null. */
   instructions(threadId: string): string | null;
-  /** One pass of the service: poll every repository, then reconcile every open job. */
+  /** One pass of the service: poll every repository, reconcile every job that may act, and wait for any reconcile in flight. */
   sweep(): Promise<void>;
 };
 
@@ -96,7 +99,8 @@ const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number } | { ok: false; transient: boolean; error: string };
 
-type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>) => Promise<EffectOutcome>;
+/** `deadline` is when the claim's lease ends, less a margin to settle; every call the effect makes ends by then. */
+type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>, deadline: number) => Promise<EffectOutcome>;
 /** How to perform an effect, and how to find its trace when EFFECT_POLICY looks for one before running it again. */
 export type EffectHandler<Op extends EffectOp> = { perform: Run<Op> } & ((typeof EFFECT_POLICY)[Op]["recovery"]["kind"] extends "replay"
   ? { probe?: never }
@@ -106,12 +110,13 @@ export function createIssues(deps: IssuesDeps): Issues {
   const { bb, store, github } = deps;
   const clock = deps.clock ?? Date.now;
   const done = (patch = {}): EffectOutcome => ({ kind: "done", patch });
+  const until = (deadline: number) => AbortSignal.timeout(Math.max(0, deadline - clock()));
 
-  async function threadsNaming(job: Job): Promise<string[]> {
+  async function threadsNaming(job: Job, signal?: AbortSignal): Promise<string[]> {
     const found: string[] = [];
     const since = job.createdAt - 60_000;
     for (let offset = 0; ; offset += 100) {
-      const page = await bb.sdk.threads.list({ originPluginId: bb.pluginId, projectId: job.projectId, includeHidden: true, archived: false, limit: 100, offset });
+      const page = await bb.sdk.threads.list({ originPluginId: bb.pluginId, projectId: job.projectId, includeHidden: true, archived: false, limit: 100, offset, ...(signal ? { signal } : {}) });
       for (const thread of page) {
         if (thread.createdAt < since) continue;
         const bound = store.byThread(thread.id);
@@ -123,14 +128,14 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function worktree(job: Job): Promise<Worktree> {
+  async function worktree(job: Job, signal?: AbortSignal): Promise<Worktree> {
     if (!job.threadId) return { ok: false, transient: false, error: "the job has no worker thread" };
-    const thread = await bb.sdk.threads.get({ threadId: job.threadId });
+    const thread = await bb.sdk.threads.get({ threadId: job.threadId, ...(signal ? { signal } : {}) });
     if (!thread.environmentId) return { ok: false, transient: true, error: "the worker's worktree is not ready" };
-    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) });
     if (environment.hostId !== job.hostId) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the mapped host ${job.hostId}` };
     if (environment.status !== "ready" || !environment.path) return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
-    const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}` });
+    const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
     if (status.outcome === "unavailable") return { ok: false, transient: true, error: `the worktree status is unavailable: ${status.failure.message}` };
     if (status.outcome !== "available") return { ok: false, transient: false, error: status.message };
     const { checkout, workingTree, mergeBase } = status.workspace;
@@ -147,8 +152,8 @@ export function createIssues(deps: IssuesDeps): Issues {
 
   const EFFECTS: { readonly [Op in EffectOp]: EffectHandler<Op> } = {
     labels: {
-      async perform(job, effect) {
-        const repo = github.repo(job.repo);
+      async perform(job, effect, deadline) {
+        const repo = github.repo(job.repo, until(deadline));
         const number = effect.on === "pr" ? job.pr?.number : job.issue;
         if (number === undefined) return { kind: "fail", error: "the pull request to label is not recorded" };
         if (effect.add.length > 0) await repo.addLabels(number, effect.add);
@@ -179,26 +184,20 @@ export function createIssues(deps: IssuesDeps): Issues {
           return { kind: "unknown", error: `spawn: ${message(error)}` };
         }
       },
-      async probe(job) {
-        const [threadId] = await threadsNaming(job);
+      async probe(job, _effect, deadline) {
+        const [threadId] = await threadsNaming(job, until(deadline));
         return threadId ? done({ threadId }) : { kind: "absent" };
       },
     },
     push: {
-      async perform(job, effect) {
-        const tree = await worktree(job);
+      async perform(job, effect, deadline) {
+        const tree = await worktree(job, until(deadline));
         if (!tree.ok) return tree.transient ? { kind: "retry", error: tree.error, notBefore: null } : { kind: "fail", error: tree.error };
-        const repo = github.repo(job.repo);
+        const repo = github.repo(job.repo, until(deadline));
         const { remoteUrl, token } = await repo.pushCredentials();
         try {
-          const result = await deps.hostPush(job.hostId, {
-            worktreePath: tree.path,
-            remoteUrl,
-            branch: job.branch,
-            sha: effect.sha,
-            expectedRemoteSha: effect.expectedRemoteSha,
-            token,
-          });
+          const input = { worktreePath: tree.path, remoteUrl, branch: job.branch, sha: effect.sha, expectedRemoteSha: effect.expectedRemoteSha, token };
+          const result = await deps.hostPush(job.hostId, input, until(deadline - REVOKE_MS));
           if (result.status === "pushed") return done({ pushedSha: effect.sha });
           // A claim whose lease ran out may still be pushing the same commit, and its push can land first.
           if (result.status === "rejected" && result.reason === "stale-remote" && (await repo.branchSha(job.branch)) === effect.sha) {
@@ -212,40 +211,41 @@ export function createIssues(deps: IssuesDeps): Issues {
           await repo.revoke(token).catch((error) => bb.log.warn(`pstack issues: could not revoke a push token: ${message(error)}`));
         }
       },
-      async probe(job, effect) {
-        return (await github.repo(job.repo).branchSha(job.branch)) === effect.sha ? done({ pushedSha: effect.sha }) : { kind: "absent" };
+      async probe(job, effect, deadline) {
+        return (await github.repo(job.repo, until(deadline)).branchSha(job.branch)) === effect.sha ? done({ pushedSha: effect.sha }) : { kind: "absent" };
       },
     },
     "open-pr": {
-      async perform(job, effect) {
+      async perform(job, effect, deadline) {
         try {
-          const pr = await github.repo(job.repo).createDraftPull({ head: job.branch, base: job.baseBranch, title: effect.title, body: effect.body });
+          const pr = await github.repo(job.repo, until(deadline)).createDraftPull({ head: job.branch, base: job.baseBranch, title: effect.title, body: effect.body });
           return done({ pr });
         } catch (error) {
           if (error instanceof GitHubPermanentError && error.status === 422) return { kind: "unknown", error: error.message };
           throw error;
         }
       },
-      async probe(job) {
-        const pr = await github.repo(job.repo).findPull(job.branch);
+      async probe(job, _effect, deadline) {
+        const pr = await github.repo(job.repo, until(deadline)).findPull(job.branch);
         return pr ? done({ pr }) : { kind: "absent" };
       },
     },
     comment: {
-      async perform(job, effect) {
-        await github.repo(job.repo).comment(job.issue, `${effect.body}\n\n${effectMarker(effect.key)}`);
+      async perform(job, effect, deadline) {
+        await github.repo(job.repo, until(deadline)).comment(job.issue, `${effect.body}\n\n${effectMarker(effect.key)}`);
         return done();
       },
-      async probe(job, effect) {
+      async probe(job, effect, deadline) {
         const since = (("effects" in job.phase && job.phase.firstAt) || clock()) - 60_000;
-        return (await github.repo(job.repo).findComment(job.issue, effectMarker(effect.key), since)) ? done() : { kind: "absent" };
+        return (await github.repo(job.repo, until(deadline)).findComment(job.issue, effectMarker(effect.key), since)) ? done() : { kind: "absent" };
       },
     },
     "stop-thread": {
-      async perform(job) {
-        const threads = new Set([...(job.threadId ? [job.threadId] : []), ...(await threadsNaming(job))]);
+      async perform(job, _effect, deadline) {
+        const signal = until(deadline);
+        const threads = new Set([...(job.threadId ? [job.threadId] : []), ...(await threadsNaming(job, signal))]);
         for (const threadId of threads) {
-          await bb.sdk.threads.stop({ threadId }).catch((error) => {
+          await bb.sdk.threads.stop({ threadId, signal }).catch((error) => {
             if (!isMissing(error)) throw error;
           });
         }
@@ -254,13 +254,13 @@ export function createIssues(deps: IssuesDeps): Issues {
     },
   };
 
-  async function runEffect(job: Job, effect: Effect, mode: EffectMode): Promise<EffectOutcome> {
+  async function runEffect(job: Job, effect: Effect, mode: EffectMode, deadline: number): Promise<EffectOutcome> {
     const handler = EFFECTS[effect.op] as { perform: Run<EffectOp>; probe?: Run<EffectOp> };
     try {
-      if (mode === "perform") return await handler.perform(job, effect);
+      if (mode === "perform") return await handler.perform(job, effect, deadline);
       if (!handler.probe) throw new Error(`${effect.op} has no probe`);
-      const probed = await handler.probe(job, effect);
-      return probed.kind === "absent" && mode === "probe-then-perform" ? await handler.perform(job, effect) : probed;
+      const probed = await handler.probe(job, effect, deadline);
+      return probed.kind === "absent" && mode === "probe-then-perform" ? await handler.perform(job, effect, deadline) : probed;
     } catch (error) {
       if (error instanceof GitHubTransientError) return { kind: "retry", error: error.message, notBefore: error.notBefore };
       if (error instanceof GitHubSetupError) return { kind: "retry", error: error.message, notBefore: null };
@@ -342,7 +342,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!("effects" in phase)) return;
         const claimed = store.write(job.id, job.version, { phase: { ...phase, tries: phase.tries + 1, firstAt: phase.firstAt ?? clock(), leaseUntil: action.leaseUntil } }, clock());
         if (!claimed) return;
-        const outcome = await runEffect(claimed, action.effect, action.mode);
+        const outcome = await runEffect(claimed, action.effect, action.mode, action.leaseUntil - SETTLE_MARGIN_MS);
         // A lost write here means stop replaced the outbox while the effect ran; its result is dropped on purpose.
         store.write(job.id, claimed.version, settle(claimed, outcome, clock()), clock());
         return;
@@ -483,22 +483,21 @@ export function createIssues(deps: IssuesDeps): Issues {
     });
   }
 
-  async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<JobId[]> {
+  async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
     const now = clock();
     const previous = store.repoPoll(mapping.repo).poll as PollCursor | null;
     if (mapping.hostId === primaryHostId) {
       store.saveRepoPoll(mapping.repo, previous, now, `host ${mapping.hostId} is the bb server's machine; map ${mapping.repo} to another host`);
-      return [];
+      return;
     }
     const repo = github.repo(mapping.repo);
     try {
       const result = await repo.labeledIssues(LABEL.trigger, previous);
       if (!result.changed) {
         store.saveRepoPoll(mapping.repo, previous, now, null);
-        return [];
+        return;
       }
       const [appLogin, baseBranch] = await Promise.all([repo.appLogin(), repo.defaultBranch()]);
-      const queued: JobId[] = [];
       for (const issue of result.issues) {
         if (store.open(mapping.repo, issue.number)) continue;
         const event = await repo.latestLabelEvent(issue.number, LABEL.trigger);
@@ -506,7 +505,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         const permission = event.actor === appLogin ? null : await repo.permission(event.actor);
         const refusal =
           permission === null ? "the label was added by the GitHub App" : CAN_TRIGGER.has(permission) ? null : `@${event.actor} has ${permission} permission`;
-        const job = store.insert(
+        store.insert(
           {
             id: `psi_${randomUUID()}` as JobId,
             repo: mapping.repo,
@@ -521,25 +520,24 @@ export function createIssues(deps: IssuesDeps): Issues {
           },
           now,
         );
-        if (job && !refusal) queued.push(job.id);
       }
       store.saveRepoPoll(mapping.repo, result.next, now, null);
-      return queued;
     } catch (error) {
       store.saveRepoPoll(mapping.repo, previous, now, message(error));
-      return [];
     }
   }
 
+  /** Inserts the jobs new label events start. The next tickDue starts them. */
   async function poll(): Promise<void> {
     const repos = deps.repos();
     if (repos.length === 0) return;
     const { primaryHostId } = await bb.sdk.system.config();
-    for (const mapping of repos) for (const id of await pollRepo(mapping, primaryHostId)) await tick(id);
+    await Promise.all(repos.map((mapping) => pollRepo(mapping, primaryHostId)));
   }
 
+  /** Reconciles every job that may act now, concurrently, and resolves when all of them have. */
   async function tickDue(): Promise<void> {
-    for (const id of store.due()) await tick(id).catch((error) => bb.log.error(`pstack issues: ${id}: ${message(error)}`));
+    await Promise.all(store.due(clock()).map((id) => tick(id).catch((error) => bb.log.error(`pstack issues: ${id}: ${message(error)}`))));
   }
 
   async function serve(signal: AbortSignal): Promise<void> {
@@ -550,7 +548,8 @@ export function createIssues(deps: IssuesDeps): Issues {
           nextPoll = clock() + POLL_MS;
           await poll();
         }
-        await tickDue();
+        // Not awaited: a job's slow push must not hold back polling or the next pass. tick() runs one reconcile per job.
+        background(tickDue());
       } catch (error) {
         bb.log.error(`pstack issues: ${message(error)}`);
       }
@@ -580,6 +579,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     async sweep() {
       await poll();
       await tickDue();
+      await Promise.all([...running.values()].map((entry) => entry.done.catch(() => {})));
     },
   };
 }

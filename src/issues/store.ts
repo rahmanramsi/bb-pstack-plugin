@@ -7,6 +7,8 @@ import {
   BUSY,
   CONCURRENCY,
   TERMINAL,
+  TRANSIT,
+  WATCHED,
   branchFor,
   isTransit,
   type AcceptedReport,
@@ -46,8 +48,8 @@ export type IssueStore = {
   byThread(threadId: string): Job | null;
   byTrigger(eventId: number): Job | null;
   open(repo: RepoName, issue: number): Job | null;
-  /** Non-terminal jobs, oldest first. */
-  due(): JobId[];
+  /** Jobs that may act at `now`, oldest first: WATCHED ones, and transit ones whose lease and backoff have passed. */
+  due(now: number): JobId[];
   /** Newest first; terminal jobs only with `all`. */
   list(filter: { repo?: RepoName; all: boolean }): Job[];
   /**
@@ -167,6 +169,7 @@ function columns(change: Change): Record<string, unknown> {
 
 const TERMINAL_LIST = [...TERMINAL];
 const BUSY_LIST = [...BUSY];
+const TRANSIT_LIST = Object.keys(TRANSIT);
 const placeholders = (values: readonly unknown[]) => values.map(() => "?").join(", ");
 
 export function openIssueStore(db: Db): IssueStore {
@@ -226,10 +229,14 @@ export function openIssueStore(db: Db): IssueStore {
       const row = openRow(repo, issue);
       return row ? parse(row) : null;
     },
-    due() {
+    due(now) {
       const rows = db
-        .prepare(`SELECT id FROM issue_jobs WHERE state NOT IN (${placeholders(TERMINAL_LIST)}) ORDER BY created_at, id`)
-        .all(...TERMINAL_LIST) as { id: JobId }[];
+        .prepare(
+          `SELECT id FROM issue_jobs WHERE state IN (${placeholders(WATCHED)})
+             OR (state IN (${placeholders(TRANSIT_LIST)}) AND coalesce(effect_lease_until, 0) <= ? AND coalesce(effect_next_at, 0) <= ?)
+           ORDER BY created_at, id`,
+        )
+        .all(...WATCHED, ...TRANSIT_LIST, now, now) as { id: JobId }[];
       return rows.map((row) => row.id);
     },
     list({ repo, all }) {

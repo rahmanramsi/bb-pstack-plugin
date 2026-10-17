@@ -178,7 +178,7 @@ function harness() {
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false };
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   let next = 0;
@@ -269,11 +269,17 @@ function harness() {
 
   const events = new Map<string, (payload: any) => unknown>();
   const services: string[] = [];
+  const serviceStarts = new Map<string, (signal: AbortSignal) => Promise<void>>();
   const bb = {
     pluginId: "pstack",
     sdk,
     events: { on: (event: string, handler: (payload: any) => unknown) => events.set(event, handler) },
-    background: { service: (name: string) => services.push(name) },
+    background: {
+      service: (name: string, { start }: { start: (signal: AbortSignal) => Promise<void> }) => {
+        services.push(name);
+        serviceStarts.set(name, start);
+      },
+    },
     log: { info() {}, warn() {}, error() {}, debug() {} },
   } as unknown as BbPluginApi;
 
@@ -297,9 +303,15 @@ function harness() {
       bb,
       store,
       github: createGitHub({ credentials: () => ({ appId: "1", privateKey }), apiUrl: base, gitUrl: "https://github.test", clock: () => clock.now }),
-      hostPush: async (hostId: string, input: PushInput): Promise<PushResult> => {
+      hostPush: async (hostId: string, input: PushInput, signal?: AbortSignal): Promise<PushResult> => {
         assert.equal(hostId, "host_worker");
         pushes.push(input);
+        if (failures.pushHangs) {
+          await new Promise((_, reject) => {
+            if (signal?.aborted) reject(signal.reason);
+            signal?.addEventListener("abort", () => reject(signal.reason));
+          });
+        }
         await held("push:before");
         if ((gh.refs.get(input.branch) ?? null) !== input.expectedRemoteSha) return { status: "rejected", reason: "stale-remote", detail: "[rejected] (stale info)" };
         gh.refs.set(input.branch, input.sha);
@@ -374,6 +386,7 @@ function harness() {
     work,
     events,
     services,
+    serviceStarts,
     store,
     label,
     unlabel,
@@ -785,4 +798,51 @@ test("a push that outlives its lease while a second engine pushes the same commi
   assert.equal(done.pushedSha, SHA2);
   assert.equal(h.pushes.length, 2, "both engines pushed");
   assert.equal([...h.gh().issues.values()].filter((issue) => issue.pr).length, 1, "one pull request");
+});
+
+test("in the service, one job's slow push does not hold back another job", { timeout: 10_000 }, async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  h.clock.now += MIN;
+  h.label(42);
+  await h.engine().issues.sweep();
+  const issue = async (number: number) => (await h.views()).find((job) => job.issue === number)!;
+  const pushing = h.holdAt("push", "sdk");
+  await h.report((await issue(41)).threadId!, GOOD);
+  await pushing.hit;
+
+  h.threads.get((await issue(42)).threadId!)!.status = "error";
+  h.engine().issues.register();
+  const service = new AbortController();
+  const serving = h.serviceStarts.get("pstack-issues")!(service.signal);
+  try {
+    while ((await issue(42)).state !== "stuck") await new Promise((resolve) => setTimeout(resolve, 5));
+  } finally {
+    service.abort();
+    pushing.free();
+  }
+  await serving;
+});
+
+test("a push still running when its claim's lease ends is abandoned, so the job can claim it again", { timeout: 10_000 }, async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  h.failures.pushHangs = true;
+  const minting = h.holdAt("POST /app/installations/1/access_tokens", "github");
+  await h.report(working.threadId!, GOOD);
+  await minting.hit;
+  h.clock.now += EFFECT_POLICY.push.leaseMs;
+  minting.free();
+
+  let job = await h.only();
+  while (!job.error) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    job = await h.only();
+  }
+  assert.equal(job.state, "publishing");
+  assert.equal(job.next?.op, "push");
+  assert.notEqual(job.next?.retryAt, null);
 });

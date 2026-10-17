@@ -16,6 +16,8 @@ export type GitHubOptions = {
   /** Default https://github.com. */
   gitUrl?: string;
   clock?: () => number;
+  /** Default 20 s. Each request is aborted after this long, so a hung connection cannot hold a job's effect. */
+  requestTimeoutMs?: number;
 };
 
 /** 5xx, 429, rate limits and network errors. `notBefore` comes from Retry-After or X-RateLimit-Reset. */
@@ -78,7 +80,10 @@ export type RepoClient = {
   revoke(token: string): Promise<void>;
 };
 
-export type GitHub = { repo(name: RepoName): RepoClient };
+export type GitHub = {
+  /** A client for one repository. With `signal`, every request it makes, token minting included, ends when it aborts. */
+  repo(name: RepoName, signal?: AbortSignal): RepoClient;
+};
 
 type Cursor = { since: string | null; etag: string | null };
 type Cached<T> = { value: T; until: number };
@@ -92,6 +97,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
   const apiUrl = (options.apiUrl ?? "https://api.github.com").replace(/\/$/, "");
   const gitUrl = (options.gitUrl ?? "https://github.com").replace(/\/$/, "");
   const clock = options.clock ?? Date.now;
+  const requestTimeoutMs = options.requestTimeoutMs ?? 20_000;
 
   let identity: string | null = null;
   let jwt: Cached<string> | null = null;
@@ -127,7 +133,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return jwt.value;
   }
 
-  type Auth = { kind: "app" } | { kind: "repo"; repo: RepoName } | { kind: "token"; token: string };
+  type Auth = ({ kind: "app" } | { kind: "repo"; repo: RepoName } | { kind: "token"; token: string }) & { signal?: AbortSignal | undefined };
   type Reply = { status: number; headers: Headers; json: unknown };
 
   function notBefore(headers: Headers): number | null {
@@ -138,11 +144,15 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return null;
   }
 
-  async function send(method: string, url: string, authorization: string, init: { body?: unknown; etag?: string | null }): Promise<Reply> {
+  async function send(method: string, url: string, authorization: string, init: { body?: unknown; etag?: string | null; signal?: AbortSignal | undefined }): Promise<Reply> {
+    const timeout = AbortSignal.timeout(requestTimeoutMs);
+    const signal = init.signal ? AbortSignal.any([timeout, init.signal]) : timeout;
     let response: Response;
+    let text: string;
     try {
       response = await fetch(url, {
         method,
+        signal,
         headers: {
           accept: "application/vnd.github+json",
           authorization,
@@ -153,10 +163,10 @@ export function createGitHub(options: GitHubOptions): GitHub {
         },
         ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
       });
+      text = await response.text();
     } catch (error) {
       throw new GitHubTransientError(`${method} ${url}: ${error instanceof Error ? error.message : String(error)}`, null);
     }
-    const text = await response.text();
     let json: unknown = null;
     try {
       json = text ? JSON.parse(text) : null;
@@ -173,12 +183,12 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return new GitHubPermanentError(message, reply.status);
   }
 
-  async function installationId(repo: RepoName): Promise<number> {
+  async function installationId(repo: RepoName, signal: AbortSignal | undefined): Promise<number> {
     credentials();
     const known = installations.get(repo);
     if (known !== undefined) return known;
     const path = `/repos/${repo}/installation`;
-    const reply = await send("GET", `${apiUrl}${path}`, `Bearer ${appJwt()}`, {});
+    const reply = await send("GET", `${apiUrl}${path}`, `Bearer ${appJwt()}`, { signal });
     if (reply.status === 404) throw new GitHubSetupError(`the GitHub App is not installed on ${repo}`);
     if (reply.status === 401) throw new GitHubSetupError(`GitHub rejected the App credentials (${(reply.json as { message?: string })?.message ?? "401"})`);
     if (reply.status !== 200) throw failure("GET", path, reply);
@@ -187,10 +197,10 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return id;
   }
 
-  async function mintToken(repo: RepoName, scope?: object): Promise<{ token: string; expiresAt: number }> {
-    const id = await installationId(repo);
+  async function mintToken(repo: RepoName, signal: AbortSignal | undefined, scope?: object): Promise<{ token: string; expiresAt: number }> {
+    const id = await installationId(repo, signal);
     const path = `/app/installations/${id}/access_tokens`;
-    const reply = await send("POST", `${apiUrl}${path}`, `Bearer ${appJwt()}`, scope ? { body: scope } : {});
+    const reply = await send("POST", `${apiUrl}${path}`, `Bearer ${appJwt()}`, { signal, ...(scope ? { body: scope } : {}) });
     if (reply.status === 404) {
       installations.delete(repo);
       throw new GitHubSetupError(`the GitHub App installation for ${repo} is gone`);
@@ -200,11 +210,11 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return { token: body.token, expiresAt: Date.parse(body.expires_at) };
   }
 
-  async function installationToken(repo: RepoName): Promise<string> {
-    const id = await installationId(repo);
+  async function installationToken(repo: RepoName, signal: AbortSignal | undefined): Promise<string> {
+    const id = await installationId(repo, signal);
     const cached = tokens.get(id);
     if (cached && cached.until > clock()) return cached.value;
-    const minted = await mintToken(repo);
+    const minted = await mintToken(repo, signal);
     tokens.set(id, { value: minted.token, until: minted.expiresAt - 15 * 60_000 });
     return minted.token;
   }
@@ -212,11 +222,12 @@ export function createGitHub(options: GitHubOptions): GitHub {
   async function request(auth: Auth, method: string, path: string, init: { body?: unknown; etag?: string | null } = {}): Promise<Reply> {
     const url = path.startsWith("http") ? path : `${apiUrl}${path}`;
     const authorization = async () =>
-      auth.kind === "app" ? `Bearer ${appJwt()}` : auth.kind === "token" ? `Bearer ${auth.token}` : `Bearer ${await installationToken(auth.repo)}`;
-    let reply = await send(method, url, await authorization(), init);
+      auth.kind === "app" ? `Bearer ${appJwt()}` : auth.kind === "token" ? `Bearer ${auth.token}` : `Bearer ${await installationToken(auth.repo, auth.signal)}`;
+    const sent = { ...init, signal: auth.signal };
+    let reply = await send(method, url, await authorization(), sent);
     if (reply.status === 401 && auth.kind === "repo") {
-      tokens.delete(await installationId(auth.repo));
-      reply = await send(method, url, await authorization(), init);
+      tokens.delete(await installationId(auth.repo, auth.signal));
+      reply = await send(method, url, await authorization(), sent);
     }
     return reply;
   }
@@ -252,11 +263,11 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return value;
   }
 
-  function repo(name: RepoName): RepoClient {
-    const auth: Auth = { kind: "repo", repo: name };
+  function repo(name: RepoName, signal?: AbortSignal): RepoClient {
+    const auth: Auth = { kind: "repo", repo: name, signal };
     const base = `/repos/${name}`;
     const appLogin = async () => {
-      if (appSlug === null) appSlug = (await call<{ slug: string }>({ kind: "app" }, "GET", "/app")).json.slug;
+      if (appSlug === null) appSlug = (await call<{ slug: string }>({ kind: "app", signal }, "GET", "/app")).json.slug;
       return `${appSlug}[bot]`;
     };
     return {
@@ -337,11 +348,11 @@ export function createGitHub(options: GitHubOptions): GitHub {
         return { number: json.number, url: json.html_url };
       },
       async pushCredentials() {
-        const { token } = await mintToken(name, { repositories: [name.split("/")[1]], permissions: { contents: "write" } });
+        const { token } = await mintToken(name, signal, { repositories: [name.split("/")[1]], permissions: { contents: "write" } });
         return { remoteUrl: `${gitUrl}/${name}.git`, token };
       },
       async revoke(token) {
-        await call({ kind: "token", token }, "DELETE", "/installation/token");
+        await call({ kind: "token", token, signal }, "DELETE", "/installation/token");
       },
     };
   }

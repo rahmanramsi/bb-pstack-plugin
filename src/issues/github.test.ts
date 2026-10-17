@@ -11,7 +11,8 @@ const REPO = "acme/web" as RepoName;
 const NOW = Date.parse("2026-10-17T12:00:00Z");
 
 type Seen = { method: string; path: string; headers: IncomingMessage["headers"]; body: any };
-type Route = (request: Seen) => { status: number; json?: unknown; headers?: Record<string, string> };
+/** A route that returns null never answers. */
+type Route = (request: Seen) => { status: number; json?: unknown; headers?: Record<string, string> } | null;
 
 let server: ReturnType<typeof createServer>;
 let base = "";
@@ -27,6 +28,7 @@ before(async () => {
       seen.push(entry);
       const route = routes[`${entry.method} ${entry.path}`] ?? routes[`${entry.method} ${entry.path.split("?")[0]}`];
       const reply = route ? route(entry) : { status: 404, json: { message: "Not Found" } };
+      if (!reply) return;
       response.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
       response.end(reply.json === undefined ? "" : JSON.stringify(reply.json));
     });
@@ -34,7 +36,10 @@ before(async () => {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
-after(() => server.close());
+after(() => {
+  server.closeAllConnections();
+  server.close();
+});
 
 let minted = 0;
 function setup(overrides: Partial<GitHubOptions> = {}) {
@@ -205,4 +210,19 @@ test("the private key setting must be base64 of a PEM private key", () => {
   assert.ok(decoded.ok && decoded.pem === privateKey);
   assert.equal(decodePrivateKey("bm90IGEga2V5").ok, false);
   assert.equal(decodePrivateKey(Buffer.from("-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----").toString("base64")).ok, false);
+});
+
+test("a request GitHub never answers fails as transient after the timeout, or as soon as the caller's signal aborts", async () => {
+  const { github } = setup({ requestTimeoutMs: 100 });
+  routes["GET /repos/acme/web"] = () => null;
+  const started = Date.now();
+  await assert.rejects(github.repo(REPO).defaultBranch(), GitHubTransientError);
+  assert.ok(Date.now() - started < 5_000);
+
+  const { github: patient } = setup({ requestTimeoutMs: 60_000 });
+  routes["GET /repos/acme/web"] = () => null;
+  const caller = new AbortController();
+  const pending = patient.repo(REPO, caller.signal).defaultBranch();
+  setTimeout(() => caller.abort(), 50);
+  await assert.rejects(pending, GitHubTransientError);
 });

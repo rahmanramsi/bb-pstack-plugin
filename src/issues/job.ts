@@ -224,6 +224,9 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly ("slotFree" | "work
   stuck: [],
 };
 
+/** Resting states whose next action depends on facts outside the row, so the sweep reconciles them every pass. */
+export const WATCHED: readonly RestingState[] = RESTING_STATES.filter((state) => FACTS_FOR[state].length > 0);
+
 /**
  * `perform` runs the head effect. `probe` only looks for its trace. `probe-then-perform` runs it when the probe finds
  * nothing, under the same claim, so a replayable effect does not need a second claim to run after a negative probe.
