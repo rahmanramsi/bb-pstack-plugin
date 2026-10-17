@@ -31,6 +31,8 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 | command | what it does |
 |---|---|
 | `bb pstack models [--role <role>] [--json]` | the model each role uses, configured values merged over the defaults. |
+| `bb pstack spawn --new-environment worktree --prompt-stdin` | creates a delegate on the eligible machine with the most free slots. `--parent-self` sets its parent. `--machine here` pins local work. `--dry-run` prints the decision and spawn arguments. |
+| `bb pstack machines [--provider <id> --model <id>] [--json]` | shows running threads, held slots, concurrency limits, and placement blockers. automatic placement onto another machine requires a known limit. |
 | `bb pstack doctor` | checks every role against the live provider catalog. run it after setup. |
 | `bb pstack run start --file <plan.json>` | runs a review panel or a swarm on hidden worker threads, with a live card in the chat. skills write the plan for you. |
 | `bb pstack run status <id>` / `run stop <id>` | a run's progress and results, or stop it. |
@@ -142,7 +144,6 @@ to keep [`/poteto-mode`](./skills/poteto-mode/SKILL.md) on across turns, add a l
 | [`/architect`](./skills/architect/SKILL.md) | you're about to write code that crosses a function boundary and want the caller's usage, types, and module shape settled first. |
 | [`/arena`](./skills/arena/SKILL.md) | you want N parallel attempts at the same thing, then to grab the best parts of each. |
 | [`/swarm`](./skills/swarm/SKILL.md) | you want N parallel workers across different slices or races, then one aggregated report. |
-| [`/pick-machine`](./skills/pick-machine/SKILL.md) | you have several bb machines and want each new thread on one with free concurrency slots, the project checkout, and the model, instead of queueing on a full one. |
 | [`/interrogate`](./skills/interrogate/SKILL.md) | you have a diff and want different models to try to break it, including a strict code-quality lens. |
 | [`/automate-me`](./skills/automate-me/SKILL.md) | you want your own `-mode` skill, drafted from how you've actually worked. |
 | [`/setup-pstack`](./skills/setup-pstack/SKILL.md) | you want to pick which models pstack uses per role. detects your models and writes a config rule. |
@@ -216,7 +217,7 @@ help:              /poteto-help which skill should i use to review this branch?
 
 [`/poteto-mode`](./skills/poteto-mode/SKILL.md) runs in the thread that receives it. that thread owns the playbook, the todo list, and every delegate.
 
-delegates are child bb threads (`bb thread spawn --parent-self`), each on the provider, model, and reasoning level its role names. they show up under the parent in the sidebar, and the parent hears back when each one finishes. code-writing delegates get their own managed worktree.
+delegates are child bb threads (`bb pstack spawn --parent-self`), each on the provider, model, and reasoning level its role names. they show up under the parent in the sidebar, and the parent hears back when each one finishes. code-writing delegates get their own managed worktree.
 
 a delegate spawned during a run is a **poteto delegate**: its prompt starts with the [poteto delegate preamble](./skills/poteto-mode/references/poteto-agent.md), which makes it load `poteto-mode` in full, including its inline principles index, before doing any work. a plain thread skips that read and drifts. do not spawn a poteto delegate to run the playbook itself.
 

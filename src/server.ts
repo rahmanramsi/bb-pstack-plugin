@@ -8,6 +8,8 @@ import { createRunFeature } from "./run-commands.ts";
 import { openRunStore } from "./run-store.ts";
 import { RunnerError, createRunner, type RunId } from "./runner.ts";
 import { openDatabase } from "./store.ts";
+import { createPlacement } from "./placement.ts";
+import { createPlacementCommands } from "./placement-commands.ts";
 import {
   PluginCliError,
   cliCommand,
@@ -77,7 +79,7 @@ function instructionsFor(text: string): string | null {
   if (configured.length === 0) return null;
   return [
     "pstack model configuration (set with /setup-pstack, overrides the defaults in pstack skills).",
-    "Each value is `provider/model/level` for `bb thread spawn --provider --model --reasoning-level`, or `inherit-parent` to omit those flags. A role without a line keeps its skill default. `bb pstack models` prints the effective table.",
+    "Each value is `provider/model/level` for `bb pstack spawn --provider --model --reasoning-level`, or `inherit-parent` to omit those flags. A role without a line keeps its skill default. `bb pstack models` prints the effective table.",
     "",
     ...configured,
   ].join("\n");
@@ -112,6 +114,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   const db = openDatabase(bb);
   const runStore = openRunStore(db);
+  const isRunWorker = (threadId: string) => runStore.attemptByThread(threadId) !== null;
+  const placement = createPlacement(bb);
   const checklistStore = openChecklistStore(db);
   const runner = createRunner(bb, runStore, resolveRole, Date.now, async (tuples, environmentId) => {
     const ids = [...new Set(tuples.map((tuple) => tuple.split("/")[0]!))];
@@ -148,7 +152,7 @@ export default async function plugin(bb: BbPluginApi) {
   runs.register();
 
   bb.events.on("thread.idle", ({ thread }) => {
-    if (thread.originPluginId === bb.pluginId) return;
+    if (isRunWorker(thread.id)) return;
     return checklist.onIdle(thread.id).catch((error) => bb.log.error(`pstack nudge: ${error instanceof Error ? error.message : String(error)}`));
   });
 
@@ -198,6 +202,7 @@ export default async function plugin(bb: BbPluginApi) {
       commands: {
         ...checklist.commands,
         ...runs.commands,
+        ...createPlacementCommands({ bb, placement }),
         models: cliCommand({
           summary:
             "Print the effective role-to-model table (configured values merged over defaults)",
