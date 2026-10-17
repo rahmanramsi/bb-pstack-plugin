@@ -531,3 +531,18 @@ test("a feedback round's report must answer exactly the listed items, add a comm
   assert.equal(parseReport(addressing, { outcome: "changes", pr: { title: "fix: x is renamed", body: "b" }, replies: REPLIES, verification: ["npm test"], summary: "s" }).ok, false, "the title is set once");
   assert.equal(parseReport(addressing, { outcome: "no-change", verification: ["read it"], summary: "s" }).ok, false, "replies are required");
 });
+
+test("a round ends when the job leaves it: back in review, waiting for an answer, or on its way to an end, and not when a job in review ends", () => {
+  const replying = inReview({ phase: transit("replying", [{ op: "labels", key: "labels:x", on: "issue", add: ["agent:review"], remove: ["agent:working"] }], { tries: 1 }), round: 2 });
+  assert.equal(settle(replying, { kind: "done", patch: {} }, NOW).finishRound, true);
+  const publishing = inReview({ phase: transit("publishing", [pushEffect, labelEffect], { tries: 1 }) });
+  assert.equal(settle(publishing, { kind: "done", patch: { pushedSha: HEAD } }, NOW).finishRound, undefined, "effects are still owed");
+
+  const addressing = inReview({ phase: { state: "addressing" }, round: 2, deadline: NOW });
+  assert.equal((plan(addressing, facts({ pr: { state: "open" }, thread: { kind: "active" } })) as { change: Change }).change.finishRound, true, "a timeout ends the round");
+  assert.equal(stop(addressing, "maya")?.finishRound, true);
+
+  const merged = plan(inReview(), facts({ ...pending([]), pr: { state: "merged" } }));
+  assert.equal((merged as { change: Change }).change.finishRound, undefined, "the round already ended when the job came back to review");
+  assert.equal(stop(inReview(), "maya")?.finishRound, undefined);
+});

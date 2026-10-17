@@ -249,6 +249,8 @@ export type Change = {
   pr?: { number: number; url: string };
   error?: string | null;
   startRound?: RoundStart;
+  /** The current round ended with this change; its history row records when. */
+  finishRound?: true;
   worker?: WorkerSettings;
 };
 
@@ -342,7 +344,20 @@ export const MAX_NUDGES = 2;
 export const MAX_REJECTIONS = 2;
 export const ROUND_MS = 60 * 60_000;
 
+/** States a round runs through, from its start until the job rests in review or needs-info, or heads to an end. */
+const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "asking", "sending", "respawning", "addressing", "republishing", "replying"]);
+
+/** Marks a change that takes the job out of its round as the round's end. */
+function rounded(job: Job, change: Change): Change {
+  return change.phase && IN_ROUND.has(job.phase.state) && !IN_ROUND.has(change.phase.state) ? { ...change, finishRound: true } : change;
+}
+
 export function plan(job: Job, facts: Facts): Action | null {
+  const action = next(job, facts);
+  return action?.type === "change" ? { type: "change", change: rounded(job, action.change) } : action;
+}
+
+function next(job: Job, facts: Facts): Action | null {
   const { phase } = job;
   const { now } = facts;
   if (isTransit(phase.state) && "effects" in phase) {
@@ -407,6 +422,10 @@ export function plan(job: Job, facts: Facts): Action | null {
 
 /** The Change for an effect's outcome, against the row as it was right after the claim. */
 export function settle(job: Job, outcome: EffectOutcome, now: number): Change {
+  return rounded(job, settled(job, outcome, now));
+}
+
+function settled(job: Job, outcome: EffectOutcome, now: number): Change {
   const { phase } = job;
   if (!isTransit(phase.state) || !("effects" in phase)) throw new Error(`settle on ${job.id} in resting state ${phase.state}`);
   const head = phase.effects[0];
@@ -506,7 +525,7 @@ export function stick(job: Job, reason: string): Change {
 export function stop(job: Job, by: string): Change | null {
   const state = job.phase.state;
   if (TERMINAL.has(state) || state === "stopping" || state === "sticking") return null;
-  return { phase: enter("stopping", endingEffects(job, "stop")), deadline: null, error: `stopped by ${by}` };
+  return rounded(job, { phase: enter("stopping", endingEffects(job, "stop")), deadline: null, error: `stopped by ${by}` });
 }
 
 /** A transit phase with fresh bookkeeping, or the target resting state when there is nothing to do. */
@@ -600,7 +619,8 @@ function verdict(job: Job, reasons: readonly string[], accepted: () => Change): 
 }
 
 export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts): Verdict {
-  return parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
+  const verdict = parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
+  return { ...verdict, change: rounded(job, verdict.change) };
 }
 
 function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts): Verdict {

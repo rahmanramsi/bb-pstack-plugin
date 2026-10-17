@@ -65,7 +65,7 @@ export type IssueStore = {
    * The one write. Returns the new row, or null when the version moved (re-read and replan) or when the change would
    * make the job BUSY while CONCURRENCY other jobs already are. Both checks are in the same statement. In the same
    * transaction, a round start inserts the round's row and marks its feedback as sent, and the current round's row
-   * records the accepted report, the pushed commit, and when the job came back to review or ended.
+   * records the accepted report, the pushed commit, and, once, when the change says the round finished.
    */
   write(id: JobId, version: number, change: Change, now: number): Job | null;
   /** Open jobs in the repository that have a pull request, whose feedback the poller reads. */
@@ -338,11 +338,11 @@ export function openIssueStore(db: Db): IssueStore {
       const history: Record<string, unknown> = {};
       if (change.report !== undefined) history.report_json = set.report_json;
       if (change.pushedSha !== undefined) history.pushed_sha = change.pushedSha;
-      if (change.phase && (change.phase.state === "review" || TERMINAL.has(change.phase.state))) history.finished_at = now;
       const fields = Object.keys(history);
       if (fields.length > 0) {
         db.prepare(`UPDATE issue_rounds SET ${fields.map((name) => `${name} = ?`).join(", ")} WHERE job_id = ? AND ordinal = ?`).run(...Object.values(history), id, job.round);
       }
+      if (change.finishRound) db.prepare("UPDATE issue_rounds SET finished_at = ? WHERE job_id = ? AND ordinal = ? AND finished_at IS NULL").run(now, id, job.round);
       return job;
     }),
     withPullRequest(repo) {

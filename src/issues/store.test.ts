@@ -147,7 +147,7 @@ const comment = (id: number, createdAt: number, kind: Feedback["kind"] = "review
 function inReview(store: ReturnType<typeof setup>["store"]) {
   const job = store.insert(newJob(), 10)!;
   store.write(job.id, 0, { phase: enter("starting", [spawn]), startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } }, 11);
-  return store.write(job.id, 1, { phase: { state: "review" }, threadId: "thr_r", pushedSha: SHA, pr: { number: 7, url: "u" } }, 12)!;
+  return store.write(job.id, 1, { phase: { state: "review" }, threadId: "thr_r", pushedSha: SHA, pr: { number: 7, url: "u" }, finishRound: true }, 12)!;
 }
 
 test("feedback is stored once per GitHub item, and only for the job it was polled for", () => {
@@ -184,7 +184,7 @@ test("a round start writes the job, the round's row and its feedback in one tran
   assert.deepEqual(store.roundFeedback(job.id, 2).map((item) => item.id), [1, 2]);
 });
 
-test("the current round's row records its report, its pushed commit, and when the job is back in review", () => {
+test("the current round's row records its report, its pushed commit, and when the round ended, which a later end of the job does not move", () => {
   const { db, store } = setup();
   const job = inReview(store);
   const next = SHA.replace(/a/g, "b") as Sha;
@@ -192,11 +192,15 @@ test("the current round's row records its report, its pushed commit, and when th
   const report: AcceptedReport = { outcome: "no-change", replies: [], verification: ["read it"], summary: "Explained the naming.", headSha: SHA, acceptedAt: 300 };
   current = store.write(job.id, current.version, { report }, 300)!;
   current = store.write(job.id, current.version, { pushedSha: next }, 310)!;
-  store.write(job.id, current.version, { phase: { state: "review" } }, 320);
-  assert.deepEqual(db.prepare("SELECT ordinal, pushed_sha, finished_at FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(job.id), [
+  current = store.write(job.id, current.version, { phase: { state: "review" }, finishRound: true }, 320)!;
+  const rounds = () => db.prepare("SELECT ordinal, pushed_sha, finished_at FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(job.id);
+  assert.deepEqual(rounds(), [
     { ordinal: 1, pushed_sha: SHA, finished_at: 12 },
     { ordinal: 2, pushed_sha: next, finished_at: 320 },
   ]);
+  current = store.write(job.id, current.version, { phase: { state: "review" }, error: null }, 330)!;
+  store.write(job.id, current.version, { phase: { state: "done" }, finishRound: true }, 400);
+  assert.deepEqual(rounds().map((round) => (round as { finished_at: number }).finished_at), [12, 320], "only the write that ends a round stamps it, and only once");
   assert.deepEqual(store.feedback(job.id).rounds, [{ ordinal: 1, summary: null }, { ordinal: 2, summary: "Explained the naming." }]);
 });
 
