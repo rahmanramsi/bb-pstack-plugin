@@ -150,7 +150,7 @@ export default async function plugin(bb: BbPluginApi) {
   const runStore = openRunStore(db);
   const isRunWorker = (threadId: string) => runStore.attemptByThread(threadId) !== null;
   const placement = createPlacement(bb);
-  registerDispatchGuard(bb, placement, () => placementGuard);
+  const placementDispatch = registerDispatchGuard(bb, placement, () => placementGuard);
   const checkouts = createCheckouts(bb, {
     get: async () => (await settings.get()).checkouts,
     set: async (text) => { await settings.experimental_set({ checkouts: text }); },
@@ -236,7 +236,10 @@ export default async function plugin(bb: BbPluginApi) {
   });
   issues.register();
 
-  bb.experimental_hooks.on("message.dispatch", checklist.dispatch);
+  bb.experimental_hooks.on("message.dispatch", async (context) => {
+    const placed = await placementDispatch(context);
+    return placed.action === "reject" ? placed : checklist.dispatch(context);
+  });
   bb.background.service("pstack-poteto", { start: (signal) => checklist.serve(signal) });
   bb.events.on("thread.active", ({ thread }) => {
     if (thread.originPluginId === bb.pluginId) return;

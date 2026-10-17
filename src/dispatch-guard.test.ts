@@ -85,7 +85,6 @@ function harness(options: { listRunning?: () => Promise<{ id: string; hostId: st
   let enabled = true;
   let now = 0;
   const bb = {
-    experimental_hooks: { on: (_name: string, handler: typeof hook) => { hook = handler; } },
     background: { service: (_name: string, value: typeof service) => { service = value; } },
     sdk: {
       hosts: { list: async () => facts(0).hosts.map(({ id, name }) => ({ id, name, status: "connected", lifecycle: { phase: "active" } })) },
@@ -102,7 +101,7 @@ function harness(options: { listRunning?: () => Promise<{ id: string; hostId: st
     clock: () => now,
     exec: async () => JSON.stringify({ globalLimit: null, hosts: [{ id: HOME, effectiveLimit: 10 }, { id: BOX, effectiveLimit: 4 }] }),
   });
-  registerDispatchGuard(bb, placement, () => enabled);
+  hook = registerDispatchGuard(bb, placement, () => enabled);
   const controller = new AbortController();
   const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve)); };
   return {

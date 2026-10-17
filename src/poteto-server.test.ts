@@ -29,6 +29,7 @@ function fixture(t: TestContext) {
     events: { on(name: string, handler: (event: Event) => unknown) { events.set(name, [...events.get(name) ?? [], handler]); } },
     background: { service(name: string) { services.push(name); } },
     experimental_hooks: { on(_name: string, handler: typeof hook) { hook = handler; } },
+    hosts: { experimental_client: () => ({}) },
     realtime: { publish(...args: unknown[]) { publications.push(args); } },
     log: { error(message: string) { errors.push(message); } },
     rpc: { register(_contract: unknown, handlers: { pstackThreadView: NonNullable<typeof view> }) { view = handlers.pstackThreadView; } },
@@ -62,8 +63,8 @@ function fixture(t: TestContext) {
 test("registered dispatch, lifecycle events, CLI and RPC expose activation, charter delivery and stalled recovery", async (t) => {
   const f = fixture(t);
   await plugin(f.bb);
-  assert.deepEqual(f.dispatch("build /poteto-mode this"), { action: "proceed" });
-  assert.deepEqual(f.dispatch("build /poteto-mode this"), { action: "proceed" });
+  assert.deepEqual(await f.dispatch("build /poteto-mode this"), { action: "proceed" });
+  assert.deepEqual(await f.dispatch("build /poteto-mode this"), { action: "proceed" });
   assert.equal(f.calls.length, 0);
   assert.equal(f.publications.length, 0);
   assert.equal((await f.view()).poteto, "activated");
@@ -95,10 +96,10 @@ test("server evidence validation rejects old threads and unowned runs with recov
 test("a Codex-wrapped PR create before gate pr holds gate done through the registered server until the user acknowledges it", async (t) => {
   const f = fixture(t);
   await plugin(f.bb);
-  assert.deepEqual(f.dispatch("ship the fix /poteto-mode"), { action: "proceed" });
+  assert.deepEqual(await f.dispatch("ship the fix /poteto-mode"), { action: "proceed" });
   await f.emit("thread.active");
   assert.equal((await f.run(["checklist", "begin", "feature"])).exitCode, 0);
-  for (const id of [1, 2]) assert.equal(f.dispatch(`/poteto-mode waive ${id} Grounded in the review.`).action, "reject");
+  for (const id of [1, 2]) assert.equal((await f.dispatch(`/poteto-mode waive ${id} Grounded in the review.`)).action, "reject");
   const command = '/bin/zsh -lc "gh pr create --repo o/r --base main --head fix --title \\"fix: detect codex\\" --body-file /tmp/pr.md"';
   f.timeline.push({ id: "evt_1", threadId: "thr_integration", seq: 1, createdAt: Date.now(), type: "item/completed",
     data: { item: { type: "commandExecution", id: "codex-pr", command, status: "completed", exitCode: 0 } } });
@@ -115,7 +116,7 @@ test("a Codex-wrapped PR create before gate pr holds gate done through the regis
   assert.match(held.stdout ?? "", /pr-before-gate:codex-pr/);
   await f.emit("thread.idle");
   assert.equal(f.sends.filter((send) => send.input?.some((block) => block.type === "text" && block.text.includes("pr-before-gate:codex-pr"))).length, 1);
-  assert.equal(f.dispatch("/poteto-mode ack pr-before-gate:codex-pr").action, "reject");
+  assert.equal((await f.dispatch("/poteto-mode ack pr-before-gate:codex-pr")).action, "reject");
   assert.equal((await f.run(["gate", "done"])).exitCode, 0);
   assert.equal((await f.view()).poteto, "complete");
 });
