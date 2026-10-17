@@ -3,11 +3,11 @@
  * `pstack_result` tool (selected per thread through bb.agents.configure), lifecycle event wiring, and the
  * background service. Decisions come from runner.ts; state from run-store.ts.
  */
-import { isAbsolute, join } from "node:path";
 import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand, type PluginCliContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { RUN_ID, RunPlan, runDirective, type RunView } from "./contract.ts";
 import { RunnerError, resultToolParameters, type RunId, type Runner } from "./runner.ts";
+import { readThreadFile } from "./thread-files.ts";
 
 export type RunFeature = {
   commands: Record<string, PluginCliCommand>;
@@ -87,25 +87,6 @@ export function createRunFeature(deps: {
   };
   const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
 
-  async function readPlanFile(path: string, threadId: string, ctx: PluginCliContext): Promise<string> {
-    const absolute = isAbsolute(path) ? path : ctx.cwd ? join(ctx.cwd, path) : null;
-    if (absolute === null) {
-      throw new PluginCliError(`cannot resolve the relative path ${path} without a working directory`, {
-        code: "plan_file_unreadable",
-        hint: 'Pass an absolute path, such as --file "$BB_THREAD_STORAGE/plan.json".',
-      });
-    }
-    // The CLI runs on the server; the file lives on the invoking thread's machine.
-    const thread = await bb.sdk.threads.get({ threadId });
-    const hostId = thread.environmentId ? (await bb.sdk.environments.get({ environmentId: thread.environmentId })).hostId : undefined;
-    try {
-      const file = await bb.sdk.files.read({ ...(hostId ? { hostId } : {}), path: absolute });
-      return file.contentEncoding === "base64" ? Buffer.from(file.content, "base64").toString("utf8") : file.content;
-    } catch (error) {
-      throw new PluginCliError(`cannot read ${absolute}: ${error instanceof Error ? error.message : String(error)}`, { code: "plan_file_unreadable" });
-    }
-  }
-
   const commands: Record<string, PluginCliCommand> = {
     "run start": cliCommand({
       summary: "Start a panel or swarm run from a plan and print its chat directive",
@@ -121,7 +102,7 @@ export function createRunFeature(deps: {
         const threadId = requireThread(ctx);
         const plan =
           input.options.file !== undefined
-            ? parsePlan(await readPlanFile(input.options.file, threadId, ctx), input.options.file)
+            ? parsePlan(await readThreadFile(bb, { threadId, cwd: ctx.cwd, path: input.options.file, errorCode: "plan_file_unreadable" }), input.options.file)
             : parsePlan(input.options["plan-json"]!, "--plan-json");
         const started = await runner.start(plan, threadId).catch(cliError);
         const view = runner.view(started.runId, threadId);
