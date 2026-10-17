@@ -70,6 +70,39 @@ export const MIGRATIONS: readonly string[] = [
      CHECK (status = 'open' OR (status = 'done' AND evidence_json IS NOT NULL) OR (status = 'skipped' AND length(trim(reason)) > 0)),
      PRIMARY KEY (thread_id, id)
    )`,
+  // #6 to #13 come from pstack/poteto-audit (#5). An install of that branch already recorded them in
+  // existing databases, and bb checks each migration by index, so they stay here byte for byte.
+  `CREATE TABLE poteto_threads (
+     thread_id TEXT PRIMARY KEY,
+     activated_at INTEGER NOT NULL,
+     activation_seq_key TEXT NOT NULL UNIQUE,
+     phase TEXT NOT NULL DEFAULT 'activated' CHECK (phase IN ('activated','routed','stalled','complete')),
+     charter_state TEXT NOT NULL DEFAULT 'pending' CHECK (charter_state IN ('pending','sent')),
+     charter_attempts INTEGER NOT NULL DEFAULT 0,
+     charter_next_at INTEGER NOT NULL DEFAULT 0,
+     revivals INTEGER NOT NULL DEFAULT 0,
+     stalled_at INTEGER
+   )`,
+  `ALTER TABLE steps ADD COLUMN skip_policy TEXT NOT NULL DEFAULT 'agent' CHECK (skip_policy IN ('agent','user','never'))`,
+  `ALTER TABLE steps ADD COLUMN opened_at INTEGER`,
+  `UPDATE steps SET opened_at = (SELECT created_at FROM checklists WHERE checklists.thread_id = steps.thread_id)
+   WHERE status = 'open' AND (section = 'pr' OR id = (SELECT s.id FROM steps s WHERE s.thread_id = steps.thread_id AND s.section = 'playbook' AND s.status = 'open' ORDER BY s.position, s.id LIMIT 1))`,
+  `UPDATE steps SET skip_policy = CASE WHEN id = 4 THEN 'never' ELSE 'user' END
+   WHERE section = 'playbook' AND id IN (1,2,4) AND thread_id IN (SELECT thread_id FROM checklists WHERE playbook = 'feature')`,
+  `ALTER TABLE checklists ADD COLUMN pr_gate_passed_at INTEGER`,
+  `ALTER TABLE poteto_threads ADD COLUMN audit_cursor TEXT`,
+  `CREATE TABLE poteto_violations (
+     thread_id TEXT NOT NULL,
+     key TEXT NOT NULL,
+     kind TEXT NOT NULL CHECK (kind IN ('pr-before-gate','work-before-checklist','audit-unreadable')),
+     detail TEXT NOT NULL,
+     observed_at INTEGER NOT NULL,
+     acknowledged_at INTEGER,
+     notified_at INTEGER,
+     notify_attempts INTEGER NOT NULL DEFAULT 0,
+     notify_next_at INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (thread_id, key)
+   )`,
   `ALTER TABLE attempts ADD COLUMN host_id TEXT`,
   `ALTER TABLE attempts ADD COLUMN host_name TEXT`,
 ];
