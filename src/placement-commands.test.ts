@@ -35,7 +35,7 @@ test("auto without a fresh worktree and conflicting placement flags fail at the 
 });
 
 type SpawnArgs = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0];
-function harness(options: { failSpawn?: boolean; nullDefaults?: boolean; sources?: string[] } = {}) {
+function harness(options: { failSpawn?: boolean; nullDefaults?: boolean; sources?: string[]; remote?: () => Promise<string | null> } = {}) {
   const spawns: SpawnArgs[] = [];
   const notices: unknown[][] = [];
   const asks: unknown[][] = [];
@@ -78,6 +78,7 @@ function harness(options: { failSpawn?: boolean; nullDefaults?: boolean; sources
     ask: async (...args) => { asks.push(args); return { kind: "opened", hosts: [{ id: AWAY, name: "Box" }] }; },
     publishProof: () => false,
     verdict: async () => null,
+    remote: options.remote ?? (async () => "https://example.com/p1.git"),
   };
   const commands = createPlacementCommands({ bb, placement, checkouts });
   const cli = defineCli({ name: "pstack", summary: "pstack", commands });

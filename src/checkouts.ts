@@ -64,6 +64,7 @@ export function pressured(board: Board, need: Need): { id: HostId; name: string 
   return board.hosts.filter((row) => row.onlyNeedsCheckout).map(({ id, name }) => ({ id, name }));
 }
 
+export const NO_REMOTE = "no git remote to clone from";
 export const DISMISS_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const CLONE_BACKOFF_MS = [5_000, 30_000, 120_000];
 const CLONE_QUIET_MS = 60 * 60 * 1000;
@@ -83,6 +84,8 @@ export interface Checkouts {
   /** Publishes a pending form's proof to the bb app. False when no such form is open. */
   publishProof(formId: string): boolean;
   verdict(projectId: string, host: HostId): Promise<Verdict | null>;
+  /** The URL a clone would use. Null when neither the project nor its default checkout has a remote. */
+  remote(projectId: string): Promise<string | null>;
 }
 
 export interface CheckoutSetting {
@@ -119,6 +122,15 @@ export function createCheckouts(bb: BbPluginApi, setting: CheckoutSetting, deps:
     return next;
   }
 
+  // bb clones the project's git remote, which can be null, so fall back to the origin of the default checkout.
+  async function remoteOf(project: { gitRemoteUrl: string | null; sources: readonly { hostId: string; path: string; isDefault: boolean }[] }): Promise<string | null> {
+    if (project.gitRemoteUrl) return project.gitRemoteUrl;
+    const source = project.sources.find((candidate) => candidate.isDefault);
+    if (!source) return null;
+    const { repos } = await bb.sdk.hosts.experimental_discoverRepos({ hostId: source.hostId });
+    return repos.find((repo) => repo.path === source.path)?.originUrl ?? null;
+  }
+
   function clone(projectId: string, host: HostId): void {
     const key = `${projectId} ${host}`;
     if (cloning.has(key) || clock() - (gaveUp.get(key) ?? -Infinity) < CLONE_QUIET_MS) return;
@@ -129,7 +141,12 @@ export function createCheckouts(bb: BbPluginApi, setting: CheckoutSetting, deps:
           const project = await bb.sdk.projects.get({ projectId });
           if (project.sources.some((source) => source.hostId === host)) return;
           if (decide(await book(), projectId, host) !== "allow") return;
-          await bb.sdk.projects.sources.add({ projectId, type: "clone", hostId: host });
+          const remoteUrl = await remoteOf(project);
+          if (remoteUrl === null) {
+            bb.log.warn(`pstack checkouts: not cloning ${projectId} onto ${host}: ${NO_REMOTE}; the project has no git remote and its default checkout has no origin`);
+            return;
+          }
+          await bb.sdk.projects.sources.add({ projectId, type: "clone", hostId: host, remoteUrl });
           bb.log.info(`pstack checkouts: cloned ${projectId} onto ${host}`);
           return;
         } catch (error) { warn(`clone of ${projectId} onto ${host}, attempt ${attempt + 1}`, error); }
@@ -232,5 +249,6 @@ export function createCheckouts(bb: BbPluginApi, setting: CheckoutSetting, deps:
       return true;
     },
     async verdict(projectId, host) { return decide(await book(), projectId, host); },
+    async remote(projectId) { return remoteOf(await bb.sdk.projects.get({ projectId })); },
   };
 }

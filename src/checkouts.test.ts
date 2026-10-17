@@ -57,7 +57,10 @@ test("pressure needs a full home and a machine that lacks only a checkout", () =
   assert.deepEqual(pressured(board(0), { ...need, away: null }), []);
 });
 
-function fake(options: { setting?: string; sources?: string[]; addFailures?: number; addCreatesSource?: boolean } = {}) {
+const REMOTE = "https://example.com/p1.git";
+type Repo = { path: string; originUrl: string | null };
+
+function fake(options: { setting?: string; sources?: string[]; addFailures?: number; addCreatesSource?: boolean; gitRemoteUrl?: string | null; repos?: Repo[] } = {}) {
   let setting = options.setting ?? "";
   let now = 1_000_000;
   const sources = new Set(options.sources ?? [HOME]);
@@ -70,9 +73,16 @@ function fake(options: { setting?: string; sources?: string[]; addFailures?: num
   let failures = options.addFailures ?? 0;
   const bb = {
     sdk: {
-      hosts: { list: async () => [HOME, BOX, VPS].map((id) => ({ id, name: `${id} name`, status: id === VPS ? "disconnected" : "connected", lifecycle: { phase: "active" } })) },
+      hosts: {
+        experimental_discoverRepos: async ({ hostId }: { hostId: string }) => ({ repos: hostId === HOME ? options.repos ?? [] : [], truncated: false }),
+        list: async () => [HOME, BOX, VPS].map((id) => ({ id, name: `${id} name`, status: id === VPS ? "disconnected" : "connected", lifecycle: { phase: "active" } })),
+      },
       projects: {
-        get: async () => { gets.push(now); return { name: "Project One", sources: [...sources].map((id) => ({ hostId: id })) }; },
+        get: async () => {
+          gets.push(now);
+          const gitRemoteUrl = options.gitRemoteUrl === undefined ? REMOTE : options.gitRemoteUrl;
+          return { name: "Project One", gitRemoteUrl, sources: [...sources].map((id) => ({ hostId: id, path: `/src/${id}`, isDefault: id === HOME })) };
+        },
         sources: {
           add: async (args: { hostId: string }) => {
             adds.push(args);
@@ -185,7 +195,7 @@ test("an allow with the app's proof is recorded and clones in the background", a
   assert.match(h.setting(), /^# kept\n/);
   assert.equal(decide(book(h.setting()), "p1", BOX), "allow");
   assert.equal(decide(book(h.setting()), "p1", VPS), "deny");
-  assert.deepEqual(h.adds, [{ projectId: "p1", type: "clone", hostId: BOX }]);
+  assert.deepEqual(h.adds, [{ projectId: "p1", type: "clone", hostId: BOX, remoteUrl: REMOTE }]);
   assert.equal(h.checkouts.publishProof(form.formId), false);
 });
 
@@ -193,7 +203,7 @@ test("allowed machines clone once per project and machine however often pressure
   const h = fake({ setting: "p1 allow host_box" });
   for (let i = 0; i < 3; i++) h.checkouts.notice("thr_a", "p1", BOX_ROW);
   await settle();
-  assert.deepEqual(h.adds, [{ projectId: "p1", type: "clone", hostId: BOX }]);
+  assert.deepEqual(h.adds, [{ projectId: "p1", type: "clone", hostId: BOX, remoteUrl: REMOTE }]);
   assert.equal(h.forms.length, 0);
 });
 
@@ -232,4 +242,42 @@ test("asking lists connected machines with no checkout and no rule, past any coo
   assert.equal((await h.checkouts.ask("thr_b", "p1")).kind, "already-open");
   await h.forms[0].answer({ outcome: "submitted", value: { decisions: { [BOX]: "deny" }, proof: null } });
   assert.deepEqual(await h.checkouts.ask("thr_a", "p1"), { kind: "nothing-to-ask" });
+});
+
+async function clonedFrom(options: Parameters<typeof fake>[0]) {
+  const h = fake({ setting: "p1 allow host_box", ...options });
+  h.checkouts.notice("thr_a", "p1", BOX_ROW);
+  await settle();
+  return h.adds.map((add) => (add as { remoteUrl?: string }).remoteUrl);
+}
+
+test("a clone uses the project's git remote when it has one", async () => {
+  assert.deepEqual(await clonedFrom({ repos: [{ path: "/src/host_home", originUrl: "https://example.com/other.git" }] }), [REMOTE]);
+});
+
+test("without a project remote a clone uses the origin of the default checkout", async () => {
+  const origin = "https://github.com/owner/repo.git";
+  assert.deepEqual(await clonedFrom({ gitRemoteUrl: null, repos: [{ path: "/src/host_home", originUrl: origin }] }), [origin]);
+});
+
+test("the default checkout's origin comes only from a repo at exactly its path", async () => {
+  const exact = "https://example.com/exact.git";
+  const nearMisses = [
+    { path: "/src/host_home/", originUrl: "https://example.com/slash.git" },
+    { path: "/src/host_home-old", originUrl: "https://example.com/old.git" },
+    { path: "/src", originUrl: "https://example.com/parent.git" },
+  ];
+  assert.deepEqual(await clonedFrom({ gitRemoteUrl: null, repos: [...nearMisses, { path: "/src/host_home", originUrl: exact }] }), [exact]);
+  assert.deepEqual(await clonedFrom({ gitRemoteUrl: null, repos: nearMisses }), []);
+});
+
+test("with no git remote anywhere nothing is cloned or retried", async () => {
+  for (const repos of [[], [{ path: "/src/host_home", originUrl: null }]]) {
+    const h = fake({ setting: "p1 allow host_box", gitRemoteUrl: null, repos });
+    h.checkouts.notice("thr_a", "p1", BOX_ROW);
+    await settle();
+    assert.deepEqual(h.adds, []);
+    assert.deepEqual(h.sleeps, []);
+    assert.equal(await h.checkouts.remote("p1"), null);
+  }
 });
