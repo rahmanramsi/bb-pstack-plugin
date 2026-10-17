@@ -352,15 +352,18 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
   const background = (work: Promise<void>) => void work.catch((error) => bb.log.error(`pstack issues: ${message(error)}`));
 
-  /** Writes a Change computed from a fresh read, re-reading when another writer got there first. */
-  function writeFresh(id: JobId, decide: (job: Job) => Change | null): { job: Job; change: Change | null } | null {
+  /**
+   * Writes the Change `decide` computes from a fresh read, re-reading when another writer got there first, and returns
+   * the written row with what `decide` concluded. Null when the job is gone or `decide` declines.
+   */
+  function writeFresh<T>(id: JobId, decide: (job: Job) => { change: Change; result: T } | null): { job: Job; result: T } | null {
     for (let attempt = 0; attempt < 5; attempt++) {
       const job = store.get(id);
       if (!job) return null;
-      const change = decide(job);
-      if (!change) return { job, change: null };
-      const written = store.write(id, job.version, change, clock());
-      if (written) return { job: written, change };
+      const decision = decide(job);
+      if (!decision) return null;
+      const written = store.write(id, job.version, decision.change, clock());
+      if (written) return { job: written, result: decision.result };
     }
     throw new Error(`issue job ${id} kept changing while it was being written`);
   }
@@ -397,14 +400,13 @@ export function createIssues(deps: IssuesDeps): Issues {
     const facts = await reportFacts(bound);
     if ("unavailable" in facts) return { ok: false, code: "unavailable", message: `pstack could not check the report yet, try again shortly: ${facts.unavailable}` };
 
-    let verdict: ReturnType<typeof acceptReport> | null = null;
     const written = writeFresh(bound.id, (job) => {
       if (job.phase.state !== "working") return null;
-      verdict = acceptReport(job, parsed, facts);
-      return verdict.change;
+      const verdict = acceptReport(job, parsed, facts);
+      return { change: verdict.change, result: verdict };
     });
-    const outcome = verdict as ReturnType<typeof acceptReport> | null;
-    if (!written?.change || !outcome) return { ok: false, code: "not_working", message: `job ${bound.id} is no longer waiting for a report` };
+    if (!written) return { ok: false, code: "not_working", message: `job ${bound.id} is no longer waiting for a report` };
+    const outcome = written.result;
     background(tick(bound.id));
     if (!outcome.ok) {
       const ended = written.job.phase.state !== "working";
@@ -428,8 +430,11 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function stop(id: JobId, by: string): Promise<boolean> {
-    const written = writeFresh(id, (job) => stopChange(job, by));
-    if (!written?.change) return false;
+    const written = writeFresh(id, (job) => {
+      const change = stopChange(job, by);
+      return change && { change, result: null };
+    });
+    if (!written) return false;
     background(tick(id));
     return true;
   }
