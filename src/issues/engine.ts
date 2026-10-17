@@ -200,6 +200,10 @@ export function createIssues(deps: IssuesDeps): Issues {
             token,
           });
           if (result.status === "pushed") return done({ pushedSha: effect.sha });
+          // A claim whose lease ran out may still be pushing the same commit, and its push can land first.
+          if (result.status === "rejected" && result.reason === "stale-remote" && (await repo.branchSha(job.branch)) === effect.sha) {
+            return done({ pushedSha: effect.sha });
+          }
           if (result.status === "rejected") return { kind: "fail", error: `push rejected (${result.reason}): ${result.detail}` };
           return { kind: "unknown", error: `push failed: ${result.detail}` };
         } catch (error) {

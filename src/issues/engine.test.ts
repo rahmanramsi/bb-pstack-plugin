@@ -300,6 +300,8 @@ function harness() {
       hostPush: async (hostId: string, input: PushInput): Promise<PushResult> => {
         assert.equal(hostId, "host_worker");
         pushes.push(input);
+        await held("push:before");
+        if ((gh.refs.get(input.branch) ?? null) !== input.expectedRemoteSha) return { status: "rejected", reason: "stale-remote", detail: "[rejected] (stale info)" };
         gh.refs.set(input.branch, input.sha);
         await held("push");
         return { status: "pushed", sha: input.sha };
@@ -354,6 +356,10 @@ function harness() {
     current.crash();
     current = engine();
   };
+  /** A second engine on the same store while the first keeps running, as across a plugin reload. */
+  const overlap = () => {
+    current = engine();
+  };
 
   return {
     clock,
@@ -376,6 +382,7 @@ function harness() {
     report,
     settle,
     restart,
+    overlap,
     engine: () => current,
     setRepo: (line: typeof repoLine) => (repoLine = line),
     setWorkerRole: (value: string) => (workerRole = value),
@@ -751,4 +758,31 @@ test("an idle worker waiting on its own runs or child threads is not reminded; o
   await h.settle();
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0]!.input[0].text, /gate pr` to pass, and it fails: 2 open steps block the pr gate\.\n4\. \[Verify\] Run the tests/);
+});
+
+test("a push that outlives its lease while a second engine pushes the same commit still ends in review", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  const first = h.holdAt("push:before", "sdk");
+  await h.report(working.threadId!, GOOD);
+  await first.hit;
+
+  h.overlap();
+  h.clock.now += EFFECT_POLICY.push.leaseMs + 1;
+  const second = h.holdAt("push:before", "sdk");
+  const sweeping = h.engine().issues.sweep();
+  await second.hit;
+  first.free();
+  while (h.gh().refs.get(working.branch) !== SHA2) await new Promise((resolve) => setImmediate(resolve));
+  second.free();
+  await sweeping;
+  await h.settle();
+
+  const done = await h.only();
+  assert.equal(done.state, "review", done.error ?? "");
+  assert.equal(done.pushedSha, SHA2);
+  assert.equal(h.pushes.length, 2, "both engines pushed");
+  assert.equal([...h.gh().issues.values()].filter((issue) => issue.pr).length, 1, "one pull request");
 });
