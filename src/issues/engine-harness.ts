@@ -34,7 +34,7 @@ export function hold(key: string): Hold {
   return { key, hit, reached, release, free };
 }
 
-type Issue = { number: number; title: string; body: string; user: string; updatedAt: number; labels: Set<string>; pr?: { head: string; base: string; title: string; body: string; draft: boolean } };
+type Issue = { number: number; title: string; body: string; user: string; updatedAt: number; labels: Set<string>; closed?: boolean; subIssues?: number[]; blockedBy?: number[]; pr?: { head: string; base: string; title: string; body: string; draft: boolean } };
 type Comment = { id: number; body: string; user: { login: string }; created_at: string; updated_at: string };
 type ReviewComment = Comment & { path: string; line: number; diff_hunk: string; in_reply_to_id?: number; pull_request_review_id: number };
 type Review = { id: number; body: string; user: { login: string }; state: string; submitted_at: string };
@@ -95,7 +95,7 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
   if (method === "GET" && path === "/repos/acme/web/issues") {
     const since = url.searchParams.get("since");
     const items = [...gh.issues.values()]
-      .filter((issue) => issue.labels.has(url.searchParams.get("labels")!) && (!since || issue.updatedAt >= Date.parse(since)))
+      .filter((issue) => !issue.closed && issue.labels.has(url.searchParams.get("labels")!) && (!since || issue.updatedAt >= Date.parse(since)))
       .sort((a, b) => a.updatedAt - b.updatedAt)
       .map((issue) => ({
         number: issue.number,
@@ -104,10 +104,25 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
         html_url: `https://github.com/acme/web/${issue.pr ? "pull" : "issues"}/${issue.number}`,
         user: { login: issue.user },
         updated_at: iso(issue.updatedAt),
+        ...(issue.subIssues ? { sub_issues_summary: { total: issue.subIssues.length } } : {}),
         ...(issue.pr ? { pull_request: {} } : {}),
       }));
     const etag = `"${createHash("sha1").update(JSON.stringify(items)).digest("hex")}"`;
     return headers["if-none-match"] === etag ? [304] : [200, items, { etag }];
+  }
+  const linked = (issue: Issue) => ({ number: issue.number, title: issue.title, body: issue.body, user: { login: issue.user }, html_url: `https://github.com/acme/web/issues/${issue.number}`, state: issue.closed ? "closed" : "open", repository_url: "https://api.github.com/repos/acme/web" });
+  if ((match = /^\/repos\/acme\/web\/issues\/(\d+)$/.exec(path))) {
+    const issue = issueOf(match[1]!)!;
+    if (method === "PATCH") issue.closed = body.state === "closed";
+    return [200, { number: issue.number, state: issue.closed ? "closed" : "open", labels: [...issue.labels].map((name) => ({ name })) }];
+  }
+  if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/sub_issues$/.exec(path)) && method === "GET") return [200, (issueOf(match[1]!)!.subIssues ?? []).map((n) => linked(gh.issues.get(n)!))];
+  if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/dependencies\/blocked_by$/.exec(path)) && method === "GET") return [200, (issueOf(match[1]!)!.blockedBy ?? []).map((n) => linked(gh.issues.get(n)!))];
+  if ((match = /^\/repos\/acme\/web\/issues\/comments\/(\d+)$/.exec(path)) && method === "PATCH") {
+    const comment = [...gh.comments.values()].flat().find((candidate) => candidate.id === Number(match![1]))!;
+    comment.body = body.body;
+    comment.updated_at = iso(gh.now());
+    return [200, comment];
   }
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/events$/.exec(path)) && method === "GET") return [200, gh.events.get(Number(match[1])) ?? []];
   if ((match = /^\/repos\/acme\/web\/collaborators\/([^/]+)\/permission$/.exec(path))) {
