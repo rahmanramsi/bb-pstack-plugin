@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import process from "node:process";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // A thread holds a slot from the moment its turn starts until it settles.
@@ -165,4 +166,5 @@ function main() {
 	process.exit(result.picks.length === 0 ? 1 : 0);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+// bb loads skills through a symlinked directory, so compare real paths.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) main();

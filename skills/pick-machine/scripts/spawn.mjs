@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import process from "node:process";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { gather, rank } from "./pick-machine.mjs";
 
@@ -69,4 +70,5 @@ function main() {
 	process.exit(run.status ?? 1);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+// bb loads skills through a symlinked directory, so compare real paths.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) main();
