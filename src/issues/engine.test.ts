@@ -881,3 +881,23 @@ test("finding a worker's thread reads metadata a page at a time and stops at thr
   assert.equal(adopted.threadId, h.late[0]!.id);
   assert.deepEqual(h.calls, { list: 1, getPluginMetadata: 0, listPluginMetadata: 1 });
 });
+
+test("a worker that reports before its spawn is confirmed is told to try again, and its report is accepted once it is", async () => {
+  const h = harness();
+  h.failures.spawn.push({ create: "now" });
+  h.label(41);
+  await h.engine().issues.sweep();
+  const starting = await h.only();
+  assert.equal(starting.state, "starting");
+  const [threadId] = [...h.threads.keys()];
+
+  const early = await h.report(threadId!, GOOD);
+  assert.equal(early.exitCode, 1);
+  assert.match(early.stderr!, /try again/);
+  assert.doesNotMatch(early.stderr!, /only an issue worker thread can report/);
+
+  h.clock.now += 15_000;
+  await h.engine().issues.sweep();
+  assert.equal((await h.only()).threadId, threadId);
+  assert.equal((await h.report(threadId!, GOOD)).exitCode, 0);
+});

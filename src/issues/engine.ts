@@ -422,9 +422,23 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  /**
+   * The job a thread's metadata names, null inside when that job does not exist, or null when the metadata names none.
+   * Only a pointer: the store's binding decides who may report.
+   */
+  async function namedJob(threadId: string): Promise<{ job: Job | null } | null> {
+    const metadata = IssueMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId }).catch(() => null));
+    return metadata.success ? { job: store.get(metadata.data.jobId as JobId) } : null;
+  }
+
   async function report(threadId: string, text: string): Promise<ReportResult> {
     const bound = store.byThread(threadId);
-    if (!bound) return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can report" };
+    if (!bound) {
+      const named = (await namedJob(threadId))?.job;
+      if (named?.phase.state !== "starting") return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can report" };
+      background(tick(named.id));
+      return { ok: false, code: "unavailable", message: "pstack has not confirmed this thread as the issue's worker yet, try again shortly" };
+    }
     if (bound.phase.state !== "working") return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report` };
     let parsed: Report;
     try {
@@ -479,9 +493,9 @@ export function createIssues(deps: IssuesDeps): Issues {
   async function onThread(threadId: string): Promise<void> {
     const bound = store.byThread(threadId);
     if (bound) return tick(bound.id);
-    const metadata = IssueMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId }).catch(() => null));
-    if (!metadata.success) return;
-    const job = store.get(metadata.data.jobId as JobId);
+    const named = await namedJob(threadId);
+    if (!named) return;
+    const { job } = named;
     if (job?.phase.state === "starting") return tick(job.id);
     if (job && ("effects" in job.phase ? job.phase.effects.some((effect) => effect.op === "stop-thread") : false)) return;
     await bb.sdk.threads.stop({ threadId }).catch((error) => {
