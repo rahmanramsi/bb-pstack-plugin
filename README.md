@@ -39,6 +39,8 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 | `bb pstack checklist begin <playbook>` | copies a playbook's steps into the thread's checklist. `checklist done <id> --evidence …`, `checklist skip <id> --reason …` and `checklist add` close and extend it. |
 | `bb pstack gate pr` / `gate done` | exit 1 while checklist steps are open. `/poteto-mode` runs them before it opens a PR and before its final reply. |
 
+an agent can still call plain `bb thread spawn --parent-self --new-environment worktree`. when its machine is full and another machine has room for the same project and model, pstack refuses that spawn and names `bb pstack spawn` as the fix. it never refuses a fork, a person's thread, a reused environment, or a thread pstack spawned. it also lets the spawn through whenever it lacks the facts to decide. turn the `placementGuard` setting off to disable it (`bb plugin config pstack set placementGuard false`).
+
 ## get started
 
 two steps:
