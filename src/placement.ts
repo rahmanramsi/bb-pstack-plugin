@@ -34,6 +34,8 @@ export interface HostRow {
   limit: number | null;
   free: number;
   blocker: string | null;
+  /** Eligible except that it has no checkout of the project, so a clone would open it up. */
+  onlyNeedsCheckout: boolean;
 }
 export interface Board {
   hosts: HostRow[];
@@ -53,11 +55,14 @@ export interface Facts {
   hosts: readonly { id: HostId; name: string; connected: boolean; phase: string }[];
   limits: { perHost: ReadonlyMap<HostId, number>; global: number | null } | null;
   occupancy: Occupancy;
+  /** Hosts with a source of the project; null when unknown. */
+  checkouts: ReadonlySet<HostId> | null;
   worktrees: ReadonlyMap<HostId, string | null>;
   models: ReadonlyMap<HostId, string | null>;
   branches: ReadonlyMap<HostId, { name: string; sha: string | null }>;
 }
 export const HOLD_GRACE_MS = 60_000;
+export const NO_CHECKOUT = "no checkout of this project";
 const FACT_TTL_MS = 30_000;
 export const REFRESH_MS = 30_000;
 const WARM_MS = 2 * REFRESH_MS;
@@ -95,25 +100,29 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
     const limit = facts.limits?.perHost.get(host.id) ?? null;
     const free = limit === null ? 0 : Math.max(0, limit - used - held);
     const isHome = host.id === need.home.hostId;
-    let blocker: string | null = null;
-    if (!host.connected) blocker = "disconnected";
-    else if (host.phase !== "active") blocker = `phase ${host.phase}`;
-    else if (limit === null) blocker = "unknown concurrency limit";
-    else if (!isHome && need.away === null) blocker = "pinned to home";
-    else if (!isHome && need.away?.kind === "worktree") {
-      blocker = facts.worktrees.has(host.id) ? facts.worktrees.get(host.id)! : "worktree readiness unknown";
-      const pin = need.away.pin;
-      if (blocker === null && pin) {
-        const branch = facts.branches.get(host.id);
-        if (branch?.name !== pin.branch || branch.sha !== pin.sha) blocker = `branch ${pin.branch} is not verified at ${pin.sha}`;
+    const reach = !host.connected ? "disconnected"
+      : host.phase !== "active" ? `phase ${host.phase}`
+      : limit === null ? "unknown concurrency limit"
+      : !isHome && need.away === null ? "pinned to home"
+      : null;
+    let checkout: string | null = null;
+    if (!isHome && need.away !== null) {
+      if (facts.checkouts !== null && !facts.checkouts.has(host.id)) checkout = NO_CHECKOUT;
+      else {
+        checkout = facts.worktrees.has(host.id) ? facts.worktrees.get(host.id)! : "worktree readiness unknown";
+        const pin = need.away.pin;
+        if (checkout === null && pin) {
+          const branch = facts.branches.get(host.id);
+          if (branch?.name !== pin.branch || branch.sha !== pin.sha) checkout = `branch ${pin.branch} is not verified at ${pin.sha}`;
+        }
       }
     }
-    if (!blocker && !isHome && need.model !== null) {
-      blocker = facts.models.has(host.id) ? facts.models.get(host.id)! : "model catalog unknown";
-    }
-    if (!blocker && globalFree === 0) blocker = "global limit reached";
-    if (!blocker && free === 0) blocker = `full (${used + held}/${limit})`;
-    return { id: host.id, name: host.name, running: used, held, limit, free, blocker };
+    const capacity = (!isHome && need.model !== null ? facts.models.has(host.id) ? facts.models.get(host.id)! : "model catalog unknown" : null)
+      ?? (globalFree === 0 ? "global limit reached" : null)
+      ?? (free === 0 ? `full (${used + held}/${limit})` : null);
+    const blocker = reach ?? checkout ?? capacity;
+    const onlyNeedsCheckout = reach === null && checkout === NO_CHECKOUT && capacity === null;
+    return { id: host.id, name: host.name, running: used, held, limit, free, blocker, onlyNeedsCheckout };
   });
   const home = rows.find((row) => row.id === need.home.hostId)!;
   const away = rows.filter((row) => row.id !== home.id && row.blocker === null)
@@ -143,7 +152,7 @@ const LimitsStatus = z.object({
 });
 
 export interface Placement {
-  place(need: Need, issue: (target: Target) => Promise<string | null>): Promise<{ target: Target; threadId: string | null }>;
+  place(need: Need, issue: (target: Target) => Promise<string | null>): Promise<{ target: Target; threadId: string | null; board: Board }>;
   board(need: Need): Promise<Board>;
   wouldMove(need: Need, occupancy: Occupancy): Target | null;
   /** Reloads facts for every need wouldMove was asked about in the last ten minutes. */
@@ -187,6 +196,15 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     return occupancyPending;
   }
 
+  async function sources(need: Need): Promise<Set<HostId> | null> {
+    if (!need.projectId || need.away === null) return null;
+    try { return new Set((await bb.sdk.projects.get({ projectId: need.projectId })).sources.map((source) => hostId.parse(source.hostId))); }
+    catch (error) {
+      bb.log.warn(`pstack placement checkouts unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
   async function factsFor(need: Need, force = false): Promise<Facts> {
     const id = key(need);
     const cached = cache.get(id);
@@ -194,17 +212,17 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     const pending = loading.get(id);
     if (pending) return pending;
     const promise = (async (): Promise<Facts> => {
-      const [hosts, capacity] = await Promise.all([bb.sdk.hosts.list(), limits(force)]);
+      const [hosts, capacity, checkouts] = await Promise.all([bb.sdk.hosts.list(), limits(force), sources(need)]);
       const facts: Facts = {
         hosts: hosts.map((host) => ({ id: hostId.parse(host.id), name: host.name, connected: host.status === "connected", phase: host.lifecycle.phase })),
         limits: capacity, occupancy: { requestedAt: clock(), threads: [] },
-        worktrees: new Map(), models: new Map(), branches: new Map(),
+        checkouts, worktrees: new Map(), models: new Map(), branches: new Map(),
       };
       const worktrees = new Map<HostId, string | null>();
       const models = new Map<HostId, string | null>();
       const branches = new Map<HostId, { name: string; sha: string | null }>();
       await Promise.all(facts.hosts.filter((host) => host.connected && host.phase === "active").map(async (host) => {
-        if (need.projectId && need.away?.kind === "worktree") {
+        if (need.projectId && need.away?.kind === "worktree" && (checkouts === null || checkouts.has(host.id))) {
           try {
             const providers = await bb.sdk.environments.listProviders({ projectId: need.projectId, hostId: host.id });
             const provider = providers.find((entry) => entry.id === "git-worktree");
@@ -230,7 +248,7 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
       return result;
     })().catch((error): Facts => {
       bb.log.warn(`pstack placement facts unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      return { hosts: [], limits: null, occupancy: { requestedAt: clock(), threads: [] }, worktrees: new Map(), models: new Map(), branches: new Map() };
+      return { hosts: [], limits: null, occupancy: { requestedAt: clock(), threads: [] }, checkouts: null, worktrees: new Map(), models: new Map(), branches: new Map() };
     }).finally(() => { loading.delete(id); });
     loading.set(id, promise);
     return promise;
@@ -250,14 +268,14 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
         const settled = holds[i].settledAt;
         if (settled !== null && now - settled >= HOLD_GRACE_MS) holds.splice(i, 1);
       }
-      const { target } = choose(facts, holds, need, now);
+      const { target, board } = choose(facts, holds, need, now);
       // No await here. The next caller must see this hold before it chooses.
       const hold: Hold = { hostId: target.hostId, threadId: null, settledAt: null };
       holds.push(hold);
       try {
         hold.threadId = await issue(target);
         if (hold.threadId === null) holds.splice(holds.indexOf(hold), 1);
-        return { target, threadId: hold.threadId };
+        return { target, threadId: hold.threadId, board };
       } finally { hold.settledAt = clock(); }
     },
     async board(need) { return choose(await fresh(need), holds, need, clock()).board; },

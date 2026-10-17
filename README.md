@@ -32,7 +32,7 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 |---|---|
 | `bb pstack models [--role <role>] [--json]` | the model each role uses, configured values merged over the defaults. |
 | `bb pstack spawn --new-environment worktree --prompt-stdin` | creates a delegate on the eligible machine with the most free slots. `--parent-self` sets its parent. `--machine here` pins local work. `--dry-run` prints the decision and spawn arguments. |
-| `bb pstack machines [--provider <id> --model <id>] [--json]` | shows running threads, held slots, concurrency limits, and placement blockers. automatic placement onto another machine requires a known limit. |
+| `bb pstack machines [--provider <id> --model <id>] [--ask-clone] [--json]` | shows running threads, held slots, concurrency limits, and placement blockers. automatic placement onto another machine requires a known limit. `--ask-clone` asks you in the thread whether to clone the project onto machines that have no checkout. |
 | `bb pstack doctor` | checks every role against the live provider catalog. run it after setup. |
 | `bb pstack run start --file <plan.json>` | runs a review panel or a swarm on hidden worker threads, with a live card in the chat. skills write the plan for you. |
 | `bb pstack run status <id>` / `run stop <id>` | a run's progress and results, or stop it. |
@@ -284,6 +284,8 @@ your provider already has a plan mode (`/plan` in the composer, or `bb thread sp
 `poteto-mode` is my style. you may not want exactly that.
 
 type [`/automate-me`](./skills/automate-me/SKILL.md). it mines your recent transcripts, drafts a `<your-name>-mode` skill from how you've actually worked, and routes through pstack underneath. you keep pstack as the base and end up with your own routing skill alongside `poteto-mode`.
+
+a delegate can only run on a machine with a checkout of its project. the plugin's `checkouts` setting says where pstack may clone one, one `<projectId|*> allow|deny <hostId|*>` line per rule. the most specific rule wins, and deny wins a tie. when this machine is full and another machine lacks only a checkout, pstack clones the project there if a rule allows it. it clones from the project's git remote, or, when the project has none, from the origin of the project's default checkout. with neither, `bb pstack machines` shows "no git remote to clone from" for those machines and nothing is cloned. if no rule decides, it asks you once in the thread, and your answer is saved as a rule. dismissing the question keeps it away for 24 hours. an agent can answer deny for you but cannot answer allow, because an allow must come from the bb app.
 
 models are configurable too. type [`/setup-pstack`](./skills/setup-pstack/SKILL.md). it detects the providers and models bb has (`bb provider list`, `bb provider models`) and saves a small table mapping each role (code, judgment, the review panels) to a `provider/model/level` tuple in the plugin's `models` setting. the plugin adds that table to every thread's instructions, and `bb pstack models` prints it merged with the defaults. every skill falls back to sensible defaults for a role with no line, so you override only what you want.
 

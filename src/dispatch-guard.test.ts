@@ -26,6 +26,7 @@ const facts = (homeRunning: number): Facts => ({
   hosts: [{ id: HOME, name: "Vantage Mac Mini", connected: true, phase: "active" }, { id: BOX, name: "instabox-agentbb-2", connected: true, phase: "active" }],
   limits: { perHost: new Map([[HOME, 10], [BOX, 4]]), global: null },
   occupancy: { requestedAt: 0, threads: running(HOME, homeRunning) },
+  checkouts: new Set([HOME, BOX]),
   worktrees: new Map([[HOME, null], [BOX, null]]), models: new Map([[HOME, null], [BOX, null]]), branches: new Map(),
 });
 const placed = (homeRunning: number) => (need: Need) => {
