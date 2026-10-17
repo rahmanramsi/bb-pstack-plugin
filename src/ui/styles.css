@@ -201,3 +201,4 @@
 .ps-consent-host { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
 .ps-consent-name { min-width: 0; overflow-wrap: anywhere; }
 .ps-consent-choice { display: inline-flex; gap: 4px; flex-shrink: 0; }
+.pstack .ps-consent-choice button[aria-pressed=true] { background: var(--secondary); color: var(--foreground); }
