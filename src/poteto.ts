@@ -9,6 +9,7 @@ export type PotetoThread = {
   charterAttempts: number;
   charterNextAt: number;
   revivals: number;
+  auditCursor: string | null;
 };
 
 /** Replace code with spaces so tokens inside examples never activate the thread. */
@@ -45,10 +46,13 @@ export function activatesPoteto(context: PotetoDispatch, pluginId: string): bool
     outsideCode(block.text).slice(start, end).trim().length > 0));
 }
 
-export type PotetoControl = { kind: "waive"; stepId: number; reason: string } | { kind: "invalid" };
+export type PotetoControl = { kind: "waive"; stepId: number; reason: string } | { kind: "ack"; key: string } | { kind: "invalid" };
 
 export function potetoControl(text: string): PotetoControl | null {
-  if (outsideCode(text) !== text) return null;
+  if (/^\s*[/\u0024]poteto-mode\s+ack\b/.test(text)) {
+    const match = /^\s*[/\u0024]poteto-mode\s+ack\s+(\S+)\s*$/.exec(text);
+    return match ? { kind: "ack", key: match[1] } : { kind: "invalid" };
+  }
   if (!/^\s*[/\u0024]poteto-mode\s+waive\b/.test(text)) return null;
   const match = /^\s*[/\u0024]poteto-mode\s+waive\s+([1-9]\d*)\s+([^\r\n]+?)\s*$/.exec(text);
   if (!match || !Number.isSafeInteger(Number(match[1])) || match[2].length > 500) return { kind: "invalid" };

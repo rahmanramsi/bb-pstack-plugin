@@ -18,7 +18,7 @@ function checklist(name = "feature"): Checklist {
   assert.ok(pr);
   steps.push(...extractSteps(readFileSync(pr[1].file, "utf8"), pr[1].extractor, "pr"));
   return {
-    threadId: "thr_test", playbook: entry[0], revision: 0, nudgedAtRevision: null, createdAt: 1,
+    threadId: "thr_test", playbook: entry[0], revision: 0, nudgedAtRevision: null, createdAt: 1, prGatePassedAt: null,
     steps: steps.map((step, index) => ({ ...step, id: index + 1, openedAt: 1, resolution: { kind: "open" } })),
   };
 }
@@ -154,7 +154,7 @@ test("a truncated open-steps block always ends with the full remainder notice", 
     id: index + 1, openedAt: 1, section: "playbook" as const, skipPolicy: "agent" as const, afterPr: false, resolution: { kind: "open" as const },
     text: `Step ${index + 1} ${"x".repeat(index * 7)}`,
   }));
-  const checklist = { threadId: "thr_x", playbook: "feature" as never, steps, revision: 0, nudgedAtRevision: null, createdAt: 1 };
+  const checklist = { threadId: "thr_x", playbook: "feature" as never, steps, revision: 0, nudgedAtRevision: null, createdAt: 1, prGatePassedAt: null };
   for (let max = 120; max <= 4000; max += 37) {
     const text = renderOpenSteps(checklist, max);
     assert.ok(text.length <= max, `length at ${max}`);

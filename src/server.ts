@@ -200,7 +200,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.contributeInstructions(({ threadId }) => {
-    const parts = [instructionsFor(modelsText), checklist.instructions(threadId)].filter((part): part is string => !!part);
+    const parts = [checklist.instructions(threadId), instructionsFor(modelsText)].filter((part): part is string => !!part);
     return parts.length > 0 ? parts.join("\n\n").slice(0, INSTRUCTIONS_MAX) : null;
   });
 
@@ -210,6 +210,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         revision: runStore.revision(threadId) + (state?.revision ?? 0),
         poteto: checklistStore.poteto(threadId)?.phase ?? null,
+        violations: checklistStore.violations(threadId).map(({ key, kind, detail, acknowledgedAt }) => ({ key, kind, detail, acknowledgedAt })),
         activeRuns: runner.activeRuns(threadId).map((id) => {
           const view = runner.view(id, threadId);
           return { id: view.id, kind: view.kind, title: view.title, status: view.status, jobs: view.jobs };
