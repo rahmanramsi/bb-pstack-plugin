@@ -16,7 +16,6 @@ import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
 import {
-  CONCURRENCY,
   EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
@@ -387,7 +386,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function gather(job: Job): Promise<Facts> {
-    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
@@ -403,11 +402,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         .then((head) => ({ head }))
         .catch((error) => (bb.log.warn(`pstack issues: ${job.id}: could not read ${job.branch}: ${message(error)}`), null));
     }
-    if (wanted.includes("slotFree")) {
-      const { busy, ahead } = store.slots(job.id);
-      facts.slotFree = ahead < CONCURRENCY - busy;
-    }
-    if (wanted.includes("worker") && facts.slotFree) facts.worker = await resolveWorker(job);
+    if (wanted.includes("worker")) facts.worker = await resolveWorker(job);
     if (wanted.includes("thread")) facts.thread = await threadFact(job.threadId);
     if (facts.thread?.kind === "idle" && job.threadId) {
       const threadId = job.threadId;
