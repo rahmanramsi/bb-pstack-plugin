@@ -4,7 +4,7 @@
 import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { readThreadFile } from "../thread-files.ts";
-import { JOB_ID, toView, type JobId, type JobView, type RepoName } from "./job.ts";
+import { JOB_ID, MAX_FEEDBACK_ROUNDS, toView, type JobId, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
 export type RepoMapping = { repo: RepoName; projectId: string; hostId: string };
@@ -110,6 +110,7 @@ function formatShow(job: JobView, repo: RepoView, now: number): string {
     ["thread", job.threadId],
     ["pull request", job.pr?.url ?? null],
     ["pushed", job.pushedSha],
+    ["round", job.round > 1 ? `feedback round ${job.round - 1} of ${MAX_FEEDBACK_ROUNDS}` : null],
     ["summary", job.summary],
     ["error", job.error],
     ["repo polled", repo.polledAt === null ? "not yet" : age(repo.polledAt, now)],

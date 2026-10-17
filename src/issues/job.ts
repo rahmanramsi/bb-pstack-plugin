@@ -906,6 +906,8 @@ export type JobView = {
   threadId: string | null;
   pr: { number: number; url: string } | null;
   pushedSha: Sha | null;
+  /** 1 while the issue is worked on; each feedback round adds one. */
+  round: number;
   summary: string | null;
   error: string | null;
   createdAt: number;
@@ -929,6 +931,7 @@ export function toView(job: Job): JobView {
     threadId: job.threadId,
     pr: job.pr,
     pushedSha: job.pushedSha,
+    round: job.round,
     summary: job.report?.summary ?? null,
     error: job.error,
     createdAt: job.createdAt,

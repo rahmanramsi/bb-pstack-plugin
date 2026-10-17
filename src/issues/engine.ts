@@ -14,7 +14,7 @@ import { z } from "zod";
 import type { HostPush } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
-import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type GitHub, type PollCursor } from "./github.ts";
+import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type FeedbackCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
 import {
   CONCURRENCY,
   EFFECT_POLICY,
@@ -26,6 +26,7 @@ import {
   TERMINAL,
   acceptReport,
   awaitingThread,
+  counts,
   effectMarker,
   isReasoningLevel,
   plan,
@@ -39,6 +40,7 @@ import {
   type EffectOp,
   type EffectOutcome,
   type Facts,
+  type Feedback,
   type GateFact,
   type Job,
   type JobId,
@@ -575,51 +577,81 @@ export function createIssues(deps: IssuesDeps): Issues {
     });
   }
 
+  /**
+   * Stores the feedback on each open job pull request that counts, and records each one's state. An item counts when
+   * job.ts's rules pass and its author has write access and is not the App.
+   */
+  async function pollFeedback(repo: RepoClient): Promise<void> {
+    const jobs = new Map(store.withPullRequest(repo.name).map((job) => [job.pr!.number, job]));
+    if (jobs.size === 0) return;
+    const result = await repo.feedback(store.feedbackCursor(repo.name) as FeedbackCursor | null, [...jobs.keys()]);
+    const appLogin = await repo.appLogin();
+    const counted: { jobId: JobId; pr: number; feedback: Feedback }[] = [];
+    for (const item of result.items) {
+      const job = jobs.get(item.pr);
+      if (!job || !counts(item) || item.author === appLogin || !CAN_TRIGGER.has(await repo.permission(item.author))) continue;
+      const { pr, reviewState: _, ...feedback } = item;
+      counted.push({ jobId: job.id, pr, feedback });
+    }
+    store.addFeedback(repo.name, counted);
+    for (const { number, state } of result.pulls) pullStates.set(jobs.get(number)!.id, state);
+    store.saveFeedbackCursor(repo.name, result.next);
+  }
+
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
     const now = clock();
-    const previous = store.repoPoll(mapping.repo).poll as PollCursor | null;
+    let cursor = store.repoPoll(mapping.repo).poll as PollCursor | null;
     if (mapping.hostId === primaryHostId) {
-      store.saveRepoPoll(mapping.repo, previous, now, `host ${mapping.hostId} is the bb server's machine; map ${mapping.repo} to another host`);
+      store.saveRepoPoll(mapping.repo, cursor, now, `host ${mapping.hostId} is the bb server's machine; map ${mapping.repo} to another host`);
       return;
     }
     const repo = github.repo(mapping.repo);
+    const errors: string[] = [];
     try {
-      const result = await repo.labeledIssues(LABEL.trigger, previous);
-      if (!result.changed) {
-        store.saveRepoPoll(mapping.repo, previous, now, null);
-        return;
-      }
-      const [appLogin, baseBranch] = await Promise.all([repo.appLogin(), repo.defaultBranch()]);
-      for (const issue of result.issues) {
-        if (store.open(mapping.repo, issue.number)) continue;
-        const event = await repo.latestLabelEvent(issue.number, LABEL.trigger);
-        if (!event || store.byTrigger(event.id)) continue;
-        const permission = event.actor === appLogin ? null : await repo.permission(event.actor);
-        const refusal =
-          permission === null ? "the label was added by the GitHub App" : CAN_TRIGGER.has(permission) ? null : `@${event.actor} has ${permission} permission`;
-        store.insert(
-          {
-            id: `psi_${randomUUID()}` as JobId,
-            repo: mapping.repo,
-            issue: issue.number,
-            trigger: { eventId: event.id, actor: event.actor, at: event.at },
-            snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
-            projectId: mapping.projectId,
-            hostId: mapping.hostId,
-            baseBranch,
-            state: refusal ? "ignored" : "queued",
-            error: refusal,
-          },
-          now,
-        );
-      }
-      store.saveRepoPoll(mapping.repo, result.next, now, null);
+      cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
     } catch (error) {
-      store.saveRepoPoll(mapping.repo, previous, now, message(error));
+      errors.push(message(error));
     }
+    try {
+      await pollFeedback(repo);
+    } catch (error) {
+      errors.push(message(error));
+    }
+    store.saveRepoPoll(mapping.repo, cursor, now, errors.join("; ") || null);
   }
 
-  /** Inserts the jobs new label events start. The next tickDue starts them. */
+  /** Inserts a job for each new label event. Returns the next cursor, or null when nothing changed. */
+  async function pollLabels(mapping: RepoMapping, repo: RepoClient, cursor: PollCursor | null, now: number): Promise<PollCursor | null> {
+    const result = await repo.labeledIssues(LABEL.trigger, cursor);
+    if (!result.changed) return null;
+    const [appLogin, baseBranch] = await Promise.all([repo.appLogin(), repo.defaultBranch()]);
+    for (const issue of result.issues) {
+      if (store.open(mapping.repo, issue.number)) continue;
+      const event = await repo.latestLabelEvent(issue.number, LABEL.trigger);
+      if (!event || store.byTrigger(event.id)) continue;
+      const permission = event.actor === appLogin ? null : await repo.permission(event.actor);
+      const refusal =
+        permission === null ? "the label was added by the GitHub App" : CAN_TRIGGER.has(permission) ? null : `@${event.actor} has ${permission} permission`;
+      store.insert(
+        {
+          id: `psi_${randomUUID()}` as JobId,
+          repo: mapping.repo,
+          issue: issue.number,
+          trigger: { eventId: event.id, actor: event.actor, at: event.at },
+          snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
+          projectId: mapping.projectId,
+          hostId: mapping.hostId,
+          baseBranch,
+          state: refusal ? "ignored" : "queued",
+          error: refusal,
+        },
+        now,
+      );
+    }
+    return result.next;
+  }
+
+  /** Inserts the jobs new label events start and stores new feedback. The next tickDue acts on both. */
   async function poll(): Promise<void> {
     const repos = deps.repos();
     if (repos.length === 0) return;
