@@ -241,6 +241,7 @@ function harness() {
         stopped.push(threadId);
         const thread = threads.get(threadId);
         if (thread) thread.status = "idle";
+        await held("stop");
         return {};
       },
       async send(args: Record<string, any>) {
@@ -478,28 +479,47 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
   assert.ok(h.engine().issues.instructions(started.threadId!), "a worker in review keeps its instructions for later rounds");
 });
 
-const CRASH_POINTS: { name: string; key: string; where: "sdk" | "github"; lease: number; afterReport: boolean }[] = [
-  { name: "the working label", key: "POST /repos/acme/web/issues/41/labels", where: "github", lease: EFFECT_POLICY.labels.leaseMs, afterReport: false },
-  { name: "the spawn", key: "spawn", where: "sdk", lease: EFFECT_POLICY.spawn.leaseMs, afterReport: false },
-  { name: "the push", key: "push", where: "sdk", lease: EFFECT_POLICY.push.leaseMs, afterReport: true },
-  { name: "the pull request", key: "POST /repos/acme/web/pulls", where: "github", lease: EFFECT_POLICY["open-pr"].leaseMs, afterReport: true },
-  { name: "the review label", key: "POST /repos/acme/web/issues/41/labels", where: "github", lease: EFFECT_POLICY.labels.leaseMs, afterReport: true },
+const NEEDS_INFO = { outcome: "needs-info", questions: ["Which footer, the page or the modal?"], verification: ["read the layout code"] };
+const NO_CHANGE = { outcome: "no-change", summary: "The footer already clears the button on main.", verification: ["checked at 375px"] };
+const UNCHANGED = { headSha: SHA1, ahead: 0 };
+const ISSUE_LABELS = "POST /repos/acme/web/issues/41/labels";
+const COMMENTS = "POST /repos/acme/web/issues/41/comments";
+
+type CrashPoint = {
+  name: string;
+  key: string;
+  where: "sdk" | "github";
+  lease: number;
+  /** What leads to the held call: the start alone, a report after it, or a stop after it. */
+  after: { report: unknown; tree: Partial<{ headSha: string; ahead: number }> } | "start" | "stop";
+  end: { state: string; labels: string[]; comments: number; pushes: number };
+};
+
+const CRASH_POINTS: CrashPoint[] = [
+  { name: "the working label", key: ISSUE_LABELS, where: "github", lease: EFFECT_POLICY.labels.leaseMs, after: "start", end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
+  { name: "the spawn", key: "spawn", where: "sdk", lease: EFFECT_POLICY.spawn.leaseMs, after: "start", end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
+  { name: "the push", key: "push", where: "sdk", lease: EFFECT_POLICY.push.leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
+  { name: "the pull request", key: "POST /repos/acme/web/pulls", where: "github", lease: EFFECT_POLICY["open-pr"].leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
+  { name: "the review label", key: ISSUE_LABELS, where: "github", lease: EFFECT_POLICY.labels.leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
+  { name: "the questions comment", key: COMMENTS, where: "github", lease: EFFECT_POLICY.comment.leaseMs, after: { report: NEEDS_INFO, tree: UNCHANGED }, end: { state: "needs-info", labels: ["agent", "agent:needs-info"], comments: 1, pushes: 0 } },
+  { name: "the no-change comment", key: COMMENTS, where: "github", lease: EFFECT_POLICY.comment.leaseMs, after: { report: NO_CHANGE, tree: UNCHANGED }, end: { state: "done", labels: ["agent"], comments: 1, pushes: 0 } },
+  { name: "stopping the worker", key: "stop", where: "sdk", lease: EFFECT_POLICY["stop-thread"].leaseMs, after: "stop", end: { state: "stopped", labels: ["agent"], comments: 0, pushes: 0 } },
 ];
 
 for (const point of CRASH_POINTS) {
-  test(`a crash after claiming ${point.name} recovers on restart without a second worker, push or pull request`, async () => {
+  test(`a crash after claiming ${point.name} recovers on restart with one worker, and each write done once`, async () => {
     const h = harness();
     h.label(41);
-    let held: Hold | null = null;
+    let held: Hold;
     let inflight: Promise<unknown>;
-    if (point.afterReport) {
+    if (point.after === "start") {
+      held = h.holdAt(point.key, point.where);
+      inflight = h.engine().issues.sweep();
+    } else {
       await h.engine().issues.sweep();
       const working = await h.only();
       held = h.holdAt(point.key, point.where);
-      inflight = h.report(working.threadId!, GOOD);
-    } else {
-      held = h.holdAt(point.key, point.where);
-      inflight = h.engine().issues.sweep();
+      inflight = point.after === "stop" ? Promise.resolve(h.engine().run(["issues", "stop", working.id])) : h.report(working.threadId!, point.after.report, point.after.tree);
     }
     await held.hit;
     h.restart();
@@ -510,19 +530,21 @@ for (const point of CRASH_POINTS) {
 
     h.clock.now += point.lease + 1;
     await h.settle();
-    if (!point.afterReport) {
+    if (point.after === "start") {
       const working = await h.only();
       assert.equal(working.state, "working");
       await h.report(working.threadId!, GOOD);
       await h.settle();
     }
 
-    const done = await h.only();
-    assert.equal(done.state, "review", done.error ?? "");
+    const end = await h.only();
+    assert.equal(end.state, point.end.state, end.error ?? "");
     assert.equal(h.spawned.length, 1, "one worker");
-    assert.equal(h.pushes.length, 1, "one push");
-    assert.equal([...h.gh().issues.values()].filter((issue) => issue.pr).length, 1, "one pull request");
-    assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", "agent:review"]);
+    assert.equal(h.pushes.length, point.end.pushes, "pushes");
+    assert.equal([...h.gh().issues.values()].filter((issue) => issue.pr).length, point.end.pushes, "pull requests");
+    assert.equal(h.gh().comments.get(41)?.length ?? 0, point.end.comments, "comments");
+    assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), point.end.labels);
+    if (point.after === "stop") assert.ok(h.stopped.includes(end.threadId!), "the worker was stopped");
     held.free();
     await inflight;
   });
