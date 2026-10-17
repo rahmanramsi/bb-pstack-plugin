@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import type { PushInput, PushResult } from "../host-contract.ts";
 import { parseChoice } from "../models.ts";
 import { MIGRATIONS } from "../store.ts";
-import { createIssues } from "./engine.ts";
+import { createIssues, type EffectHandler } from "./engine.ts";
 import { createGitHub } from "./github.ts";
 import { EFFECT_POLICY, type JobView, type RepoName } from "./job.ts";
 import { openIssueStore, type IssueStore } from "./store.ts";
@@ -668,4 +668,13 @@ test("a worker role with a reasoning level bb does not know never reaches a spaw
   const job = await h.only();
   assert.equal(h.spawned.length, 0);
   assert.match(job.error!, /reasoning level "extreme"/);
+});
+
+test("an effect's handler has a probe exactly when its policy looks for a trace before running it again", () => {
+  const perform = async () => ({ kind: "absent" }) as const;
+  // @ts-expect-error labels are replayed, so a probe would never run
+  const labels: EffectHandler<"labels"> = { perform, probe: perform };
+  // @ts-expect-error a push is probed before it runs again
+  const push: EffectHandler<"push"> = { perform };
+  assert.ok(labels && push);
 });

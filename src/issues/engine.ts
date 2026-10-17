@@ -16,6 +16,7 @@ import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type GitHub, type PollCursor } from "./github.ts";
 import {
+  EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
   MAX_REJECTIONS,
@@ -88,17 +89,16 @@ const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number } | { ok: false; transient: boolean; error: string };
 
-/** How to perform each effect and how to find its trace. Which effects get probed or replayed is EFFECT_POLICY's call. */
-type EffectHandler<Op extends EffectOp> = {
-  perform(job: Job, effect: Extract<Effect, { op: Op }>): Promise<EffectOutcome>;
-  probe(job: Job, effect: Extract<Effect, { op: Op }>): Promise<EffectOutcome>;
-};
+type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>) => Promise<EffectOutcome>;
+/** How to perform an effect, and how to find its trace when EFFECT_POLICY looks for one before running it again. */
+export type EffectHandler<Op extends EffectOp> = { perform: Run<Op> } & ((typeof EFFECT_POLICY)[Op]["recovery"]["kind"] extends "replay"
+  ? { probe?: never }
+  : { probe: Run<Op> });
 
 export function createIssues(deps: IssuesDeps): Issues {
   const { bb, store, github } = deps;
   const clock = deps.clock ?? Date.now;
   const done = (patch = {}): EffectOutcome => ({ kind: "done", patch });
-  const noProbe = async (): Promise<EffectOutcome> => ({ kind: "absent" });
 
   async function threadsNaming(job: Job): Promise<string[]> {
     const found: string[] = [];
@@ -148,7 +148,6 @@ export function createIssues(deps: IssuesDeps): Issues {
         for (const label of effect.remove) await repo.removeLabel(number, label);
         return done();
       },
-      probe: noProbe,
     },
     spawn: {
       async perform(job, effect) {
@@ -239,14 +238,14 @@ export function createIssues(deps: IssuesDeps): Issues {
         }
         return done();
       },
-      probe: noProbe,
     },
   };
 
   async function runEffect(job: Job, effect: Effect, mode: EffectMode): Promise<EffectOutcome> {
-    const handler = EFFECTS[effect.op] as EffectHandler<EffectOp>;
+    const handler = EFFECTS[effect.op] as { perform: Run<EffectOp>; probe?: Run<EffectOp> };
     try {
       if (mode === "perform") return await handler.perform(job, effect);
+      if (!handler.probe) throw new Error(`${effect.op} has no probe`);
       const probed = await handler.probe(job, effect);
       return probed.kind === "absent" && mode === "probe-then-perform" ? await handler.perform(job, effect) : probed;
     } catch (error) {

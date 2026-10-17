@@ -82,20 +82,23 @@ export type Effect =
 export type EffectOp = Effect["op"];
 
 /**
- * The one place that says which effects may run twice.
- *   probe: before running again an effect that may have happened, look for its trace.
- *   replay: may it run again after the probe found nothing? Never for spawn: no SDK error proves a thread was not
- *     created, so a negative probe waits until `graceMs` after the first claim and then sticks the job.
- *   leaseMs: how long a claim keeps other ticks off the effect. It covers the call's own timeout.
+ * How an effect runs again after a claim that never settled, which may or may not have happened.
+ *   replay: run it again; repeating it is harmless.
+ *   probe: look for its trace, and run it again only when there is none.
+ *   once: look for its trace and never run it again. No SDK error proves a spawn created no thread, so a probe that
+ *     finds nothing waits until `graceMs` after the first claim and then sticks the job.
  */
-export const EFFECT_POLICY: { readonly [Op in EffectOp]: { probe: boolean; replay: boolean; graceMs: number; leaseMs: number } } = {
-  labels: { probe: false, replay: true, graceMs: 0, leaseMs: 60_000 },
-  spawn: { probe: true, replay: false, graceMs: 5 * 60_000, leaseMs: 2 * 60_000 },
-  push: { probe: true, replay: true, graceMs: 0, leaseMs: 11 * 60_000 },
-  "open-pr": { probe: true, replay: true, graceMs: 0, leaseMs: 60_000 },
-  comment: { probe: true, replay: true, graceMs: 0, leaseMs: 60_000 },
-  "stop-thread": { probe: false, replay: true, graceMs: 0, leaseMs: 60_000 },
-};
+export type Recovery = { kind: "replay" } | { kind: "probe" } | { kind: "once"; graceMs: number };
+
+/** The one place that says how each effect recovers. `leaseMs` keeps other ticks off a claim and covers the call's timeout. */
+export const EFFECT_POLICY = {
+  labels: { recovery: { kind: "replay" }, leaseMs: 60_000 },
+  spawn: { recovery: { kind: "once", graceMs: 5 * 60_000 }, leaseMs: 2 * 60_000 },
+  push: { recovery: { kind: "probe" }, leaseMs: 11 * 60_000 },
+  "open-pr": { recovery: { kind: "probe" }, leaseMs: 60_000 },
+  comment: { recovery: { kind: "probe" }, leaseMs: 60_000 },
+  "stop-thread": { recovery: { kind: "replay" }, leaseMs: 60_000 },
+} as const satisfies { readonly [Op in EffectOp]: { recovery: Recovery; leaseMs: number } };
 
 export const MAX_EFFECT_TRIES = 8;
 const BACKOFF_MS = [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
@@ -209,6 +212,8 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly ("slotFree" | "work
  */
 export type EffectMode = "perform" | "probe" | "probe-then-perform";
 
+const RECOVERY_MODE = { replay: "perform", probe: "probe-then-perform", once: "probe" } as const satisfies Record<Recovery["kind"], EffectMode>;
+
 export type Action =
   | { type: "change"; change: Change }
   /** Claim the head effect (tries + 1 and a lease), then run it in `mode`. */
@@ -233,7 +238,7 @@ export function plan(job: Job, facts: Facts): Action | null {
     if (phase.tries >= MAX_EFFECT_TRIES) {
       return { type: "change", change: stick(job, `${head.op} failed ${phase.tries} times: ${job.error ?? "no error recorded"}`) };
     }
-    const mode: EffectMode = phase.tries === 0 || !policy.probe ? "perform" : policy.replay ? "probe-then-perform" : "probe";
+    const mode: EffectMode = phase.tries === 0 ? "perform" : RECOVERY_MODE[policy.recovery.kind];
     return { type: "effect", effect: head, mode, leaseUntil: now + policy.leaseMs };
   }
 
@@ -272,7 +277,6 @@ export function settle(job: Job, outcome: EffectOutcome, now: number): Change {
   const { phase } = job;
   if (!isTransit(phase.state) || !("effects" in phase)) throw new Error(`settle on ${job.id} in resting state ${phase.state}`);
   const head = phase.effects[0];
-  const policy = EFFECT_POLICY[head.op];
   const backoff = () => now + BACKOFF_MS[Math.min(Math.max(phase.tries - 1, 0), BACKOFF_MS.length - 1)]!;
   switch (outcome.kind) {
     case "done": {
@@ -282,9 +286,10 @@ export function settle(job: Job, outcome: EffectOutcome, now: number): Change {
       return { phase: enter(phase.state, rest), ...outcome.patch, ...(ending ? {} : { error: null }) };
     }
     case "absent": {
-      if (policy.replay) return { phase: { ...phase, leaseUntil: null, nextAt: null } };
-      const graceEnd = (phase.firstAt ?? now) + policy.graceMs;
-      if (now >= graceEnd) return stick(job, `the ${head.op} may not have happened: no trace of it ${Math.round(policy.graceMs / 60_000)} minutes after the first try`);
+      const { recovery } = EFFECT_POLICY[head.op];
+      if (recovery.kind !== "once") throw new Error(`${head.op} runs again when its probe finds nothing, so it never settles as absent`);
+      const graceEnd = (phase.firstAt ?? now) + recovery.graceMs;
+      if (now >= graceEnd) return stick(job, `the ${head.op} may not have happened: no trace of it ${Math.round(recovery.graceMs / 60_000)} minutes after the first try`);
       return { phase: { ...phase, leaseUntil: null, nextAt: Math.min(graceEnd, backoff()) } };
     }
     case "unknown":
