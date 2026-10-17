@@ -148,7 +148,7 @@ export function Agreement({ run }: { run: RunView }) {
 
 export function Workers({ run, onThread }: { run: RunView; onThread: (threadId: string) => void }) {
   return <Section title="Workers"><div className="ps-workers">{run.jobs.map((job) => <div className="ps-worker-row" key={job.key}>
-    <WorkerButton job={job} onThread={onThread} /><p className="ps-model">{job.model} · attempt {job.attempt}</p>
+    <WorkerButton job={job} onThread={onThread} /><p className="ps-model">{job.model}{job.host === null ? null : ` · ${job.host.name}`} · attempt {job.attempt}</p>
     {job.summary === null ? null : <p>{job.summary}</p>}{job.error === null ? null : <p className="ps-error">{job.error}</p>}
   </div>)}</div></Section>;
 }
