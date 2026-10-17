@@ -12,7 +12,8 @@ const nextId = () => `psi_00000000-0000-0000-0000-${String(++ids).padStart(12, "
 function setup() {
   const db = new Database(":memory:");
   for (const statement of MIGRATIONS) db.exec(statement);
-  return { db, store: openIssueStore(db) };
+  const changes = { count: 0 };
+  return { db, store: openIssueStore(db, () => changes.count++), changes };
 }
 
 function newJob(overrides: Partial<NewJob> = {}): NewJob {
@@ -200,7 +201,7 @@ test("a step 1 database migrates its jobs to round 1 with their history", () => 
      VALUES ('psi_old', 'acme/web', 41, 1, 1, 'maya', 1, '{}', 'p', 'h', 'main', 'agent/issue-41-x', 'review', 'thr_old', ?, 7, 'u', '{"summary":"Fixed."}', 5, 6)`,
   ).run(SHA);
   for (const statement of MIGRATIONS.slice(step1)) db.exec(statement);
-  const store = openIssueStore(db);
+  const store = openIssueStore(db, () => {});
   const job = store.get("psi_old" as JobId)!;
   assert.equal(job.round, 1);
   assert.equal(job.phase.state, "review");
@@ -249,4 +250,32 @@ test("the sub-issue migration keeps existing jobs, and a parent gets at most one
   store.write(first.id, 0, { phase: { state: "stopped" } }, 12);
   assert.equal(store.insert(newJob(child), 13), null, "a stopped child is not recreated");
   assert.deepEqual(store.children(parent.id).map((job) => job.issue), [51]);
+});
+
+test("each write that changes something signals once, and a write that changes nothing does not", () => {
+  const { store, changes } = setup();
+  const signals = (write: () => unknown) => {
+    const before = changes.count;
+    write();
+    return changes.count - before;
+  };
+  const queued = newJob({ issue: 40 });
+  let job = store.insert(queued, 10)!;
+  assert.equal(changes.count, 1, "insert");
+  assert.equal(signals(() => store.insert(queued, 11)), 0, "the same label event again");
+  assert.equal(signals(() => store.insert(newJob({ issue: 40, trigger: { eventId: 999, actor: "maya", at: 1 } }), 11)), 0, "an open job already holds the issue");
+
+  assert.equal(signals(() => (job = store.write(job.id, job.version, { error: "x" }, 12)!)), 1, "write");
+  assert.equal(signals(() => store.write(job.id, job.version - 1, { error: "stale" }, 13)), 0, "a write that lost the version race");
+
+  assert.equal(signals(() => store.saveRepoPoll(REPO, { at: 1 }, 14, null)), 1, "saveRepoPoll");
+  assert.equal(signals(() => store.recordPollError(job.id, "502", 15)), 1, "recordPollError");
+
+  const reviewed = inReview(store);
+  assert.equal(signals(() => store.recordPoll(reviewed.id, { cursor: { at: 2 }, prState: "open", feedback: [comment(1, 100), comment(2, 110)] }, 16)), 1, "recordPoll with new feedback");
+  const item = { jobId: reviewed.id, pr: 7, feedback: comment(3, 120) };
+  assert.equal(signals(() => store.addFeedback(REPO, [item])), 1, "addFeedback with a new item");
+  assert.equal(signals(() => store.addFeedback(REPO, [item])), 0, "addFeedback with nothing new");
+
+  assert.equal(signals(() => [store.get(job.id), store.list({ all: true }), store.repoPoll(REPO), store.jobPoll(job.id), store.due(20)]), 0, "reads");
 });

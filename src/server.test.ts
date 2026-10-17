@@ -60,7 +60,7 @@ test("a thread pstack launched, such as an issue worker, gets no checklist nudge
   const begun = await harness.runCli(["checklist", "begin", "feature"], { threadId: worker, cwd: "/tmp" });
   assert.equal(begun.exitCode, 0, begun.stderr);
 
-  const store = openIssueStore(bb.storage.database());
+  const store = openIssueStore(bb.storage.database(), () => {});
   const job = store.insert(
     {
       id: "psi_00000000-0000-0000-0000-000000000001" as JobId,

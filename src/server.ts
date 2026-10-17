@@ -4,7 +4,7 @@ import { gate, renderOpenSteps } from "./checklist.ts";
 import { createChecklistFeature } from "./checklist-commands.ts";
 import { openChecklistStore } from "./checklist-store.ts";
 import { evidenceFreshnessError } from "./checklist.ts";
-import { STATE_CHANNEL } from "./contract.ts";
+import { ISSUES_CHANNEL, STATE_CHANNEL } from "./contract.ts";
 import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
 import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
 import { createIssues } from "./issues/engine.ts";
@@ -79,6 +79,8 @@ function skillNames(): string[] {
 }
 
 const INSTRUCTIONS_MAX = 4000;
+/** One poll or tick writes many rows; they become one signal. */
+const ISSUE_SIGNAL_MS = 250;
 
 function evidenceLabel(evidence: { kind: string } & Record<string, string>): string {
   const value = evidence.id ?? evidence.sha ?? evidence.path ?? evidence.url;
@@ -198,7 +200,17 @@ export default async function plugin(bb: BbPluginApi) {
   const runs = createRunFeature({ bb, runner, footer: checklist.footer, skills: skillNames() });
   runs.register();
 
-  const issueStore = openIssueStore(db);
+  let issueSignal: ReturnType<typeof setTimeout> | null = null;
+  const issueStore = openIssueStore(db, () => {
+    issueSignal ??= setTimeout(() => {
+      issueSignal = null;
+      try {
+        bb.realtime.publish(ISSUES_CHANNEL, { revision: Date.now() });
+      } catch (error) {
+        bb.log.error(`pstack issues: publish failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }, ISSUE_SIGNAL_MS);
+  });
   const hosts = bb.hosts.experimental_client({ contract: hostContract });
   const issues = createIssues({
     bb,
