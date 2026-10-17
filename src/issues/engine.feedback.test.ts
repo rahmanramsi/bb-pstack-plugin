@@ -266,3 +266,42 @@ test("a report from a repeated copy of an earlier round's message is refused wit
   const current = roundReport([{ kind: "review-comment", commentId: second.comments[0]!, body: "Renamed y too." }], { round: 2 });
   assert.equal((await h.report(job.threadId!, current, { headSha: "4".repeat(40) })).exitCode, 0);
 });
+
+test("one pull request GitHub cannot read holds back no other, and shows its error until a poll succeeds", async () => {
+  const h = harness();
+  const broken = await h.toReview(41);
+  const healthy = await h.toReview(42);
+  h.gh().outages.push({ key: `GET /repos/acme/web/pulls/${broken.pr}/reviews`, status: 404, times: Infinity });
+  h.review(broken.pr, { author: "maya", body: "Rename `x`." });
+  h.review(healthy.pr, { author: "maya", body: "Rename `y`." });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+
+  assert.equal((await h.byIssue(42)).state, "addressing", "the healthy pull request's feedback starts its round");
+  assert.equal((await h.byIssue(41)).state, "review");
+  const shown = (await h.engine().run(["issues", "show", broken.job.id])).stdout!;
+  assert.match(shown, /pr poll error +GitHub GET \/repos\/acme\/web\/pulls\/\d+\/reviews\?per_page=100: 404/);
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}review .*\n {4}pull request poll error: GitHub GET/);
+  assert.doesNotMatch((await h.engine().run(["issues", "show", healthy.job.id])).stdout!, /poll error/);
+
+  h.gh().outages.length = 0;
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "addressing", "the next good poll catches up");
+  assert.doesNotMatch((await h.engine().run(["issues", "show", broken.job.id])).stdout!, /poll error/);
+});
+
+test("a pull request's last polled state is stored, so a restarted service acts on it before GitHub answers again", async () => {
+  const h = harness();
+  const { pr } = await h.toReview();
+  h.review(pr, { author: "maya", body: "Rename `x`." });
+  await h.settle();
+  assert.equal((await h.only()).state, "review", "the round waits for two quiet minutes");
+
+  h.restart();
+  for (const path of [`/repos/acme/web/pulls/${pr}`, `/repos/acme/web/pulls/${pr}/reviews`, `/repos/acme/web/pulls/${pr}/comments`, `/repos/acme/web/issues/${pr}/comments`]) {
+    h.gh().outages.push({ key: `GET ${path}`, times: Infinity });
+  }
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+});

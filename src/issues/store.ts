@@ -1,5 +1,5 @@
 /**
- * SQL for issue_repos, issue_jobs, issue_rounds and issue_feedback. Rows are parsed into job.ts types here, and a row
+ * SQL for issue_repos, issue_jobs, issue_rounds, issue_feedback and issue_job_polls. Rows are parsed into job.ts types here, and a row
  * that breaks an invariant the types encode throws: that is a bug, not input. Every job write is one UPDATE guarded by
  * the row's version, in one transaction with the round history and feedback rows it implies.
  */
@@ -22,6 +22,7 @@ import {
   type JobId,
   type JobState,
   type Phase,
+  type PullState,
   type RepoName,
   type Sha,
   type BranchName,
@@ -41,6 +42,9 @@ export type NewJob = {
   state: "queued" | "ignored";
   error: string | null;
 };
+
+/** A job's last poll of its pull request: the cursor github.ts hands back, the state it read, and why it last failed. */
+export type JobPoll = { cursor: unknown; prState: PullState | null; polledAt: number | null; error: string | null };
 
 export type IssueStore = {
   /**
@@ -78,8 +82,11 @@ export type IssueStore = {
   roundFeedback(id: JobId, ordinal: number): Feedback[];
   repoPoll(repo: RepoName): { poll: unknown; polledAt: number | null; error: string | null };
   saveRepoPoll(repo: RepoName, poll: unknown, now: number, error: string | null): void;
-  feedbackCursor(repo: RepoName): unknown;
-  saveFeedbackCursor(repo: RepoName, cursor: unknown): void;
+  jobPoll(id: JobId): JobPoll;
+  /** A successful poll of the job's pull request: its new feedback, its state and the next cursor, in one transaction. */
+  recordPoll(id: JobId, poll: { cursor: unknown; prState: PullState; feedback: readonly Feedback[] }, now: number): void;
+  /** A failed poll keeps the last cursor and state, so the next poll starts where the last good one ended. */
+  recordPollError(id: JobId, error: string, now: number): void;
 };
 
 type JobRow = {
@@ -262,6 +269,18 @@ export function openIssueStore(db: Db): IssueStore {
     return get(job.id);
   });
 
+  const addFeedback = db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO issue_feedback (repo, kind, github_id, job_id, pr_number, author, body, path, line, diff_hunk, in_reply_to, review_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    let added = 0;
+    for (const { jobId, pr, feedback: item } of items) {
+      added += insert.run(repo, item.kind, item.id, jobId, pr, item.author, item.body, item.path, item.line, item.diffHunk, item.inReplyTo, item.reviewId, item.createdAt).changes;
+    }
+    return added;
+  });
+
   return {
     insert,
     get,
@@ -351,17 +370,7 @@ export function openIssueStore(db: Db): IssueStore {
         .all(repo, ...TERMINAL_LIST) as JobRow[];
       return rows.map(parse);
     },
-    addFeedback: db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
-      const insert = db.prepare(
-        `INSERT OR IGNORE INTO issue_feedback (repo, kind, github_id, job_id, pr_number, author, body, path, line, diff_hunk, in_reply_to, review_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      let added = 0;
-      for (const { jobId, pr, feedback: item } of items) {
-        added += insert.run(repo, item.kind, item.id, jobId, pr, item.author, item.body, item.path, item.line, item.diffHunk, item.inReplyTo, item.reviewId, item.createdAt).changes;
-      }
-      return added;
-    }),
+    addFeedback,
     feedback(id) {
       const pending = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round IS NULL ORDER BY created_at, github_id").all(id) as FeedbackRow[];
       const rounds = db.prepare("SELECT ordinal, report_json FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(id) as { ordinal: number; report_json: string | null }[];
@@ -386,15 +395,26 @@ export function openIssueStore(db: Db): IssueStore {
          ON CONFLICT (repo) DO UPDATE SET poll_json = excluded.poll_json, polled_at = excluded.polled_at, error = excluded.error`,
       ).run(repo, poll === null ? null : JSON.stringify(poll), now, error);
     },
-    feedbackCursor(repo) {
-      const row = db.prepare("SELECT feedback_json FROM issue_repos WHERE repo = ?").get(repo) as { feedback_json: string | null } | undefined;
-      return row?.feedback_json ? JSON.parse(row.feedback_json) : null;
+    jobPoll(id) {
+      const row = db.prepare("SELECT cursor_json, pr_state, polled_at, error FROM issue_job_polls WHERE job_id = ?").get(id) as
+        | { cursor_json: string | null; pr_state: PullState | null; polled_at: number | null; error: string | null }
+        | undefined;
+      return { cursor: row?.cursor_json ? JSON.parse(row.cursor_json) : null, prState: row?.pr_state ?? null, polledAt: row?.polled_at ?? null, error: row?.error ?? null };
     },
-    saveFeedbackCursor(repo, cursor) {
+    recordPoll: db.transaction((id: JobId, poll: { cursor: unknown; prState: PullState; feedback: readonly Feedback[] }, now: number) => {
+      const job = get(id);
+      if (!job?.pr) throw new Error(`issue job ${id} has no pull request to poll`);
+      addFeedback(job.repo, poll.feedback.map((feedback) => ({ jobId: id, pr: job.pr!.number, feedback })));
       db.prepare(
-        `INSERT INTO issue_repos (repo, feedback_json) VALUES (?, ?)
-         ON CONFLICT (repo) DO UPDATE SET feedback_json = excluded.feedback_json`,
-      ).run(repo, JSON.stringify(cursor));
+        `INSERT INTO issue_job_polls (job_id, cursor_json, pr_state, polled_at, error) VALUES (?, ?, ?, ?, NULL)
+         ON CONFLICT (job_id) DO UPDATE SET cursor_json = excluded.cursor_json, pr_state = excluded.pr_state, polled_at = excluded.polled_at, error = NULL`,
+      ).run(id, JSON.stringify(poll.cursor), poll.prState, now);
+    }),
+    recordPollError(id, error, now) {
+      db.prepare(
+        `INSERT INTO issue_job_polls (job_id, polled_at, error) VALUES (?, ?, ?)
+         ON CONFLICT (job_id) DO UPDATE SET polled_at = excluded.polled_at, error = excluded.error`,
+      ).run(id, now, error);
     },
   };
 }

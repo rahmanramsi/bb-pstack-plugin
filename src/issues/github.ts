@@ -50,7 +50,7 @@ export type LabeledIssue = { number: number; title: string; body: string; url: s
 export type LabelEvent = { id: number; actor: string; at: number };
 /** Opaque to callers, who store it and hand it back. */
 export type PollCursor = { readonly __brand: "PollCursor" };
-/** Opaque to callers, like PollCursor: per pull request list cursors, ETags, and the last known review states. */
+/** Opaque to callers, like PollCursor: one pull request's list cursors, ETags, and the last known review states. */
 export type FeedbackCursor = { readonly __brand: "FeedbackCursor" };
 
 export type RepoClient = {
@@ -77,10 +77,10 @@ export type RepoClient = {
   /** An inline review comment by the App on pull request `pr` whose last line is `marker`, posted at or after `since`. */
   findReviewComment(pr: number, marker: string, since: number): Promise<{ id: number } | null>;
   /**
-   * Reviews, inline comments and conversation comments on each pull request since the cursor, and each one's state.
-   * Unchanged lists answer 304 and cost no rate limit. Items can repeat across calls; callers dedupe on the id.
+   * One pull request's reviews, inline comments and conversation comments since the cursor, and its state. Unchanged
+   * lists answer 304 and cost no rate limit. Items can repeat across calls; callers dedupe on the id.
    */
-  feedback(cursor: FeedbackCursor | null, pulls: readonly number[]): Promise<{ items: PolledFeedback[]; pulls: { number: number; state: PullState }[]; next: FeedbackCursor }>;
+  pullActivity(pr: number, cursor: FeedbackCursor | null): Promise<{ state: PullState; items: PolledFeedback[]; next: FeedbackCursor }>;
   addLabels(issue: number, labels: readonly string[]): Promise<void>;
   /** A label that is not on the issue is success. */
   removeLabel(issue: number, label: string): Promise<void>;
@@ -381,61 +381,55 @@ export function createGitHub(options: GitHubOptions): GitHub {
         const found = comments.find((comment) => comment.user?.login === login && endsWith(comment.body, marker));
         return found ? { id: found.id } : null;
       },
-      async feedback(cursor, pulls) {
-        const previous = (cursor as unknown as Record<string, PullCursor> | null) ?? {};
+      async pullActivity(pr, cursor) {
         const items: PolledFeedback[] = [];
-        const states: { number: number; state: PullState }[] = [];
-        const next: Record<string, PullCursor> = {};
         const author = (user: RawUser) => user?.login ?? "ghost";
-        for (const pr of pulls) {
-          const was = previous[pr] ?? { reviewComments: null, comments: null, reviews: null, pull: null };
-          // Comments before reviews: a comment's review exists by the time the comment is listed, so the review list
-          // read after it knows that review's state.
-          const inline = await list<RawReviewComment>(auth, `${base}/pulls/${pr}/comments`, { sort: "updated", direction: "asc" }, was.reviewComments, true);
-          const conversation = await list<RawComment>(auth, `${base}/issues/${pr}/comments`, { sort: "updated", direction: "asc" }, was.comments, true);
-          const reviews = await list<RawReview>(auth, `${base}/pulls/${pr}/reviews`, {}, was.reviews && { since: null, etag: was.reviews.etag }, false);
-          const reviewStates = reviews ? Object.fromEntries(reviews.items.map((review) => [review.id, review.state])) : (was.reviews?.states ?? {});
-          const pull = await request(auth, "GET", `${base}/pulls/${pr}`, { etag: was.pull?.etag ?? null });
-          let state: PullState;
-          if (pull.status === 304 && was.pull) state = was.pull.state;
-          else if (pull.status === 200) {
-            const json = pull.json as { state: string; merged?: boolean; merged_at?: string | null };
-            state = json.state === "open" ? "open" : json.merged || json.merged_at ? "merged" : "closed";
-          } else throw failure("GET", `${base}/pulls/${pr}`, pull);
+        const was = (cursor as unknown as PullCursor | null) ?? { reviewComments: null, comments: null, reviews: null, pull: null };
+        // Comments before reviews: a comment's review exists by the time the comment is listed, so the review list
+        // read after it knows that review's state.
+        const inline = await list<RawReviewComment>(auth, `${base}/pulls/${pr}/comments`, { sort: "updated", direction: "asc" }, was.reviewComments, true);
+        const conversation = await list<RawComment>(auth, `${base}/issues/${pr}/comments`, { sort: "updated", direction: "asc" }, was.comments, true);
+        const reviews = await list<RawReview>(auth, `${base}/pulls/${pr}/reviews`, {}, was.reviews && { since: null, etag: was.reviews.etag }, false);
+        const reviewStates = reviews ? Object.fromEntries(reviews.items.map((review) => [review.id, review.state])) : (was.reviews?.states ?? {});
+        const pull = await request(auth, "GET", `${base}/pulls/${pr}`, { etag: was.pull?.etag ?? null });
+        let state: PullState;
+        if (pull.status === 304 && was.pull) state = was.pull.state;
+        else if (pull.status === 200) {
+          const json = pull.json as { state: string; merged?: boolean; merged_at?: string | null };
+          state = json.state === "open" ? "open" : json.merged || json.merged_at ? "merged" : "closed";
+        } else throw failure("GET", `${base}/pulls/${pr}`, pull);
 
-          const none = { path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null };
-          for (const comment of inline?.items ?? []) {
-            items.push({
-              kind: "review-comment",
-              id: comment.id,
-              pr,
-              author: author(comment.user),
-              body: comment.body,
-              path: comment.path,
-              line: comment.line ?? comment.original_line ?? null,
-              diffHunk: comment.diff_hunk,
-              inReplyTo: comment.in_reply_to_id ?? null,
-              reviewId: comment.pull_request_review_id,
-              createdAt: Date.parse(comment.created_at),
-              reviewState: comment.pull_request_review_id === null ? null : (reviewStates[comment.pull_request_review_id] ?? null),
-            });
-          }
-          for (const comment of conversation?.items ?? []) {
-            items.push({ kind: "pr-comment", id: comment.id, pr, author: author(comment.user), body: comment.body ?? "", ...none, createdAt: Date.parse(comment.created_at), reviewState: null });
-          }
-          for (const review of reviews?.items ?? []) {
-            if (!review.submitted_at) continue;
-            items.push({ kind: "review", id: review.id, pr, author: author(review.user), body: review.body ?? "", ...none, createdAt: Date.parse(review.submitted_at), reviewState: review.state });
-          }
-          states.push({ number: pr, state });
-          next[pr] = {
-            reviewComments: inline?.next ?? was.reviewComments,
-            comments: conversation?.next ?? was.comments,
-            reviews: reviews ? { etag: reviews.next.etag, states: reviewStates } : was.reviews,
-            pull: { etag: pull.status === 200 ? pull.headers.get("etag") : (was.pull?.etag ?? null), state },
-          };
+        const none = { path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null };
+        for (const comment of inline?.items ?? []) {
+          items.push({
+            kind: "review-comment",
+            id: comment.id,
+            pr,
+            author: author(comment.user),
+            body: comment.body,
+            path: comment.path,
+            line: comment.line ?? comment.original_line ?? null,
+            diffHunk: comment.diff_hunk,
+            inReplyTo: comment.in_reply_to_id ?? null,
+            reviewId: comment.pull_request_review_id,
+            createdAt: Date.parse(comment.created_at),
+            reviewState: comment.pull_request_review_id === null ? null : (reviewStates[comment.pull_request_review_id] ?? null),
+          });
         }
-        return { items, pulls: states, next: next as unknown as FeedbackCursor };
+        for (const comment of conversation?.items ?? []) {
+          items.push({ kind: "pr-comment", id: comment.id, pr, author: author(comment.user), body: comment.body ?? "", ...none, createdAt: Date.parse(comment.created_at), reviewState: null });
+        }
+        for (const review of reviews?.items ?? []) {
+          if (!review.submitted_at) continue;
+          items.push({ kind: "review", id: review.id, pr, author: author(review.user), body: review.body ?? "", ...none, createdAt: Date.parse(review.submitted_at), reviewState: review.state });
+        }
+        const next: PullCursor = {
+          reviewComments: inline?.next ?? was.reviewComments,
+          comments: conversation?.next ?? was.comments,
+          reviews: reviews ? { etag: reviews.next.etag, states: reviewStates } : was.reviews,
+          pull: { etag: pull.status === 200 ? pull.headers.get("etag") : (was.pull?.etag ?? null), state },
+        };
+        return { state, items, next: next as unknown as FeedbackCursor };
       },
       async addLabels(issue, labels) {
         await call(auth, "POST", `${base}/issues/${issue}/labels`, { body: { labels } });

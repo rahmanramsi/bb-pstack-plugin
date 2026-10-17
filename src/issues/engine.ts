@@ -43,7 +43,6 @@ import {
   type Job,
   type ParsedReport,
   type JobId,
-  type PullState,
   type RepoName,
   type ReportFacts,
   type Sha,
@@ -371,16 +370,13 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  /** Each open pull request's state as of the last poll, by job. Empty until the first poll after a start. */
-  const pullStates = new Map<JobId, PullState>();
-
   async function gather(job: Job): Promise<Facts> {
     const wanted = FACTS_FOR[job.phase.state];
     const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, pr: null };
     if (wanted.includes("feedback")) facts.feedback = store.feedback(job.id);
     if (wanted.includes("pr")) {
-      const state = pullStates.get(job.id);
-      facts.pr = state ? { state } : null;
+      const { prState } = store.jobPoll(job.id);
+      facts.pr = prState ? { state: prState } : null;
     }
     if (wanted.includes("slotFree")) {
       const { busy, ahead } = store.slots(job.id);
@@ -577,24 +573,30 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   /**
-   * Stores the feedback on each open job pull request that counts, and records each one's state. An item counts when
-   * job.ts's rules pass and its author has write access and is not the App.
+   * Polls each open job's pull request on its own, so one that GitHub cannot read holds back no other: it keeps its
+   * last cursor and state and records the error. Stores the feedback that counts: job.ts's rules pass, and its author
+   * has write access and is not the App.
    */
   async function pollFeedback(repo: RepoClient): Promise<void> {
-    const jobs = new Map(store.withPullRequest(repo.name).map((job) => [job.pr!.number, job]));
-    if (jobs.size === 0) return;
-    const result = await repo.feedback(store.feedbackCursor(repo.name) as FeedbackCursor | null, [...jobs.keys()]);
+    const jobs = store.withPullRequest(repo.name);
+    if (jobs.length === 0) return;
     const appLogin = await repo.appLogin();
-    const counted: { jobId: JobId; pr: number; feedback: Feedback }[] = [];
-    for (const item of result.items) {
-      const job = jobs.get(item.pr);
-      if (!job || !counts(item) || item.author === appLogin || !CAN_TRIGGER.has(await repo.permission(item.author))) continue;
-      const { pr, reviewState: _, ...feedback } = item;
-      counted.push({ jobId: job.id, pr, feedback });
-    }
-    store.addFeedback(repo.name, counted);
-    for (const { number, state } of result.pulls) pullStates.set(jobs.get(number)!.id, state);
-    store.saveFeedbackCursor(repo.name, result.next);
+    await Promise.all(
+      jobs.map(async (job) => {
+        try {
+          const result = await repo.pullActivity(job.pr!.number, store.jobPoll(job.id).cursor as FeedbackCursor | null);
+          const feedback: Feedback[] = [];
+          for (const item of result.items) {
+            if (!counts(item) || item.author === appLogin || !CAN_TRIGGER.has(await repo.permission(item.author))) continue;
+            const { pr: _, reviewState: __, ...rest } = item;
+            feedback.push(rest);
+          }
+          store.recordPoll(job.id, { cursor: result.next, prState: result.state, feedback }, clock());
+        } catch (error) {
+          store.recordPollError(job.id, message(error), clock());
+        }
+      }),
+    );
   }
 
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {

@@ -221,3 +221,15 @@ test("a step 1 database migrates its jobs to round 1 with their history", () => 
   assert.deepEqual(store.feedback(job.id).rounds, [{ ordinal: 1, summary: "Fixed." }]);
   assert.throws(() => db.prepare("UPDATE issue_jobs SET state = 'addressing', thread_id = NULL WHERE id = 'psi_old'").run(), /CHECK/);
 });
+
+test("a job's poll stores its feedback, state and cursor together, and a failed poll keeps the last good cursor and state", () => {
+  const { store } = setup();
+  const job = inReview(store);
+  assert.deepEqual(store.jobPoll(job.id), { cursor: null, prState: null, polledAt: null, error: null });
+  store.recordPoll(job.id, { cursor: { at: 1 }, prState: "open", feedback: [comment(1, 100)] }, 50);
+  assert.deepEqual(store.feedback(job.id).pending.map((item) => item.id), [1]);
+  store.recordPollError(job.id, "GitHub GET /repos/acme/web/pulls/7: 404", 60);
+  assert.deepEqual(store.jobPoll(job.id), { cursor: { at: 1 }, prState: "open", polledAt: 60, error: "GitHub GET /repos/acme/web/pulls/7: 404" });
+  store.recordPoll(job.id, { cursor: { at: 2 }, prState: "merged", feedback: [] }, 70);
+  assert.deepEqual(store.jobPoll(job.id), { cursor: { at: 2 }, prState: "merged", polledAt: 70, error: null });
+});

@@ -49,8 +49,11 @@ type GitHubState = {
   permissions: Map<string, string>;
   revoked: string[];
   holds: Hold[];
-  /** Requests answered 502 once, before the fake applies them: `METHOD /path`, and a text the body must contain. */
-  outages: { key: string; body?: string }[];
+  /**
+   * Requests the fake answers with an error before applying them: `METHOD /path`, a text the body must contain, the
+   * status (502), and how many times (once).
+   */
+  outages: { key: string; body?: string; status?: number; times?: number }[];
   nextId: number;
   now: () => number;
 };
@@ -187,8 +190,10 @@ before(async () => {
       const url = new URL(request.url!, "http://fake");
       const outage = gh.outages.findIndex((candidate) => candidate.key === `${request.method} ${url.pathname}` && (!candidate.body || raw.includes(candidate.body)));
       if (outage !== -1) {
-        gh.outages.splice(outage, 1);
-        return send(response, 502, { message: "Bad Gateway" });
+        const { status = 502, times = 1 } = gh.outages[outage]!;
+        if (times <= 1) gh.outages.splice(outage, 1);
+        else gh.outages[outage]!.times = times - 1;
+        return send(response, status, { message: "the fake GitHub is down for this request" });
       }
       const [status, json, headers] = await route(request.method!, url, raw ? JSON.parse(raw) : null, request.headers);
       const held = gh.holds.find((candidate) => candidate.key === `${request.method} ${url.pathname}`);
@@ -447,14 +452,15 @@ export function harness() {
   const settle = async () => {
     for (let i = 0; i < 5; i++) await current.issues.sweep();
   };
-  /** Label issue 41 and let the worker's first report open its pull request. */
-  const toReview = async () => {
-    label(41);
+  const byIssue = async (issue: number) => (await views()).find((job) => job.issue === issue)!;
+  /** Label the issue and let the worker's first report open its pull request. */
+  const toReview = async (issue = 41) => {
+    label(issue);
     await current.issues.sweep();
-    const working = await only();
+    const working = await byIssue(issue);
     await report(working.threadId!, GOOD);
     await settle();
-    const job = await only();
+    const job = await byIssue(issue);
     assert.equal(job.state, "review", job.error ?? "");
     return { job, pr: job.pr!.number };
   };
@@ -506,6 +512,7 @@ export function harness() {
     converse,
     views,
     only,
+    byIssue,
     report,
     settle,
     restart,

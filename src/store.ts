@@ -1,6 +1,6 @@
 /**
  * The plugin's SQLite schema. Runs, jobs and attempts are owned by run-store.ts; checklists and steps by
- * checklist-store.ts; issue_repos, issue_jobs, issue_rounds and issue_feedback by issues/store.ts. Every state change is a conditional (compare-and-set) transaction, so a repeated
+ * checklist-store.ts; issue_repos, issue_jobs, issue_rounds, issue_feedback and issue_job_polls by issues/store.ts. Every state change is a conditional (compare-and-set) transaction, so a repeated
  * transition is a no-op.
  * Migrations are append-only: never edit or reorder a shipped statement, only push new ones.
  */
@@ -196,6 +196,15 @@ export const MIGRATIONS: readonly string[] = [
    )`,
   `CREATE INDEX issue_feedback_job ON issue_feedback (job_id, round)`,
   `ALTER TABLE issue_repos ADD COLUMN feedback_json TEXT`,
+  // Feedback is polled per job, so one pull request's failure keeps no other job from its feedback or its state.
+  // issue_repos.feedback_json is no longer read.
+  `CREATE TABLE issue_job_polls (
+     job_id TEXT PRIMARY KEY,
+     cursor_json TEXT,
+     pr_state TEXT CHECK (pr_state IN ('open','merged','closed')),
+     polled_at INTEGER,
+     error TEXT
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

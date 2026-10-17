@@ -4,7 +4,7 @@
 import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { readThreadFile } from "../thread-files.ts";
-import { JOB_ID, MAX_FEEDBACK_ROUNDS, toView, type JobId, type JobView, type RepoName } from "./job.ts";
+import { JOB_ID, MAX_FEEDBACK_ROUNDS, toView, type Job, type JobId, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
 export type RepoMapping = { repo: RepoName; projectId: string; hostId: string };
@@ -83,8 +83,10 @@ function stateLabel(job: JobView): string {
 
 /** A repository's last poll. `error` is why it failed, including setup problems such as an App that is not installed. */
 export type RepoView = { repo: RepoName; polledAt: number | null; error: string | null };
+/** A job with its pull request's last poll, which fails on its own when GitHub cannot read that one pull request. */
+type ListedJob = JobView & { prPoll: { polledAt: number | null; error: string | null } | null };
 
-function formatList(repos: readonly RepoView[], jobs: readonly JobView[], now: number): string {
+function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now: number): string {
   if (repos.length === 0 && jobs.length === 0) return "No issue jobs.";
   return repos
     .map(({ repo, polledAt, error }) => {
@@ -94,14 +96,15 @@ function formatList(repos: readonly RepoView[], jobs: readonly JobView[], now: n
         .map((job) => {
           const parts = [`#${job.issue}`, stateLabel(job), job.pr ? `PR #${job.pr.number}` : null, job.threadId, job.id, age(job.createdAt, now)];
           const detail = job.state === "ignored" || job.state === "stuck" ? job.error : null;
-          return `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
+          const row = `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
+          return job.prPoll?.error ? `${row}\n    pull request poll error: ${job.prPoll.error}` : row;
         });
       return [header, ...(error ? [`  poll error: ${error}`] : []), ...rows].join("\n");
     })
     .join("\n\n");
 }
 
-function formatShow(job: JobView, repo: RepoView, now: number): string {
+function formatShow(job: ListedJob, repo: RepoView, now: number): string {
   const rows: [string, string | null][] = [
     ["state", stateLabel(job)],
     ["issue", job.issueUrl],
@@ -113,6 +116,8 @@ function formatShow(job: JobView, repo: RepoView, now: number): string {
     ["round", job.round > 1 ? `feedback round ${job.round - 1} of ${MAX_FEEDBACK_ROUNDS}` : null],
     ["summary", job.summary],
     ["error", job.error],
+    ["pr polled", job.prPoll && (job.prPoll.polledAt === null ? "not yet" : age(job.prPoll.polledAt, now))],
+    ["pr poll error", job.prPoll?.error ?? null],
     ["repo polled", repo.polledAt === null ? "not yet" : age(repo.polledAt, now)],
     ["repo error", repo.error],
   ];
@@ -134,6 +139,10 @@ export function issueCommands(deps: {
     const { polledAt, error } = store.repoPoll(repo);
     return { repo, polledAt, error };
   };
+  const listed = (job: Job): ListedJob => {
+    const { polledAt, error } = store.jobPoll(job.id);
+    return { ...toView(job), prPoll: job.pr ? { polledAt, error } : null };
+  };
 
   return {
     "issues list": cliCommand({
@@ -145,20 +154,20 @@ export function issueCommands(deps: {
       },
       run(input) {
         const only = input.options.repo?.toLowerCase() as RepoName | undefined;
-        const jobs = store.list({ repo: only, all: input.options.all ?? false }).map(toView);
+        const jobs = store.list({ repo: only, all: input.options.all ?? false }).map(listed);
         const names = [...new Set([...deps.repos().map((mapping) => mapping.repo), ...jobs.map((job) => job.repo)])].filter((repo) => !only || repo === only);
         const repos = names.map(repoView);
         return input.options.json ? json({ repos, jobs }) : { exitCode: 0, stdout: `${formatList(repos, jobs, deps.clock())}\n` };
       },
     }),
     "issues show": cliCommand({
-      summary: "Show one issue job: thread, branch, pull request, pending GitHub write, last error, and its repository's last poll",
+      summary: "Show one issue job: thread, branch, pull request, pending GitHub write, last error, and the last polls of its pull request and repository",
       positionals: [{ name: "job", description: "Job id (psi_…)", required: true }],
       options: { json: { type: "boolean", description: "Emit the job view as JSON" } },
       run(input) {
         const job = store.get(jobId(input.positionals.job));
         if (!job) throw new PluginCliError(`no issue job ${input.positionals.job}`, { code: "job_not_found" });
-        return input.options.json ? json(toView(job)) : { exitCode: 0, stdout: `${formatShow(toView(job), repoView(job.repo), deps.clock())}\n` };
+        return input.options.json ? json(listed(job)) : { exitCode: 0, stdout: `${formatShow(listed(job), repoView(job.repo), deps.clock())}\n` };
       },
     }),
     "issues stop": cliCommand({
