@@ -29,13 +29,17 @@ export const PushInput = z.strictObject({
 
 export const PushResult = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("pushed"), sha: Sha }),
-  /** Decided before the push or by the remote; retrying cannot help. */
+  /**
+   * Decided before the push or by the remote; retrying cannot help. `stale-remote`: the branch is not at the expected
+   * commit. `remote-rejected`: the remote refused the ref, such as a rule, a hook or a workflow file the token may not
+   * write; `detail` carries its reason. `denied`: the transport refused the token.
+   */
   z.strictObject({
     status: z.literal("rejected"),
-    reason: z.enum(["missing-commit", "not-descendant", "stale-remote", "denied"]),
+    reason: z.enum(["missing-commit", "not-descendant", "stale-remote", "remote-rejected", "denied"]),
     detail: z.string(),
   }),
-  /** Network, timeout, remote 5xx. The server probes the branch head before retrying. */
+  /** No ref was refused: network, timeout, remote 5xx. The server probes the branch head before retrying. */
   z.strictObject({ status: z.literal("failed"), detail: z.string() }),
 ]);
 

@@ -70,6 +70,18 @@ function isolatedEnv(scratch: string, remoteUrl: string, token: string | null): 
   return env;
 }
 
+/** The lease or a fast-forward check failed: the remote branch is not where the push expected it. */
+const STALE = /^\[rejected\] \((stale info|fetch first|non-fast-forward)\)$/;
+
+/** The `--porcelain` line for `ref`: its flag (`!` when rejected) and summary, such as `[remote rejected] (reason)`. */
+function refStatus(stdout: string, ref: string): { flag: string; summary: string } | null {
+  for (const line of stdout.split("\n")) {
+    const [flag, refs, summary] = line.split("\t");
+    if (flag !== undefined && summary !== undefined && refs?.endsWith(`:${ref}`)) return { flag, summary: summary.trim() };
+  }
+  return null;
+}
+
 async function push(input: PushInput, tempDir: string, signal: AbortSignal): Promise<PushResult> {
   const objects = resolveObjectsDir(input.worktreePath);
   const scratch = await mkdtemp(join(tempDir, "push-"));
@@ -99,10 +111,15 @@ async function push(input: PushInput, tempDir: string, signal: AbortSignal): Pro
       isolatedEnv(scratch, input.remoteUrl, input.token),
       signal,
     );
-    const output = redact(`${result.stdout}\n${result.stderr}`);
     if (result.code === 0) return { status: "pushed", sha: input.sha };
-    if (/stale info|fetch first|non-fast-forward/.test(output)) return { status: "rejected", reason: "stale-remote", detail: output };
-    if (/\b403\b|denied|not permitted|protected branch/i.test(output)) return { status: "rejected", reason: "denied", detail: output };
+    const status = refStatus(result.stdout, ref);
+    if (status?.flag === "!") {
+      const remote = result.stderr.split("\n").filter((line) => line.startsWith("remote:"));
+      const reason = STALE.test(status.summary) ? "stale-remote" : "remote-rejected";
+      return { status: "rejected", reason, detail: redact([status.summary, ...remote].join("\n")) };
+    }
+    const output = redact(`${result.stdout}\n${result.stderr}`);
+    if (!status && /\b403\b|denied|not permitted/i.test(output)) return { status: "rejected", reason: "denied", detail: output };
     return { status: "failed", detail: output };
   } finally {
     await rm(scratch, { recursive: true, force: true });

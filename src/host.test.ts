@@ -124,3 +124,17 @@ test("the contract admits only agent branches and full commit ids", async () => 
   assert.equal(existsSync(join(f.loot, "pre-push-env")), false);
   await f.harness.experimental_dispose();
 });
+
+test("a push the remote refuses is rejected with the remote's reason, not retried as a failure", async () => {
+  const f = fixture();
+  const hook = join(f.remote, "hooks", "pre-receive");
+  writeFileSync(hook, "#!/bin/sh\necho 'GH013: Repository rule violations found for refs/heads/agent' >&2\nexit 1\n");
+  chmodSync(hook, 0o755);
+  const sha = commit(f.worktree, "a.txt", "one\n");
+  const result = await f.push(sha, null);
+  assert.equal(result.status, "rejected");
+  assert.equal(result.status === "rejected" && result.reason, "remote-rejected");
+  assert.match(result.status === "rejected" ? result.detail : "", /pre-receive hook declined[\s\S]*GH013: Repository rule violations/);
+  assert.equal(f.remoteHead(), null);
+  await f.harness.experimental_dispose();
+});
