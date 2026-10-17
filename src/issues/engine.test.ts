@@ -395,7 +395,7 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
   assert.deepEqual(spawn, {
     projectId: "prj_web",
     visibility: "visible",
-    environment: { type: "host", hostId: "host_worker", workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } },
+    environment: { type: "host", hostId: "host_worker", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "origin/main" } } },
     pluginMetadata: { pstackIssue: 1, jobId: started.id },
     title: "acme/web#41: Submit button hides behind the footer",
     providerId: "codex",

@@ -156,7 +156,9 @@ export function createIssues(deps: IssuesDeps): Issues {
           const thread = await bb.sdk.threads.spawn({
             projectId: job.projectId,
             visibility: "visible",
-            environment: { type: "host", hostId: job.hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } },
+            // The ref report validation counts new commits against and the pull request targets, not the project's
+            // worktree base, so a fresh worktree has nothing ahead of it.
+            environment: { type: "host", hostId: job.hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: `origin/${job.baseBranch}` } } },
             pluginMetadata: { pstackIssue: 1, jobId: job.id },
             prompt: spec.prompt,
             title: spec.title,
