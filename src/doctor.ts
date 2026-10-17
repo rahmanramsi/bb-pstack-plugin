@@ -89,9 +89,10 @@ export function renderChecks(checks: readonly Check[]): string {
     .join("\n");
 }
 
-/** Reads each provider's live model catalog on the environment's host (the server's when omitted). */
-export async function loadCatalog(bb: BbPluginApi, environmentId: string | undefined, ids: readonly string[]): Promise<Catalog> {
-  const routing = environmentId ? { environmentId } : {};
+type CatalogRouting = NonNullable<Parameters<BbPluginApi["sdk"]["providers"]["list"]>[0]>;
+
+export async function loadCatalog(bb: BbPluginApi, route: string | CatalogRouting | undefined, ids: readonly string[]): Promise<Catalog> {
+  const routing = typeof route === "string" ? { environmentId: route } : route ?? {};
   const providers = await bb.sdk.providers.list(routing);
   const entries = await Promise.all(
     ids.map(async (id): Promise<[string, ProviderCatalog] | null> => {
