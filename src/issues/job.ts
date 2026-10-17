@@ -164,7 +164,7 @@ export type FeedbackRef = { kind: FeedbackKind; id: number };
  * comment as `thread`; a review body or a conversation comment is answered in the conversation.
  */
 export type ReplyTarget = { kind: "review-comment"; id: number; thread: number } | { kind: "review" | "pr-comment"; id: number };
-/** A review body, an inline review comment, or an `/agent` comment on the job's pull request. */
+/** A review body, an inline review comment, or a conversation comment that mentions the App on the job's pull request. */
 export type Feedback = FeedbackRef & {
   author: string;
   body: string;
@@ -189,23 +189,28 @@ export type Feedback = FeedbackRef & {
 export type PolledFeedback = Omit<Feedback, "parent"> & { pr: number; reviewState: string | null };
 
 const COUNTED_REVIEWS: ReadonlySet<string> = new Set(["CHANGES_REQUESTED", "COMMENTED"]);
-const AGENT_COMMAND = /^\s*\/agent\b/i;
-const STOP_COMMAND = /^\s*\/agent\s+stop\b/i;
+const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** The comment's own text: quoted lines repeat someone else's words, so a mention there asks for nothing. */
+const ownText = (body: string) => body.split("\n").filter((line) => !/^\s*>/.test(line)).join("\n");
+/** `@<slug>` or `@<slug>[bot]` as a whole mention, case-insensitive, so `@pstack-agents` or `x@pstack-agent` do not match. */
+const mention = (slug: string, after = "") =>
+  new RegExp(`(?<![\\w@./-])@${escape(slug)}(?:\\[bot\\])?(?![\\w-])${after}`, "i");
 
-/** The command a comment gives, whoever wrote it; only the poller knows whether its author may. */
-export function command(body: string): "stop" | null {
-  return STOP_COMMAND.test(body) ? "stop" : null;
+/** The command a comment gives the App, whoever wrote it; only the poller knows whether its author may. */
+export function command(body: string, appSlug: string): "stop" | null {
+  return mention(appSlug, "\\s+stop\\b").test(ownText(body)) ? "stop" : null;
 }
 
 /**
- * Whether polled feedback starts a round, before the author check. Conversation comments count only as `/agent`
- * requests, and `/agent stop` is a command, not feedback; approved and dismissed reviews count for nothing, their inline comments included. A review without a
- * body has nothing to answer: its inline comments arrive on their own.
+ * Whether polled feedback starts a round, before the author check. A conversation comment counts only when it
+ * mentions the App, and `@<app> stop` is a command, not feedback; approved and dismissed reviews count for nothing,
+ * their inline comments included. A review without a body has nothing to answer: its inline comments arrive on their
+ * own.
  */
-export function counts(item: PolledFeedback): boolean {
+export function counts(item: PolledFeedback, appSlug: string): boolean {
   switch (item.kind) {
     case "pr-comment":
-      return AGENT_COMMAND.test(item.body) && command(item.body) === null;
+      return mention(appSlug).test(ownText(item.body)) && command(item.body, appSlug) === null;
     case "review":
       return COUNTED_REVIEWS.has(item.reviewState ?? "") && item.body.trim() !== "";
     case "review-comment":

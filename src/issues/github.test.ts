@@ -245,7 +245,7 @@ test("feedback reads each pull request's inline comments, conversation comments,
     const json = inline.filter((comment) => !since || comment.updated_at >= since);
     return etagged(json, `"c${json.length}"`)(request);
   };
-  routes["GET /repos/acme/web/issues/7/comments"] = etagged([{ id: 12, body: "/agent also add a test", user: user("maya"), created_at: "2026-10-17T10:01:00Z", updated_at: "2026-10-17T10:01:00Z" }], '"i1"');
+  routes["GET /repos/acme/web/issues/7/comments"] = etagged([{ id: 12, body: "@pstack-test also add a test", user: user("maya"), created_at: "2026-10-17T10:01:00Z", updated_at: "2026-10-17T10:01:00Z" }], '"i1"');
   routes["GET /repos/acme/web/pulls/7/reviews"] = etagged([{ id: 21, body: "A few things.", user: user("maya"), state: "CHANGES_REQUESTED", submitted_at: "2026-10-17T10:00:00Z" }, { id: 22, body: "", user: user("maya"), state: "PENDING" }], '"r1"');
   routes["GET /repos/acme/web/pulls/7"] = (request) => (request.headers["if-none-match"] === '"p1"' ? { status: 304 } : { status: 200, json: { state: "open", merged: false }, headers: { etag: '"p1"' } });
   routes["GET /app"] = () => ({ status: 200, json: { slug: "pstack-dev" } });
@@ -343,15 +343,15 @@ test("inline comments overlap the cursor, a new review's own comments are read, 
 test("a job's activity reads its issue's comments from when the job started, then from the cursor", async () => {
   const { repo } = setup();
   const comments = [
-    { id: 1, body: "/agent stop", user: { login: "maya" }, created_at: "2026-10-17T09:00:00Z", updated_at: "2026-10-17T09:00:00Z" },
-    { id: 2, body: "/agent stop", user: { login: "lee" }, created_at: "2026-10-17T11:00:00Z", updated_at: "2026-10-17T11:00:00Z" },
+    { id: 1, body: "@pstack-test stop", user: { login: "maya" }, created_at: "2026-10-17T09:00:00Z", updated_at: "2026-10-17T09:00:00Z" },
+    { id: 2, body: "@pstack-test stop", user: { login: "lee" }, created_at: "2026-10-17T11:00:00Z", updated_at: "2026-10-17T11:00:00Z" },
   ];
   routes["GET /repos/acme/web/issues/41/comments"] = (request) => {
     const since = new URL(request.path, "http://x").searchParams.get("since");
     return { status: 200, json: comments.filter((comment) => !since || comment.updated_at >= since) };
   };
   const first = await repo.activity({ issue: 41, since: Date.parse("2026-10-17T10:00:00Z"), pr: null }, null);
-  assert.deepEqual(first.issueComments, [{ id: 2, author: "lee", body: "/agent stop", createdAt: Date.parse("2026-10-17T11:00:00Z") }]);
+  assert.deepEqual(first.issueComments, [{ id: 2, author: "lee", body: "@pstack-test stop", createdAt: Date.parse("2026-10-17T11:00:00Z") }]);
   assert.equal(first.pull, null, "no pull request yet, nothing else is read");
   assert.equal(seen.filter((request) => request.path.includes("/pulls/")).length, 0);
   await repo.activity({ issue: 41, since: 0, pr: null }, first.next);

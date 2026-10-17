@@ -12,6 +12,7 @@ import {
   branchFor,
   FEEDBACK_QUIET_MS,
   MAX_FEEDBACK_ROUNDS,
+  command,
   counts,
   enter,
   isReasoningLevel,
@@ -357,13 +358,18 @@ test("a spawn spec takes only the reasoning levels bb's SDK accepts", () => {
   assert.equal(isReasoningLevel("extreme"), false);
 });
 
-test("feedback counts per the operator's rules: /agent conversation comments, and reviews that are not approved or dismissed", () => {
+test("feedback counts per the operator's rules: conversation comments that mention the App, and reviews that are not approved or dismissed", () => {
   const item = (kind: "review" | "review-comment" | "pr-comment", body: string, reviewState: string | null) =>
-    counts({ kind, id: 1, pr: 7, author: "maya", body, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, postedAt: NOW, reviewState });
-  assert.equal(item("pr-comment", "  /Agent please add a test", null), true);
+    counts({ kind, id: 1, pr: 7, author: "maya", body, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, postedAt: NOW, reviewState }, "pstack-agent");
+  assert.equal(item("pr-comment", "@Pstack-Agent please add a test", null), true);
+  assert.equal(item("pr-comment", "Thanks. @pstack-agent, also cover 320px.", null), true, "the mention can be anywhere");
+  assert.equal(item("pr-comment", "@pstack-agent[bot] add a test", null), true);
   assert.equal(item("pr-comment", "Looks good, but please add a test", null), false);
-  assert.equal(item("pr-comment", "/agents", null), false);
-  assert.equal(item("pr-comment", "/agent stop", null), false, "a stop command is not feedback");
+  assert.equal(item("pr-comment", "@pstack-agents add a test", null), false, "another account's name");
+  assert.equal(item("pr-comment", "mail me at dev@pstack-agent.io", null), false);
+  assert.equal(item("pr-comment", "> @pstack-agent add a test\n\nI disagree with this.", null), false, "a quoted mention asks for nothing");
+  assert.equal(item("pr-comment", "/agent add a test", null), false, "the old slash command is gone");
+  assert.equal(item("pr-comment", "@pstack-agent stop", null), false, "a stop command is not feedback");
   assert.equal(item("review", "Rename the helper.", "CHANGES_REQUESTED"), true);
   assert.equal(item("review", "Nit: rename.", "COMMENTED"), true);
   assert.equal(item("review", "Ship it, but rename later.", "APPROVED"), false);
@@ -371,6 +377,14 @@ test("feedback counts per the operator's rules: /agent conversation comments, an
   assert.equal(item("review-comment", "Rename this.", "COMMENTED"), true);
   assert.equal(item("review-comment", "Rename this.", "APPROVED"), false);
   assert.equal(item("review-comment", "Rename this.", "DISMISSED"), false);
+});
+
+test("@<app> stop is the stop command, wherever it sits in the comment's own text", () => {
+  assert.equal(command("@pstack-agent stop", "pstack-agent"), "stop");
+  assert.equal(command("This is going nowhere. @PSTACK-AGENT STOP please", "pstack-agent"), "stop");
+  assert.equal(command("@pstack-agent stopping is not what I asked", "pstack-agent"), null);
+  assert.equal(command("> @pstack-agent stop\n\nWhy did you stop?", "pstack-agent"), null, "a quoted stop is not a command");
+  assert.equal(command("/agent stop", "pstack-agent"), null);
 });
 
 const PUSHED = "b".repeat(40) as Sha;

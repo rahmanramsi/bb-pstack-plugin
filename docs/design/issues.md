@@ -37,10 +37,10 @@ Daily use happens on GitHub:
 | A user with write access | Adds the `agent` label to an issue | A worker thread starts. The issue gets `agent:working` and one status comment. |
 | Worker | Finishes | A draft pull request with the `agent` label, `Closes #<n>` in the body, and the issue moves to `agent:review`. |
 | Worker | Cannot proceed without an answer | Questions are posted on the issue, which moves to `agent:needs-info`. A reply from the author or a collaborator resumes the worker. |
-| Reviewer | Submits a review, writes an inline comment, or writes a pull request comment that starts with `/agent` | After 2 minutes without new feedback, the worker starts one round with all of it. |
+| Reviewer | Submits a review, writes an inline comment, or writes a pull request comment that mentions the App, such as `@pstack-agent also cover 320px` | After 2 minutes without new feedback, the worker starts one round with all of it. |
 | CI | Fails on a commit the App pushed | The worker starts a round to fix it. |
 | GitHub | Reports a merge conflict | The worker merges the base branch and resolves the conflict. |
-| A user with write access | Comments `/agent stop`, or removes the `agent` label | The worker stops and the job ends. |
+| A user with write access | Comments `@pstack-agent stop`, or removes the `agent` label | The worker stops and the job ends. |
 
 Operators inspect jobs from bb:
 
@@ -98,7 +98,7 @@ A rejected report exits 1 and prints every reason. These exit 1 too, and none co
 **Polling, not webhooks.** The server has no stable public endpoint, and polling resumes from a cursor after downtime. The `pstack-issues` service polls each repository every 60 s with an installation token. Requests send `If-None-Match`, and a 304 response does not count against the rate limit.
 
 - Open issues labeled `agent`. Items with a `pull_request` field are skipped, because GitHub lists pull requests as issues.
-- For each open job: its issue's comments since the job started, for `/agent stop`.
+- For each open job: its issue's comments since the job started, for `@<app> stop`.
 - For each open job's pull request: its inline review comments and its conversation comments since its cursor, its reviews, and its state (open, merged, or closed). Each list keeps its own ETag, and a 304 keeps the last known reviews and pull request state.
 - Later: check runs and `mergeable` for the head commit of each open job pull request.
 
@@ -112,13 +112,13 @@ GitHub dates a review's inline comments from when they were drafted, not when th
 
 **What counts as feedback.** The rules are the pure `counts()` in `job.ts`:
 
-- A comment in the pull request's conversation counts only when its body starts with `/agent`, case-insensitive, after leading whitespace. `/agent stop` is a command, not feedback.
+- A comment in the pull request's conversation counts only when it mentions the App by its slug, `@<app>` or `@<app>[bot]`, anywhere in its own text and case-insensitive. Quoted lines (`>`) do not count, because they repeat someone else's words, and the App's own replies quote with mentions neutralized, so it never mentions itself. `@<app> stop` is a command, not feedback. The slug comes from `GET /app`. This is the convention other GitHub App bots use, such as `@dependabot rebase`. Pick a slug no GitHub user owns, or that user is notified by every mention.
 - Inline review comments and review bodies always count, except that a review whose state is `APPROVED` or `DISMISSED` counts for nothing, its inline comments included. `CHANGES_REQUESTED` and `COMMENTED` count.
 - A review with an empty body is not stored: its inline comments arrive on their own, and there is nothing else to answer.
 
 Feedback that does not count is not stored.
 
-**Stopping from GitHub.** A comment that starts with `/agent stop`, on the issue or on the job's pull request, stops the job. Its author needs write access and must not be the App, and it must be written after the job started. It takes the same path as `bb pstack issues stop`, so the worker stops and the status labels go.
+**Stopping from GitHub.** A comment that says `@<app> stop` in its own text, on the issue or on the job's pull request, stops the job. Its author needs write access and must not be the App, and it must be written after the job started. It takes the same path as `bb pstack issues stop`, so the worker stops and the status labels go.
 
 **Job states.**
 
@@ -127,11 +127,11 @@ detected ─► working ─┬─► needs-info ──(answer)──► working
                      ├─► done (no-change)
                      └─► review ──(feedback, CI failure, conflict)──► addressing ──► review
 review, addressing ──(merged or closed)──► done
-any ──(/agent stop, label removed)──► stopped
+any ──(@<app> stop, label removed)──► stopped
 any ──(round limit, timeout, repeated invalid report)──► stuck
 ```
 
-Step 2 builds feedback as the trigger for `addressing`, and `/agent stop` comments. CI failures and conflicts come in step 4, and `needs-info` answers and the label removal in step 3.
+Step 2 builds feedback as the trigger for `addressing`, and `@<app> stop` comments. CI failures and conflicts come in step 4, and `needs-info` answers and the label removal in step 3.
 
 `working`, `needs-info`, `review`, and `stuck` map to the labels `agent:working`, `agent:needs-info`, `agent:review`, and `agent:stuck`. The issue has one status comment that the service edits. It states the current state and links the pull request, and nothing else.
 
@@ -226,7 +226,7 @@ Past a limit the job moves to `stuck`, which stops the worker and removes its st
 - `issue_job_polls`: one row per polled job: its cursor, its pull request's last state, when it was last polled, and the last error.
 - `issue_jobs`: one row per label event, unique on the event id. It holds the trigger, the issue snapshot, project, host, branch, generation, state, the outbox and its claim bookkeeping (`effects_json`, `effect_tries`, `effect_first_at`, `effect_lease_until`, `effect_next_at`), thread, deadline, rejections, reminders, the accepted report, the pushed commit, the pull request, the current round and its base, the worker's settings, the last error, and a version for compare-and-set writes. Its `CHECK` state lists repeat `job.ts`, and a test fails when they disagree. Step 2 rebuilt the table, because SQLite cannot alter a `CHECK`; existing jobs are in round 1.
 - `issue_rounds`: one row per round, keyed by job and ordinal. It holds the kind (`initial` or `feedback`), when the round started, the branch head it started from, the accepted report, the commit it pushed, and when it ended.
-- `issue_feedback`: one row per counted review, inline comment, or `/agent` comment, keyed by repository, kind, and GitHub id, which dedupes repeated polls. It holds the job, the pull request, the author, the body, and the file, line, diff hunk and review of an inline comment. A follow-up also holds the thread comment it answers, with that comment's author and text. Each row records when it was made and when it became visible. `round` is null while the item waits, and is set to the round that sent it.
+- `issue_feedback`: one row per counted review, inline comment, or conversation comment that mentions the App, keyed by repository, kind, and GitHub id, which dedupes repeated polls. It holds the job, the pull request, the author, the body, and the file, line, diff hunk and review of an inline comment. A follow-up also holds the thread comment it answers, with that comment's author and text. Each row records when it was made and when it became visible. `round` is null while the item waits, and is set to the round that sent it.
 
 `store.write` is the one write path for the job, its rounds and its feedback's round. In one transaction it updates the job, and a round start inserts the round's row and marks its feedback. The current round's row then records the report, the pushed commit, and the end when the change says so. The items a round must answer are the feedback rows marked with it, so the round has no second list that could disagree.
 

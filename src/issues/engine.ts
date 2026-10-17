@@ -611,7 +611,7 @@ export function createIssues(deps: IssuesDeps): Issues {
 
   /**
    * Polls each open job on its own, so one that GitHub cannot read holds back no other: it keeps its last cursor and
-   * pull request state and records the error. A `/agent stop` on the issue or the pull request stops the job. The
+   * pull request state and records the error. An `@<app> stop` on the issue or the pull request stops the job. The
    * pull request's feedback that counts is stored: job.ts's rules pass, and its author has write access and is not
    * the App.
    */
@@ -619,6 +619,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const jobs = store.list({ repo: repo.name, all: false });
     if (jobs.length === 0) return;
     const appLogin = await repo.appLogin();
+    const appSlug = appLogin.replace(/\[bot\]$/, "");
     const trusted = async (author: string) => author !== appLogin && CAN_TRIGGER.has(await repo.permission(author));
     await Promise.all(
       jobs.map(async (job) => {
@@ -628,11 +629,11 @@ export function createIssues(deps: IssuesDeps): Issues {
           const comments = [...result.issueComments, ...(result.pull?.items.filter((item) => item.kind === "pr-comment") ?? [])];
           let stopper: string | null = null;
           for (const comment of comments) {
-            if (!stopper && command(comment.body) === "stop" && comment.createdAt >= job.createdAt && (await trusted(comment.author))) stopper = comment.author;
+            if (!stopper && command(comment.body, appSlug) === "stop" && comment.createdAt >= job.createdAt && (await trusted(comment.author))) stopper = comment.author;
           }
           const feedback: Feedback[] = [];
           for (const item of result.pull?.items ?? []) {
-            if (!counts(item) || !(await trusted(item.author))) continue;
+            if (!counts(item, appSlug) || !(await trusted(item.author))) continue;
             const { pr: _, reviewState: __, ...rest } = item;
             const parent = item.inReplyTo !== null && !store.hasFeedback(repo.name, item) ? await repo.reviewComment(item.inReplyTo) : null;
             feedback.push({ ...rest, parent });
