@@ -44,7 +44,7 @@ Installing changes nothing until the user invokes a skill. Only `/setup-pstack` 
 
 If cost is the worry, say where the tokens go and how to spend fewer. pstack spends extra tokens on subagents and review panels. Rerun `/setup-pstack` and pick a smaller budget or cheaper models. A role set to `inherit-parent` runs on the thread's model, which saves tokens when the thread runs on a cheaper model. A shorter panel list runs fewer subagents, one for each entry. Save `/poteto-mode` for work that needs rigor.
 
-pstack is built for bb. Its skills use the Agent Skills format, so other tools can read them. But most workflow skills, including `/poteto-mode`, `/how`, `/why`, and `/teach`, spawn bb threads with per-role models (`bb thread spawn`), so those parts may not work there.
+pstack is built for bb. Its skills use the Agent Skills format, so other tools can read them. But most workflow skills, including `/poteto-mode`, `/how`, `/why`, and `/teach`, spawn bb threads with per-role models (`bb pstack spawn`), so those parts may not work there.
 
 ## Start a task with `/poteto-mode`
 
@@ -76,7 +76,7 @@ The default answer is `/poteto-mode`, which runs most of the others when its ste
 | Settle types and module shape before code that crosses a function boundary | [`/architect`](../architect/SKILL.md) |
 | Get several attempts at one brief, merged into the best one | [`/arena`](../arena/SKILL.md) |
 | Run parallel checks over slices, or race workers, as parallel threads | [`/swarm`](../swarm/SKILL.md) |
-| Spread new threads across machines by free concurrency slots | [`/pick-machine`](../pick-machine/SKILL.md) |
+| Spread new threads across machines by free concurrency slots | `bb pstack spawn --new-environment worktree`; inspect capacity with `bb pstack machines`. |
 | Have different models review a diff and try to break it | [`/interrogate`](../interrogate/SKILL.md) |
 | Fix a bug test-first when a cheap local test exists | [`/tdd`](../tdd/SKILL.md) |
 | Apply TypeScript rules to `.ts` or `.tsx` work | [`/typescript-best-practices`](../typescript-best-practices/SKILL.md) |
@@ -138,7 +138,7 @@ Principles are one-rule skills that `/poteto-mode` reads and cites in its replie
 | A new model choice had no effect | The configuration from `/setup-pstack` applies to new threads. Start one. |
 | Runs cost more than expected | See the cost paragraph under Get set up. |
 | A skill didn't load on its own | Only `/setup-pstack` loads from the user's words. The others load when the user types them or when `/poteto-mode` runs them, and it doesn't run every skill. |
-| Parallel agents overwrote each other | Give each agent its own worktree (`bb thread spawn --new-environment worktree`). |
+| Parallel agents overwrote each other | Give each agent its own worktree (`bb pstack spawn --new-environment worktree`). |
 | An overnight run moved but finished nothing | A loop (`/loop` in Claude Code, or a bb automation) needs a check that can pass or fail, not a duration. See [guide page 7](../../docs/guide/07-overnight.md). |
 | The reply claims success from a green build | Ask for the real command, flow, stored value, or profile. That's the prove-it-works principle. |
 
