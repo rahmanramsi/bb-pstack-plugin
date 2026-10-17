@@ -139,6 +139,16 @@ test("settle pops a done effect, merges what it learned, and enters the resting 
   assert.equal(working.threadId, "thr_w1");
 });
 
+test("a job keeps its stuck reason through its last effects, while other transit states clear a recovered error", () => {
+  const sticking = job({ threadId: "thr_w", phase: transit("sticking", [labelEffect], { tries: 1 }), error: "the worker stopped without reporting" });
+  const stuck = apply(sticking, settle(sticking, { kind: "done", patch: {} }, NOW));
+  assert.deepEqual(stuck.phase, { state: "stuck" });
+  assert.equal(stuck.error, "the worker stopped without reporting");
+
+  const publishing = job({ threadId: "thr_w", phase: transit("publishing", [pushEffect, labelEffect], { tries: 2 }), error: "GitHub 502" });
+  assert.equal(apply(publishing, settle(publishing, { kind: "done", patch: { pushedSha: HEAD } }, NOW)).error, null);
+});
+
 test("a spawn whose outcome is unknown is probed, never re-run, and sticks once the grace period passes with no thread", () => {
   const claimed = job({ phase: transit("starting", [spawnEffect], { tries: 1, firstAt: NOW, leaseUntil: NOW + 2 * MIN }) });
   const afterUnknown = apply(claimed, settle(claimed, { kind: "unknown", error: "socket hang up" }, NOW));

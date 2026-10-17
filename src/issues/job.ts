@@ -270,7 +270,9 @@ export function settle(job: Job, outcome: EffectOutcome, now: number): Change {
   switch (outcome.kind) {
     case "done": {
       const [, ...rest] = phase.effects;
-      return { phase: enter(phase.state, rest), ...outcome.patch, error: null };
+      // On the way to stuck or stopped the error is the reason, so it outlives the effects.
+      const ending = phase.state === "sticking" || phase.state === "stopping";
+      return { phase: enter(phase.state, rest), ...outcome.patch, ...(ending ? {} : { error: null }) };
     }
     case "absent": {
       if (policy.replay) return { phase: { ...phase, leaseUntil: null, nextAt: null } };
