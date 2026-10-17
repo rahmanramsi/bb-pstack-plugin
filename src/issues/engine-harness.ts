@@ -251,14 +251,16 @@ export function harness() {
   };
 
   const threads = new Map<string, FakeThread>();
-  const worktrees = new Map<string, { headSha: string; dirty: boolean; ahead: number }>();
+  /** `commits`: what HEAD contains past `origin/main`; by default HEAD and every commit pstack pushed. */
+  type Worktree = { headSha: string; dirty: boolean; ahead: number; commits?: string[] };
+  const worktrees = new Map<string, Worktree>();
   const files = new Map<string, string>();
   const spawned: Record<string, any>[] = [];
   const sent: Record<string, any>[] = [];
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, staleWorktree: null as string | null };
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
@@ -276,7 +278,10 @@ export function harness() {
   const createThread = (args: Record<string, any>): FakeThread => {
     const id = `thr_w${++next}`;
     const thread: FakeThread = { id, status: "active", archivedAt: null, deletedAt: null, createdAt: clock.now, updatedAt: clock.now, projectId: args.projectId, originPluginId: "pstack", environmentId: `env_${id}`, metadata: args.pluginMetadata };
-    worktrees.set(thread.environmentId, { headSha: SHA1, dirty: false, ahead: 0 });
+    // A replacement starts from the branch as the host last fetched it: GitHub's head, unless the test makes it stale.
+    const base: string = args.environment.workspace.baseBranch.name;
+    const head = base.startsWith("origin/agent/") ? (failures.staleWorktree ?? gh.refs.get(base.slice("origin/".length)) ?? SHA1) : SHA1;
+    worktrees.set(thread.environmentId, { headSha: head, dirty: false, ahead: 0 });
     return thread;
   };
 
@@ -344,7 +349,7 @@ export function harness() {
           workspace: {
             checkout: { kind: "branch", branchName: "bb/x", headSha: tree.headSha },
             workingTree: { hasUncommittedChanges: tree.dirty, files: [] },
-            mergeBase: { aheadCount: tree.ahead },
+            mergeBase: { aheadCount: tree.ahead, commits: (tree.commits ?? [tree.headSha, ...pushes.map((push) => push.sha)]).map((sha) => ({ sha })) },
           },
         };
       },
@@ -453,7 +458,7 @@ export function harness() {
     return all[0]!;
   };
   /** The worker commits and reports through the CLI. */
-  const report = async (threadId: string, value: unknown, tree: Partial<{ headSha: string; dirty: boolean; ahead: number }> = { headSha: SHA2, ahead: 1 }) => {
+  const report = async (threadId: string, value: unknown, tree: Partial<Worktree> = { headSha: SHA2, ahead: 1 }) => {
     const environmentId = threads.get(threadId)!.environmentId;
     worktrees.set(environmentId, { ...worktrees.get(environmentId)!, ...tree });
     files.set("/worktrees/x/report.json", JSON.stringify(value));

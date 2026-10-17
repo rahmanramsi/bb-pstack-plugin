@@ -393,3 +393,72 @@ test("a pull request waiting for review costs no worker thread reads until a rou
   assert.equal((await h.only()).state, "addressing");
   assert.ok(h.threadReads.count > 0);
 });
+
+const SUGGESTED = "5".repeat(40);
+const UPDATED = "6".repeat(40);
+const SHA4 = "4".repeat(40);
+
+test("a branch moved on GitHub between rounds becomes the round's base: the worker is told to merge it, and the push expects it", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.gh().refs.set(job.branch, SUGGESTED);
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  const text: string = h.sent.at(-1)!.input[0].text;
+  assert.match(text, new RegExp(`\`${job.branch}\` on GitHub is at 5555555[\\s\\S]*git fetch origin[\\s\\S]*merge \`origin/${job.branch}\``));
+
+  const reply = [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }];
+  const stale = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SHA2] });
+  assert.equal(stale.exitCode, 1);
+  assert.match(stale.stderr!, /does not contain 5555555[\s\S]*merge `origin\//);
+  const merged = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SUGGESTED, SHA2] });
+  assert.equal(merged.exitCode, 0, merged.stderr);
+  await h.settle();
+  const back = await h.only();
+  assert.equal(back.state, "review", back.error ?? "");
+  assert.deepEqual([h.pushes.at(-1)!.sha, h.pushes.at(-1)!.expectedRemoteSha], [SHA3, SUGGESTED]);
+  assert.equal(appReplies(h, pr).length, 1);
+});
+
+test("a branch moved on GitHub during a round refuses the report without counting it, and the next report pushes on top of the new head", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.doesNotMatch(h.sent.at(-1)!.input[0].text, /git fetch origin/, "the branch had not moved when the round started");
+  h.gh().refs.set(job.branch, UPDATED);
+
+  const reply = [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }];
+  const refused = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SHA2] });
+  assert.equal(refused.exitCode, 1);
+  assert.match(refused.stderr!, /moved to 6666666 since this round started[\s\S]*git fetch origin/);
+  const still = await h.only();
+  assert.equal(still.state, "addressing");
+  assert.equal(still.error, null, "not a rejection");
+
+  const accepted = await h.report(job.threadId!, roundReport(reply), { headSha: SHA4, commits: [SHA4, UPDATED, SHA3, SHA2] });
+  assert.equal(accepted.exitCode, 0, accepted.stderr);
+  await h.settle();
+  assert.equal((await h.only()).state, "review", (await h.only()).error ?? "");
+  assert.deepEqual([h.pushes.at(-1)!.sha, h.pushes.at(-1)!.expectedRemoteSha], [SHA4, UPDATED]);
+});
+
+test("a replacement worker whose worktree starts behind the branch on GitHub is told to fetch and merge before it commits", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  h.threads.get(job.threadId!)!.archivedAt = h.clock.now;
+  h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.gh().refs.set(job.branch, SUGGESTED);
+  h.failures.staleWorktree = SHA2;
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+
+  const addressing = await h.only();
+  assert.equal(addressing.state, "addressing", addressing.error ?? "");
+  const note = h.sent.find((message) => message.threadId === addressing.threadId);
+  assert.ok(note, "the replacement gets a note");
+  assert.match(note.input[0].text, /starts at 2222222[\s\S]*is at 5555555[\s\S]*git fetch origin/);
+});

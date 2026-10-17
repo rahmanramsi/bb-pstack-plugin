@@ -208,6 +208,7 @@ export const MIGRATIONS: readonly string[] = [
   `ALTER TABLE issue_feedback ADD COLUMN posted_at INTEGER`,
   `ALTER TABLE issue_feedback ADD COLUMN parent_author TEXT`,
   `ALTER TABLE issue_feedback ADD COLUMN parent_body TEXT`,
+  `ALTER TABLE issue_jobs ADD COLUMN round_base TEXT`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

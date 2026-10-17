@@ -129,6 +129,7 @@ type JobRow = {
   updated_at: number;
   round: number;
   worker_json: string | null;
+  round_base: string | null;
 };
 
 type FeedbackRow = {
@@ -200,6 +201,7 @@ function parse(row: JobRow): Job {
     pr: row.pr_number === null ? null : { number: row.pr_number, url: row.pr_url ?? "" },
     error: row.error,
     round: row.round,
+    roundBase: row.round_base as Sha | null,
     worker: row.worker_json === null ? null : (JSON.parse(row.worker_json) as WorkerSettings),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -231,6 +233,7 @@ function columns(change: Change): Record<string, unknown> {
   if (change.error !== undefined) set.error = change.error;
   if (change.startRound !== undefined) set.round = change.startRound.ordinal;
   if (change.worker !== undefined) set.worker_json = JSON.stringify(change.worker);
+  if (change.roundBase !== undefined) set.round_base = change.roundBase;
   return set;
 }
 

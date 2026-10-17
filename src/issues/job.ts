@@ -103,7 +103,9 @@ export type Effect =
   /** `body` is posted as is: a conversation reply already quotes what it answers. */
   | { op: "reply"; key: string; target: ReplyTarget; body: string }
   | { op: "request-review"; key: string; reviewers: readonly string[] }
-  | { op: "edit-pr"; key: string; body: string };
+  | { op: "edit-pr"; key: string; body: string }
+  /** A replacement worker's worktree must contain `base`, the branch's head on GitHub; when it does not, it is told to merge. */
+  | { op: "check-worktree"; key: string; base: Sha };
 
 export type EffectOp = Effect["op"];
 
@@ -131,6 +133,8 @@ export const EFFECT_POLICY = {
   // One request per reviewer when GitHub refuses the batch, so it gets longer than one call.
   "request-review": { recovery: { kind: "replay" }, leaseMs: 2 * 60_000 },
   "edit-pr": { recovery: { kind: "replay" }, leaseMs: 60_000 },
+  // A repeated note to merge the branch is harmless.
+  "check-worktree": { recovery: { kind: "replay" }, leaseMs: 60_000 },
 } as const satisfies { readonly [Op in EffectOp]: { recovery: Recovery; leaseMs: number } };
 
 export const MAX_EFFECT_TRIES = 8;
@@ -241,6 +245,11 @@ export type Job = {
   error: string | null;
   /** The current round's ordinal: 1 is the issue, each later one answers feedback on the pull request. */
   round: number;
+  /**
+   * In a feedback round, the branch's head on GitHub that the round's commit must contain and its push expects. Set
+   * when the round starts, and moved when the branch moves on GitHub during the round. Null before the first.
+   */
+  roundBase: Sha | null;
   /** The worker's settings from the start, so a replacement worker runs the same model. */
   worker: WorkerSettings | null;
   createdAt: number;
@@ -267,6 +276,7 @@ export type Change = {
   startRound?: RoundStart;
   /** The current round ended with this change; its history row records when. */
   finishRound?: true;
+  roundBase?: Sha;
   worker?: WorkerSettings;
 };
 
@@ -309,6 +319,8 @@ export type Facts = {
   gate: GateFact | null;
   feedback: FeedbackFact | null;
   rounds: readonly RoundSummary[] | null;
+  /** The branch's head on GitHub, read when a round is due; `head` is null when the branch is gone. */
+  remote: { head: Sha | null } | null;
   /** The pull request's state as last polled; null until the job's first successful poll. */
   pr: { state: PullState } | null;
 };
@@ -341,7 +353,7 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
  * What `review` needs once a round is due, and only then: a pull request can wait days for review, and these cost a bb
  * call and store reads per job on every sweep.
  */
-export const ROUND_FACTS: readonly FactName[] = ["slotFree", "thread", "rounds"];
+export const ROUND_FACTS: readonly FactName[] = ["slotFree", "thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
@@ -427,10 +439,11 @@ function next(job: Job, facts: Facts): Action | null {
       }
       const quiet = quietAt(feedback.pending);
       if (quiet > now) return { type: "sleep", until: quiet };
-      if (!facts.slotFree || !facts.thread || !facts.rounds) return null;
+      if (!facts.slotFree || !facts.thread || !facts.rounds || !facts.remote) return null;
+      if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
       // A failed thread cannot take the round's message; it is replaced like a gone one.
       const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
-      return { type: "change", change: startRound(job, feedback.pending, facts.rounds, respawn, now) };
+      return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
     }
     case "addressing":
     case "working": {
@@ -504,12 +517,13 @@ export function start(job: Job, worker: WorkerSettings, now: number): Change {
  * review → sending, or respawning when the worker thread is gone or failed: relabel the issue, then hand the worker every pending
  * item in one message. The round's row and its feedback are written with this change, so no item is sent twice.
  */
-function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], respawn: boolean, now: number): Change {
+function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], head: Sha, respawn: boolean, now: number): Change {
   const ordinal = job.round + 1;
-  const text = roundPrompt(job, ordinal, pending, rounds);
+  const text = roundPrompt(job, ordinal, pending, rounds, head);
   const relabel: Effect = { op: "labels", key: `labels:${job.id}:working:${ordinal}`, on: "issue", add: [LABEL.working], remove: [LABEL.review] };
   const round = {
-    startRound: { ordinal, kind: "feedback", baseSha: job.pushedSha, feedback: pending.map(({ kind, id }) => ({ kind, id })) },
+    startRound: { ordinal, kind: "feedback", baseSha: head, feedback: pending.map(({ kind, id }) => ({ kind, id })) },
+    roundBase: head,
     deadline: now + ROUND_MS,
     rejections: 0,
     nudges: 0,
@@ -518,7 +532,8 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
   if (!respawn) return { phase: enter("sending", [relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round };
   if (!job.worker) return stick(job, "the worker thread is gone and the job has no worker settings to start another");
   const spec: SpawnSpec = { ...job.worker, title: workerTitle(job), prompt: text, baseRef: `origin/${job.branch}` };
-  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }]), ...round };
+  const check: Effect = { op: "check-worktree", key: `check-worktree:${job.id}:${ordinal}`, base: head };
+  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }, check]), ...round };
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */
@@ -624,8 +639,10 @@ export type AcceptedReport = Report & { headSha: Sha; acceptedAt: number };
 
 export type ReportFacts = {
   now: number;
-  /** `ahead`: commits on HEAD that `origin/<base>` does not have. */
-  worktree: { headSha: Sha; dirty: boolean; ahead: number };
+  /** `ahead`: how many commits HEAD has that `origin/<base>` does not; `commits`: those commits. */
+  worktree: { headSha: Sha; dirty: boolean; ahead: number; commits: readonly Sha[] };
+  /** In a feedback round, the branch's head on GitHub now. */
+  remoteHead: Sha | null;
   /** `gate pr` on the worker thread's checklist. Only the first round checks it. */
   gate: GateFact;
   titleConvention: "conventional" | "free";
@@ -635,13 +652,21 @@ export type ReportFacts = {
 
 export type Verdict =
   | { ok: true; change: Change }
-  | { ok: false; reasons: readonly string[]; change: Change };
+  | { ok: false; reasons: readonly string[]; change: Change }
+  /** The branch moved on GitHub during the round. Not counted: the worker merges `moved` and reports again. */
+  | { ok: false; moved: Sha; change: Change };
 
 const refKey = (ref: FeedbackRef) => `${ref.kind} ${ref.id}`;
 
-/** HEAD is new this round: ahead of the base branch in the first round, past the pushed commit in a later one. */
+const roundBase = (job: Job): Sha | null => job.roundBase ?? job.pushedSha;
+
+/** HEAD is new this round: ahead of the base branch in the first round, past the round's base in a later one. */
 function newCommit(job: Job, worktree: ReportFacts["worktree"]): boolean {
-  return job.round === 1 ? worktree.ahead > 0 : worktree.headSha !== job.pushedSha;
+  return job.round === 1 ? worktree.ahead > 0 : worktree.headSha !== roundBase(job);
+}
+
+export function containsSha(worktree: { headSha: Sha; commits: readonly Sha[] }, sha: Sha): boolean {
+  return worktree.headSha === sha || worktree.commits.includes(sha);
 }
 
 function commitProblems(job: Job, outcome: Report["outcome"], worktree: ReportFacts["worktree"], base: string): string[] {
@@ -694,7 +719,12 @@ function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts
 }
 
 function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
-  const reasons = commitProblems(job, report.outcome, facts.worktree, "the pushed commit");
+  const base = roundBase(job)!;
+  if (facts.remoteHead !== null && facts.remoteHead !== base) return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead } };
+  const reasons = commitProblems(job, report.outcome, facts.worktree, `${base.slice(0, 7)}, the head of \`${job.branch}\``);
+  if (!containsSha(facts.worktree, base)) {
+    reasons.push(`HEAD does not contain ${base.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`git fetch origin\`, merge \`origin/${job.branch}\`, and report again`);
+  }
   const listed = new Set(facts.listed.map(refKey));
   const replied = report.replies.map((reply) => refKey({ kind: reply.kind, id: reply.commentId }));
   const missing = [...listed].filter((key) => !replied.includes(key));
@@ -730,7 +760,7 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
     { op: "labels", key: `labels:${job.id}:review:${job.round}`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
   ];
   if (report.outcome !== "changes") return ["replying", after];
-  return ["republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: job.pushedSha }, ...after]];
+  return ["republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: roundBase(job) }, ...after]];
 }
 
 function replyEffect(job: Job, reply: RoundReport["replies"][number], answers: Feedback): Extract<Effect, { op: "reply" }> {

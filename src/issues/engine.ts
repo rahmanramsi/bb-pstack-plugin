@@ -26,6 +26,9 @@ import {
   acceptReport,
   parseReport,
   awaitingThread,
+  containsSha,
+  isTransit,
+  TRANSIT,
   counts,
   moreFacts,
   isReasoningLevel,
@@ -51,7 +54,7 @@ import {
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
-import { commentBody, effectMarker, workerInstructions } from "./text.ts";
+import { commentBody, effectMarker, mergeNote, workerInstructions } from "./text.ts";
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
@@ -102,7 +105,7 @@ const isMissing = (error: unknown) => {
 };
 const short = (sha: string) => sha.slice(0, 7);
 
-type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number } | { ok: false; transient: boolean; error: string };
+type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
 
 /** `deadline` is when the claim's lease ends, less a margin to settle; every call the effect makes ends by then. */
 type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>, deadline: number) => Promise<EffectOutcome>;
@@ -158,6 +161,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       headSha: headSha as Sha,
       dirty: workingTree.hasUncommittedChanges || workingTree.files.some((file) => file.status === "??"),
       ahead: mergeBase?.aheadCount ?? 0,
+      commits: (mergeBase?.commits ?? []).map((commit) => commit.sha as Sha),
     };
   }
 
@@ -307,6 +311,16 @@ export function createIssues(deps: IssuesDeps): Issues {
         return done();
       },
     },
+    "check-worktree": {
+      async perform(job, effect, deadline) {
+        const tree = await worktree(job, until(deadline));
+        if (!tree.ok) return tree.transient ? { kind: "retry", error: tree.error, notBefore: null } : { kind: "fail", error: tree.error };
+        if (containsSha(tree, effect.base) || !job.threadId) return done();
+        // Steered into the turn the worker is running, which is the one that would commit on a stale base.
+        await bb.sdk.threads.send({ threadId: job.threadId, mode: "steer-if-active", input: [{ type: "text", text: mergeNote(job, tree.headSha, effect.base), mentions: [] }] });
+        return done();
+      },
+    },
     "stop-thread": {
       async perform(job, _effect, deadline) {
         const signal = until(deadline);
@@ -372,7 +386,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function gather(job: Job): Promise<Facts> {
-    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, pr: null };
+    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
@@ -381,6 +395,13 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     const wanted = [...first, ...moreFacts(job, facts)];
     if (wanted.includes("rounds")) facts.rounds = store.roundSummaries(job.id);
+    if (wanted.includes("remote")) {
+      facts.remote = await github
+        .repo(job.repo)
+        .branchSha(job.branch)
+        .then((head) => ({ head }))
+        .catch((error) => (bb.log.warn(`pstack issues: ${job.id}: could not read ${job.branch}: ${message(error)}`), null));
+    }
     if (wanted.includes("slotFree")) {
       const { busy, ahead } = store.slots(job.id);
       facts.slotFree = ahead < CONCURRENCY - busy;
@@ -477,9 +498,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     try {
       const tree = await worktree(job);
       if (!tree.ok) return { unavailable: tree.error };
+      const remoteHead = job.round === 1 ? null : await github.repo(job.repo).branchSha(job.branch);
+      if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub` };
       return {
         now: clock(),
-        worktree: { headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead },
+        worktree: { headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead, commits: tree.commits },
+        remoteHead,
         gate: job.threadId ? deps.prGate(job.threadId) : { pass: false, reason: "the job has no worker thread" },
         titleConvention: await github.repo(job.repo).titleConvention(),
         listed: store.roundFeedback(job.id, job.round),
@@ -506,7 +530,9 @@ export function createIssues(deps: IssuesDeps): Issues {
       background(tick(named.id));
       return { ok: false, code: "unavailable", message: "pstack has not confirmed this thread as the issue's worker yet, try again shortly" };
     }
-    if (bound.phase.state === "sending") return { ok: false, code: "unavailable", message: "pstack is still starting this round, try again shortly" };
+    if (isTransit(bound.phase.state) && REPORTING.has(TRANSIT[bound.phase.state])) {
+      return { ok: false, code: "unavailable", message: "pstack is still starting this round, try again shortly" };
+    }
     if (!REPORTING.has(bound.phase.state)) return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report` };
     let parsed: ParsedReport;
     try {
@@ -527,6 +553,13 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (!written) return { ok: false, code: "not_working", message: `job ${bound.id} is no longer waiting for a report` };
     const outcome = written.result;
     background(tick(bound.id));
+    if ("moved" in outcome) {
+      return {
+        ok: false,
+        code: "remote_moved",
+        message: `\`${bound.branch}\` on GitHub moved to ${short(outcome.moved)} since this round started. Run \`git fetch origin\`, merge \`origin/${bound.branch}\`, commit, and report again. This does not count as a rejection.`,
+      };
+    }
     if (!outcome.ok) {
       const ended = !REPORTING.has(written.job.phase.state);
       return {
