@@ -127,10 +127,9 @@ test("an unknown-limit host is never away and unreadable limits keep home", () =
   assert.match(pick(facts({ limits: { perHost: new Map([[HOME, 0]]), global: null } })).board.hosts[1].blocker!, /unknown/);
 });
 
-test("personal away targets need no worktree and reuse home preserves the environment", () => {
-  const request: Need = { ...need, home: { kind: "reuse", environmentId: "env", hostId: HOME }, away: { kind: "personal" }, affinity: "home" };
+test("reuse home preserves the environment while home has room", () => {
+  const request: Need = { ...need, home: { kind: "reuse", environmentId: "env", hostId: HOME }, affinity: "home" };
   assert.deepEqual(pick(facts(), [], request).target.environment, { type: "reuse", environmentId: "env" });
-  assert.deepEqual(pick(facts({ occupancy: { requestedAt: 0, threads: threads(HOME, 4) }, worktrees: new Map() }), [], request).target.environment, { type: "host", hostId: BOX, workspace: { type: "personal" } });
 });
 
 test("a pinned branch must be verified at the requested SHA", () => {

@@ -18,8 +18,8 @@ test("fresh worktree flags build a spread Need with the requested project, model
   assert.equal(needFromFlags(parseSpawnFlags({ provider: "other" }), invoking, null).model, null);
 });
 
-test("named machines, here, existing environments, and personal workspaces are pinned", () => {
-  for (const flags of [{ "new-environment": "worktree", machine: "box" }, { "new-environment": "worktree", machine: "here" }, { environment: "env_fixed" }, { "new-environment": "personal" }, {}]) {
+test("named machines, here, and existing environments are pinned", () => {
+  for (const flags of [{ "new-environment": "worktree", machine: "box" }, { "new-environment": "worktree", machine: "here" }, { environment: "env_fixed" }, {}]) {
     const request = needFromFlags(parseSpawnFlags(flags), invoking, flags.machine === "box" || flags.environment ? AWAY : HERE);
     assert.equal(request.away, null);
     assert.equal(request.affinity, "home");
@@ -82,14 +82,14 @@ test("CLI spawns once with parent identity, inherited execution, permission, and
   assert.equal(h.spawns.length, 1);
   assert.deepEqual(h.spawns[0], {
     projectId: "p1", environment: { type: "host", hostId: AWAY, workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } },
-    prompt: "brief", parentThreadId: "thr_origin", startedOnBehalfOf: { initiator: "agent", senderThreadId: "thr_origin" },
+    prompt: "brief", parentThreadId: "thr_origin",
     providerId: "codex", model: "m", reasoningLevel: "high", permissionMode: "full", serviceTier: undefined, title: undefined,
   });
 });
 
 test("CLI forwards model, level, tier, permission, title and project flags", async () => {
   const h = harness();
-  const result = await h.run(["spawn", "--new-environment", "personal", "--machine", "here", "--project", "p2", "--provider", "other", "--model", "new", "--reasoning-level", "max", "--service-tier", "fast", "--permission-mode", "auto", "--title", "Task", "--prompt", "brief"]);
+  const result = await h.run(["spawn", "--new-environment", "worktree", "--machine", "here", "--project", "p2", "--provider", "other", "--model", "new", "--reasoning-level", "max", "--service-tier", "fast", "--permission-mode", "auto", "--title", "Task", "--prompt", "brief"]);
   assert.equal(result.exitCode, 0, result.stderr);
   const args = h.spawns[0];
   assert.equal(args.projectId, "p2");
@@ -100,7 +100,8 @@ test("CLI forwards model, level, tier, permission, title and project flags", asy
   assert.equal(args.serviceTier, "fast");
   assert.equal(args.permissionMode, "auto");
   assert.equal(args.title, "Task");
-  assert.deepEqual(args.environment, { type: "host", hostId: HERE, workspace: { type: "personal" } });
+  assert.deepEqual(args.environment, { type: "host", hostId: HERE, workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } });
+  assert.equal("startedOnBehalfOf" in args, false);
 });
 
 test("a provider override does not inherit a model or level from a different provider", async () => {

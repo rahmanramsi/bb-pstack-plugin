@@ -6,7 +6,7 @@ import { hostId, type HostId, type Need, type Placement } from "./placement.ts";
 const Flags = z.object({
   "parent-self": z.boolean().default(false),
   project: z.string().min(1).optional(),
-  "new-environment": z.enum(["worktree", "personal"]).optional(),
+  "new-environment": z.literal("worktree").optional(),
   environment: z.string().min(1).optional(),
   machine: z.string().min(1).optional(),
   "base-branch": z.string().min(1).optional(),
@@ -46,7 +46,6 @@ export function needFromFlags(flags: SpawnFlags, invoking: Invoking, pinnedHost:
   const baseBranch = flags["base-branch"] ?? null;
   const home: Need["home"] = flags.environment
     ? { kind: "reuse", environmentId: flags.environment, hostId: id }
-    : kind === "personal" ? { kind: "personal", hostId: id }
     : kind === "worktree" || pinnedHost !== null && id !== invoking.hostId
       ? { kind: "worktree", hostId: id, baseBranch }
       : { kind: "reuse", hostId: id, environmentId: invoking.environmentId };
@@ -109,7 +108,7 @@ export function createPlacementCommands({ bb, placement }: { bb: BbPluginApi; pl
       options: {
         "parent-self": { type: "boolean", description: "Make the invoking thread the parent" },
         project: { type: "string", description: "Project id; defaults to the invoking thread's project" },
-        "new-environment": { type: "enum", values: ["worktree", "personal"], description: "Create a fresh worktree or personal workspace" },
+        "new-environment": { type: "enum", values: ["worktree"], description: "Create a fresh worktree" },
         environment: { type: "string", description: "Reuse this environment and pin its machine" },
         machine: { type: "string", description: "Pin an id, name, or here; auto spreads fresh worktrees" },
         "base-branch": { type: "string", description: "Base branch for a fresh worktree" },
@@ -139,7 +138,6 @@ export function createPlacementCommands({ bb, placement }: { bb: BbPluginApi; pl
             spawnArgs = {
               projectId: need.projectId!, environment: target.environment, prompt: text,
               parentThreadId: flags["parent-self"] ? ctx.threadId : undefined,
-              startedOnBehalfOf: { initiator: "agent", senderThreadId: ctx.threadId! },
               providerId, model,
               reasoningLevel: flags["reasoning-level"] ?? (sameProvider && (!flags.model || flags.model === defaults?.model) ? defaults?.reasoningLevel : undefined),
               permissionMode: flags["permission-mode"] ?? defaults?.permissionMode,

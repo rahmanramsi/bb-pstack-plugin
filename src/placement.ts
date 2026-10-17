@@ -17,11 +17,8 @@ export interface Need {
 }
 export type Home =
   | { kind: "reuse"; environmentId: string; hostId: HostId }
-  | { kind: "worktree"; hostId: HostId; baseBranch: string | null }
-  | { kind: "personal"; hostId: HostId };
-export type Away =
-  | { kind: "worktree"; baseBranch: string | null; pin: { sha: string; branch: string } | null }
-  | { kind: "personal" };
+  | { kind: "worktree"; hostId: HostId; baseBranch: string | null };
+export type Away = { kind: "worktree"; baseBranch: string | null; pin: { sha: string; branch: string } | null };
 export interface Target {
   hostId: HostId;
   hostName: string;
@@ -65,13 +62,10 @@ const FACT_TTL_MS = 30_000;
 
 function environment(home: Home | Away, id: HostId): CreateThreadEnvironmentArgs {
   if (home.kind === "reuse") return { type: "reuse", environmentId: home.environmentId };
-  const baseBranch = home.kind === "worktree" ? ("pin" in home && home.pin ? home.pin.branch : home.baseBranch) : null;
+  const baseBranch = "pin" in home && home.pin ? home.pin.branch : home.baseBranch;
   return {
     type: "host", hostId: id,
-    workspace: home.kind === "personal" ? { type: "personal" } : {
-      type: "managed-worktree",
-      baseBranch: baseBranch === null ? { kind: "default" } : { kind: "named", name: baseBranch },
-    },
+    workspace: { type: "managed-worktree", baseBranch: baseBranch === null ? { kind: "default" } : { kind: "named", name: baseBranch } },
   };
 }
 
