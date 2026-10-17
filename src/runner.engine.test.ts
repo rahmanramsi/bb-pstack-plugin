@@ -154,6 +154,18 @@ test("start with the same request key returns the existing run without spawning 
   await assert.rejects(h.runner.start(RunPlan.parse({ ...PANEL_INPUT, requestKey: "review-1", title: "Other" }), "thr_origin"), { code: "request_key_conflict" });
 });
 
+test("a pstack delegate without worker metadata leaves every run untouched when it goes idle or fails", async () => {
+  const h = harness();
+  const { runId } = await h.runner.start(PANEL, "thr_origin");
+  h.threads.set("thr_delegate", { id: "thr_delegate", status: "idle", archivedAt: null, deletedAt: null, output: "done", metadata: {}, originPluginId: "pstack" });
+  const before = JSON.stringify(h.runner.view(runId, "thr_origin"));
+  await h.runner.onIdle("thr_delegate", "done");
+  await h.runner.onFailed("thr_delegate", "boom");
+  assert.equal(JSON.stringify(h.runner.view(runId, "thr_origin")), before);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.spawned.length, 2);
+});
+
 test("a panel runs seats, then the judge, then tells the origin once with every outcome", async () => {
   const h = harness();
   const { runId } = await h.runner.start(PANEL, "thr_origin");

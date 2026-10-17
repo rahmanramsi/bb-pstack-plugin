@@ -88,7 +88,7 @@ function harness(options: { existing?: boolean; startError?: Error } = {}) {
     log: { error() {}, warn() {} },
   } as unknown as BbPluginApi;
 
-  const feature = createRunFeature({ bb, runner, isRunWorker: (id) => id === "thr_w1", footer: (threadId) => `Open steps for ${threadId}: 2`, skills: ["poteto-mode", "swarm"] });
+  const feature = createRunFeature({ bb, runner, footer: (threadId) => `Open steps for ${threadId}: 2`, skills: ["poteto-mode", "swarm"] });
   const cli = defineCli({ name: "pstack", summary: "pstack", commands: feature.commands });
   const run = (argv: string[], ctx: { threadId?: string; cwd?: string } = { threadId: "thr_origin", cwd: "/work/repo" }) => cli.run(argv, ctx);
   return { feature, run, started, submitted, reads, handlers, tools, services, observed, configure: () => configure! };
@@ -191,8 +191,6 @@ test("register exposes pstack_result only to structured workers, wires events, a
   await h.handlers.get("thread.idle")!({ thread: { id: "thr_w1", originPluginId: "pstack" }, lastAssistantText: "done" });
   await h.handlers.get("thread.idle")!({ thread: { id: "thr_user", originPluginId: null }, lastAssistantText: "hi" });
   await h.handlers.get("thread.failed")!({ thread: { id: "thr_w1", originPluginId: "pstack" }, error: "boom" });
-  await h.handlers.get("thread.idle")!({ thread: { id: "thr_delegate", originPluginId: "pstack" }, lastAssistantText: "done" });
-  await h.handlers.get("thread.failed")!({ thread: { id: "thr_delegate", originPluginId: "pstack" }, error: "boom" });
   await h.handlers.get("thread.archived")!({ thread: { id: "thr_origin" } });
   await h.handlers.get("thread.deleted")!({ thread: { id: "thr_w2" } });
   assert.deepEqual(h.observed, ["idle:thr_w1", "failed:thr_w1", "gone:thr_origin", "gone:thr_w2"]);

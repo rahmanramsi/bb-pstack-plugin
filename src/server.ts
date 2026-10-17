@@ -148,7 +148,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const runs = createRunFeature({ bb, runner, isRunWorker, footer: checklist.footer, skills: skillNames() });
+  const runs = createRunFeature({ bb, runner, footer: checklist.footer, skills: skillNames() });
   runs.register();
 
   bb.events.on("thread.idle", ({ thread }) => {
