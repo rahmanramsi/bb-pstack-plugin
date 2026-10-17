@@ -43,6 +43,7 @@ import {
   type RepoName,
   type ReportFacts,
   type Sha,
+  type WorkerProblem,
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
@@ -63,6 +64,11 @@ export type IssuesDeps = {
   repos: () => readonly RepoMapping[];
   resolveRole: (role: string) => readonly ModelChoice[];
   prGate: (threadId: string) => GateFact;
+  /**
+   * Why the host cannot run this `provider/model/level` tuple, or null when it can. Throws when it cannot tell, such as
+   * while the host is offline.
+   */
+  checkWorker: (hostId: string, tuple: string) => Promise<string | null>;
   /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
   activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
@@ -259,17 +265,26 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function resolveWorker(projectId: string): Promise<WorkerSettings | { error: string }> {
+  async function resolveWorker(job: Job): Promise<WorkerSettings | WorkerProblem> {
+    const permanent = (error: string): WorkerProblem => ({ error, permanent: true });
     const choice = deps.resolveRole("issue worker")[0];
-    if (!choice) return { error: "no model is configured for the issue worker role" };
-    const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId });
-    const permissionMode = defaults?.permissionMode ?? null;
-    if (choice.kind === "tuple") {
-      if (!isReasoningLevel(choice.reasoningLevel)) return { error: `the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows` };
-      return { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
+    if (!choice) return permanent("no model is configured for the issue worker role");
+    try {
+      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: job.projectId });
+      const permissionMode = defaults?.permissionMode ?? null;
+      let worker: WorkerSettings;
+      if (choice.kind === "tuple") {
+        if (!isReasoningLevel(choice.reasoningLevel)) return permanent(`the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows`);
+        worker = { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
+      } else {
+        if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
+        worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
+      }
+      const problem = await deps.checkWorker(job.hostId, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
+      return problem ? permanent(problem) : worker;
+    } catch (error) {
+      return { error: message(error), permanent: false };
     }
-    if (!defaults) return { error: `the issue worker role inherits the project's model, and project ${projectId} has no default` };
-    return { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
   }
 
   async function threadFact(threadId: string | null): Promise<Facts["thread"]> {
@@ -292,7 +307,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       const { busy, ahead } = store.slots(job.id);
       facts.slotFree = ahead < CONCURRENCY - busy;
     }
-    if (wanted.includes("worker") && facts.slotFree) facts.worker = await resolveWorker(job.projectId).catch((error) => ({ error: message(error) }));
+    if (wanted.includes("worker") && facts.slotFree) facts.worker = await resolveWorker(job);
     if (wanted.includes("thread")) facts.thread = await threadFact(job.threadId);
     if (facts.thread?.kind === "idle" && job.threadId) {
       const threadId = job.threadId;

@@ -80,11 +80,13 @@ function apply(current: Job, change: Change): Job {
 test("a queued job starts only with a free slot and resolved worker settings, labelling before it spawns", () => {
   const queued = job();
   assert.equal(plan(queued, facts({ slotFree: false, worker: WORKER })), null);
-  assert.deepEqual(plan(queued, facts({ slotFree: true, worker: { error: "no model for issue worker" } })), {
+  const offline = { error: "the host is offline", permanent: false };
+  assert.deepEqual(plan(queued, facts({ slotFree: true, worker: offline })), { type: "change", change: { error: "the host is offline" } });
+  assert.equal(plan(job({ error: "the host is offline" }), facts({ slotFree: true, worker: offline })), null);
+  assert.deepEqual(plan(queued, facts({ slotFree: true, worker: { error: "no model for issue worker", permanent: true } })), {
     type: "change",
-    change: { error: "no model for issue worker" },
+    change: { phase: { state: "stuck" }, deadline: null, error: "no model for issue worker" },
   });
-  assert.equal(plan(job({ error: "no model for issue worker" }), facts({ slotFree: true, worker: { error: "no model for issue worker" } })), null);
 
   const action = plan(queued, facts({ slotFree: true, worker: WORKER }));
   assert.equal(action?.type, "change");

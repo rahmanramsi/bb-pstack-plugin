@@ -124,7 +124,7 @@ export default async function plugin(bb: BbPluginApi) {
   const checklistStore = openChecklistStore(db);
   const runner = createRunner(bb, runStore, resolveRole, Date.now, async (tuples, environmentId) => {
     const ids = [...new Set(tuples.map((tuple) => tuple.split("/")[0]!))];
-    const catalog = await loadCatalog(bb, environmentId, ids);
+    const catalog = await loadCatalog(bb, environmentId ? { environmentId } : {}, ids);
     return tuples.flatMap((tuple) => {
       const check = checkTuple(tuple, catalog);
       return check.ok ? [] : [`${tuple}: ${check.detail}`];
@@ -181,6 +181,15 @@ export default async function plugin(bb: BbPluginApi) {
       return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
     },
     activeWork,
+    checkWorker: async (hostId, tuple) => {
+      const provider = tuple.split("/")[0]!;
+      const catalog = await loadCatalog(bb, { hostId }, [provider]);
+      const check = checkTuple(tuple, catalog);
+      if (check.ok) return null;
+      // A catalog that failed to load says nothing about the tuple, so the job waits instead of sticking.
+      if (catalog.get(provider)?.state === "error") throw new Error(`${tuple}: ${check.detail}`);
+      return `${tuple}: ${check.detail}`;
+    },
   });
   issues.register();
 
@@ -294,7 +303,7 @@ export default async function plugin(bb: BbPluginApi) {
               const thread = await bb.sdk.threads.get({ threadId: ctx.threadId });
               environmentId = thread.environmentId ?? undefined;
             }
-            const catalog = await loadCatalog(bb, environmentId, providerIds(roles));
+            const catalog = await loadCatalog(bb, environmentId ? { environmentId } : {}, providerIds(roles));
             const checks: Check[] = checkRoles(roles, catalog);
             const failed = failedChecks(checks);
             return {

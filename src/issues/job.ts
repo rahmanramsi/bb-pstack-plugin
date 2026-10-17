@@ -184,6 +184,11 @@ export type ThreadFact =
   | { kind: "gone" };
 
 export type WorkerSettings = Omit<SpawnSpec, "title" | "prompt">;
+/**
+ * Why a queued job's worker cannot be resolved. `permanent` when only an operator can fix it, such as a model the host
+ * does not have: the job sticks with the reason instead of waiting.
+ */
+export type WorkerProblem = { error: string; permanent: boolean };
 
 export type GateFact = { pass: true } | { pass: false; reason: string };
 
@@ -191,7 +196,7 @@ export type GateFact = { pass: true } | { pass: false; reason: string };
 export type Facts = {
   now: number;
   slotFree: boolean | null;
-  worker: WorkerSettings | { error: string } | null;
+  worker: WorkerSettings | WorkerProblem | null;
   thread: ThreadFact | null;
   /**
    * For an idle worker: whether it is waiting on its own pstack runs or child threads. Their results wake it, so it has
@@ -258,7 +263,10 @@ export function plan(job: Job, facts: Facts): Action | null {
   switch (phase.state) {
     case "queued": {
       if (!facts.slotFree || !facts.worker) return null;
-      if ("error" in facts.worker) return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
+      if ("error" in facts.worker) {
+        if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
+        return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
+      }
       return { type: "change", change: start(job, facts.worker, now) };
     }
     case "working": {

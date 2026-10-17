@@ -19,6 +19,7 @@ const APP = "pstack-test[bot]";
 const MIN = 60_000;
 const SHA1 = "1".repeat(40);
 const SHA2 = "2".repeat(40);
+const CATALOG = new Set(["codex/gpt-6.1-sol/high", "claude-code/claude-opus-5-5/high"]);
 
 /** A held call: the fake applies the side effect, then waits here, as if the process died before it returned. */
 type Hold = { key: string; hit: Promise<void>; reached(): void; release: Promise<void>; free(): void };
@@ -257,7 +258,12 @@ function harness() {
         return { content, contentEncoding: "utf8" };
       },
     },
-    projects: { defaultExecutionOptions: async () => ({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", permissionMode: "full", serviceTier: "default" }) },
+    projects: {
+      async defaultExecutionOptions({ projectId }: { projectId: string }) {
+        if (projectId === "prj_offline") throw new Error("project settings are unavailable");
+        return { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", permissionMode: "full", serviceTier: "default" };
+      },
+    },
     system: { config: async () => ({ primaryHostId: "host_server" }) },
   };
 
@@ -302,6 +308,10 @@ function harness() {
       resolveRole: (role) => (role === "issue worker" ? [parseChoice(workerRole)!] : []),
       prGate: () => (failures.gate ? { pass: false, reason: failures.gate } : { pass: true }),
       activeWork: async () => ({ ...work }),
+      checkWorker: async (hostId: string, tuple: string) => {
+        assert.equal(hostId, "host_worker");
+        return CATALOG.has(tuple) ? null : `${tuple}: not in the host's catalog`;
+      },
       clock: () => clock.now,
     });
     const cli = defineCli({ name: "pstack", summary: "pstack", commands: issues.commands });
@@ -662,14 +672,18 @@ test("a worker cannot stop jobs, and a thread naming a job that is not waiting f
   assert.deepEqual(h.stopped, ["thr_dup"]);
 });
 
-test("a worker role with a reasoning level bb does not know never reaches a spawn", async () => {
-  const h = harness();
-  h.setWorkerRole("codex/gpt-6.1-sol/extreme");
-  h.label(41);
-  await h.engine().issues.sweep();
-  const job = await h.only();
-  assert.equal(h.spawned.length, 0);
-  assert.match(job.error!, /reasoning level "extreme"/);
+test("a worker role bb cannot run sticks the job at once with the reason, before any label or spawn", async () => {
+  for (const [role, reason] of [["codex/gpt-6.1-sol/extreme", /reasoning level "extreme"/], ["codex/gpt-missing/high", /codex\/gpt-missing\/high: not in the host's catalog/]] as const) {
+    const h = harness();
+    h.setWorkerRole(role);
+    h.label(41);
+    await h.engine().issues.sweep();
+    const job = await h.only();
+    assert.equal(job.state, "stuck");
+    assert.match(job.error!, reason);
+    assert.equal(h.spawned.length, 0);
+    assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
+  }
 });
 
 test("an effect's handler has a probe exactly when its policy looks for a trace before running it again", () => {
