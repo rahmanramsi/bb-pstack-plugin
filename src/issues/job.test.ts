@@ -61,7 +61,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, waiting: null, gate: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);

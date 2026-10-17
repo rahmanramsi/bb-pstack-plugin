@@ -185,19 +185,28 @@ export type ThreadFact =
 
 export type WorkerSettings = Omit<SpawnSpec, "title" | "prompt">;
 
+export type GateFact = { pass: true } | { pass: false; reason: string };
+
 /** Observations the row does not own. The engine gathers only those FACTS_FOR names for the state. */
 export type Facts = {
   now: number;
   slotFree: boolean | null;
   worker: WorkerSettings | { error: string } | null;
   thread: ThreadFact | null;
+  /**
+   * For an idle worker: whether it is waiting on its own pstack runs or child threads. Their results wake it, so it has
+   * not stopped.
+   */
+  waiting: boolean | null;
+  /** For an idle worker: `gate pr` on its checklist, which the nudge names when it fails. */
+  gate: GateFact | null;
 };
 
-export const FACTS_FOR: { readonly [S in JobState]: readonly ("slotFree" | "worker" | "thread")[] } = {
+export const FACTS_FOR: { readonly [S in JobState]: readonly ("slotFree" | "worker" | "thread" | "waiting" | "gate")[] } = {
   ignored: [],
   queued: ["slotFree", "worker"],
   starting: [],
-  working: ["thread"],
+  working: ["thread", "waiting", "gate"],
   publishing: [],
   asking: [],
   "needs-info": [],
@@ -264,9 +273,9 @@ export function plan(job: Job, facts: Facts): Action | null {
         case "failed":
           return { type: "change", change: stick(job, `the worker thread failed: ${thread.error}`) };
         case "idle":
-          if (thread.since <= job.updatedAt) return null;
+          if (thread.since <= job.updatedAt || facts.waiting) return null;
           if (job.nudges >= MAX_NUDGES) return { type: "change", change: stick(job, "the worker stopped without reporting") };
-          return { type: "nudge", text: nudgeText(job), change: { nudges: job.nudges + 1 } };
+          return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
         case "active":
           return job.deadline === null ? null : { type: "sleep", until: job.deadline };
       }
@@ -392,7 +401,7 @@ export type ReportFacts = {
    */
   newCommit: boolean;
   /** `gate pr` on the worker thread's checklist. Only the first round checks it. */
-  gate: { pass: true } | { pass: false; reason: string };
+  gate: GateFact;
   titleConvention: "conventional" | "free";
   /** Comment ids the round listed. Always empty in step 1, so any reply is rejected. */
   listedCommentIds: readonly number[];
@@ -601,10 +610,11 @@ export function workerInstructions(job: Job): string {
   ].join("\n");
 }
 
-function nudgeText(job: Job): string {
+function nudgeText(job: Job, gate: GateFact | null): string {
   return [
     "You stopped without reporting. Write your report JSON to a file and run:",
     "`bb pstack issues report --file <path>`",
+    ...(gate && !gate.pass && job.pushedSha === null ? [`A \`changes\` report needs \`bb pstack gate pr\` to pass, and it fails: ${gate.reason}`] : []),
     `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}. If the worker stops again without reporting, the job ends as stuck.`,
   ].join("\n");
 }

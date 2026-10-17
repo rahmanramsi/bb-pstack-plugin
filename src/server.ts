@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { gate } from "./checklist.ts";
+import { gate, renderOpenSteps } from "./checklist.ts";
 import { createChecklistFeature } from "./checklist-commands.ts";
 import { openChecklistStore } from "./checklist-store.ts";
 import { STATE_CHANNEL } from "./contract.ts";
@@ -131,15 +131,17 @@ export default async function plugin(bb: BbPluginApi) {
     });
   });
 
+  const activeWork = async (threadId: string) => {
+    const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
+    const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
+    return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
+  };
+
   const checklist = createChecklistFeature({
     bb,
     store: checklistStore,
     skillsDir: SKILLS_DIR,
-    activeWork: async (threadId) => {
-      const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
-      const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
-      return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
-    },
+    activeWork,
     publish: (threadId) => bb.realtime.publish(STATE_CHANNEL, { threadId, revision: Date.now() }),
     evidenceError: async (evidence, threadId) => {
       if (evidence.kind === "thread") {
@@ -174,14 +176,16 @@ export default async function plugin(bb: BbPluginApi) {
     },
     resolveRole,
     prGate: (threadId) => {
-      const result = gate("pr", checklistStore.checklist(threadId));
-      return result.pass ? result : { pass: false, reason: result.reason };
+      const state = checklistStore.checklist(threadId);
+      const result = gate("pr", state);
+      return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
     },
+    activeWork,
   });
   issues.register();
 
   bb.events.on("thread.idle", ({ thread }) => {
-    if (thread.originPluginId === bb.pluginId && !issues.isWorker(thread.id)) return;
+    if (thread.originPluginId === bb.pluginId) return;
     return checklist.onIdle(thread.id).catch((error) => bb.log.error(`pstack nudge: ${error instanceof Error ? error.message : String(error)}`));
   });
 

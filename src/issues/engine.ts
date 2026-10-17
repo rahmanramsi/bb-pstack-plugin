@@ -37,6 +37,7 @@ import {
   type EffectOp,
   type EffectOutcome,
   type Facts,
+  type GateFact,
   type Job,
   type JobId,
   type RepoName,
@@ -61,7 +62,9 @@ export type IssuesDeps = {
   /** Configured repositories; empty while issue workers are not set up. */
   repos: () => readonly RepoMapping[];
   resolveRole: (role: string) => readonly ModelChoice[];
-  prGate: (threadId: string) => { pass: true } | { pass: false; reason: string };
+  prGate: (threadId: string) => GateFact;
+  /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
+  activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
 };
 
@@ -72,8 +75,6 @@ export type Issues = {
   register(): void;
   /** Standing instructions for a thread bound to an open job, else null. */
   instructions(threadId: string): string | null;
-  /** A thread that is, or was, an issue job's worker. */
-  isWorker(threadId: string): boolean;
   /** One pass of the service: poll every repository, then reconcile every open job. */
   sweep(): Promise<void>;
 };
@@ -286,13 +287,22 @@ export function createIssues(deps: IssuesDeps): Issues {
 
   async function gather(job: Job): Promise<Facts> {
     const wanted = FACTS_FOR[job.phase.state];
-    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null };
+    const facts: Facts = { now: clock(), slotFree: null, worker: null, thread: null, waiting: null, gate: null };
     if (wanted.includes("slotFree")) {
       const { busy, ahead } = store.slots(job.id);
       facts.slotFree = ahead < CONCURRENCY - busy;
     }
     if (wanted.includes("worker") && facts.slotFree) facts.worker = await resolveWorker(job.projectId).catch((error) => ({ error: message(error) }));
     if (wanted.includes("thread")) facts.thread = await threadFact(job.threadId);
+    if (facts.thread?.kind === "idle" && job.threadId) {
+      const threadId = job.threadId;
+      if (wanted.includes("waiting")) {
+        const work = await deps.activeWork(threadId).catch(() => null);
+        // Unknown counts as waiting: a missed nudge costs a sweep, a wrong one costs the job.
+        facts.waiting = work === null || work.activeRuns > 0 || work.activeChildren > 0;
+      }
+      if (wanted.includes("gate")) facts.gate = deps.prGate(threadId);
+    }
     return facts;
   }
 
@@ -548,7 +558,6 @@ export function createIssues(deps: IssuesDeps): Issues {
       const job = openJob(threadId);
       return job ? workerInstructions(job) : null;
     },
-    isWorker: (threadId) => store.byThread(threadId) !== null,
     async sweep() {
       await poll();
       await tickDue();

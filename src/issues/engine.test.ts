@@ -178,6 +178,7 @@ function harness() {
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
   const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null };
+  const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
@@ -300,6 +301,7 @@ function harness() {
       repos: () => [repoLine],
       resolveRole: (role) => (role === "issue worker" ? [parseChoice(workerRole)!] : []),
       prGate: () => (failures.gate ? { pass: false, reason: failures.gate } : { pass: true }),
+      activeWork: async () => ({ ...work }),
       clock: () => clock.now,
     });
     const cli = defineCli({ name: "pstack", summary: "pstack", commands: issues.commands });
@@ -353,6 +355,7 @@ function harness() {
     stopped,
     pushes,
     failures,
+    work,
     events,
     services,
     store,
@@ -405,7 +408,6 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
   });
   assert.match(prompt, /^\/poteto-mode /);
   assert.match(prompt, /untrusted GitHub user[\s\S]*```text\nSubmit button hides behind the footer\n\nOn 375px/);
-  assert.ok(h.engine().issues.isWorker(started.threadId!));
   assert.match(h.engine().issues.instructions(started.threadId!)!, /built-in PR tool/);
 
   const accepted = await h.report(started.threadId!, GOOD);
@@ -694,4 +696,27 @@ test("stopping a job waiting in review or needs-info removes that label from the
     assert.equal((await h.only()).state, "stopped");
     assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
   }
+});
+
+test("an idle worker waiting on its own runs or child threads is not reminded; once it stops, the reminder names the failing gate", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  const thread = h.threads.get(working.threadId!)!;
+  for (const busy of [{ activeRuns: 1, activeChildren: 0 }, { activeRuns: 0, activeChildren: 2 }, { activeRuns: 1, activeChildren: 0 }]) {
+    Object.assign(h.work, busy);
+    h.clock.now += MIN;
+    Object.assign(thread, { status: "idle", updatedAt: h.clock.now });
+    h.clock.now += 1;
+    await h.settle();
+  }
+  assert.equal(h.sent.length, 0);
+  assert.equal((await h.only()).state, "working");
+
+  Object.assign(h.work, { activeRuns: 0, activeChildren: 0 });
+  h.failures.gate = "2 open steps block the pr gate.\n4. [Verify] Run the tests";
+  await h.settle();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0]!.input[0].text, /gate pr` to pass, and it fails: 2 open steps block the pr gate\.\n4\. \[Verify\] Run the tests/);
 });
