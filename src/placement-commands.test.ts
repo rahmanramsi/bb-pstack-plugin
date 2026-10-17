@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { defineCli, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createPlacementCommands, needFromFlags, parseSpawnFlags } from "./placement-commands.ts";
+import type { Checkouts } from "./checkouts.ts";
 import { createPlacement, hostId, type Need } from "./placement.ts";
 
 const HERE = hostId.parse("host_here");
@@ -34,8 +35,10 @@ test("auto without a fresh worktree and conflicting placement flags fail at the 
 });
 
 type SpawnArgs = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0];
-function harness(options: { failSpawn?: boolean; nullDefaults?: boolean } = {}) {
+function harness(options: { failSpawn?: boolean; nullDefaults?: boolean; sources?: string[] } = {}) {
   const spawns: SpawnArgs[] = [];
+  const notices: unknown[][] = [];
+  const asks: unknown[][] = [];
   const reads: { path: string; hostId?: string }[] = [];
   const requested: Need[] = [];
   const bb = {
@@ -54,6 +57,7 @@ function harness(options: { failSpawn?: boolean; nullDefaults?: boolean } = {}) 
         get: async ({ environmentId }: { environmentId: string }) => ({ hostId: environmentId === "env_fixed" ? AWAY : HERE }),
         listProviders: async () => [{ id: "git-worktree", availability: { status: "available" } }],
       },
+      projects: { get: async () => ({ sources: (options.sources ?? [HERE, AWAY]).map((id) => ({ hostId: id })) }) },
       hosts: { list: async () => [HERE, AWAY].map((id) => ({ id, name: id === HERE ? "Laptop" : "Box", status: "connected", lifecycle: { phase: "active" } })) },
       providers: {
         list: async () => [{ id: "codex", available: true }],
@@ -69,9 +73,15 @@ function harness(options: { failSpawn?: boolean; nullDefaults?: boolean } = {}) 
   } as unknown as BbPluginApi;
   const service = createPlacement(bb, { exec: async () => JSON.stringify({ globalLimit: null, hosts: [{ id: HERE, effectiveLimit: 1 }, { id: AWAY, effectiveLimit: 2 }] }) });
   const placement = { ...service, place: (need: Need, issue: Parameters<typeof service.place>[1]) => { requested.push(need); return service.place(need, issue); } };
-  const commands = createPlacementCommands({ bb, placement });
+  const checkouts: Checkouts = {
+    notice: (...args) => { notices.push(args); },
+    ask: async (...args) => { asks.push(args); return { kind: "opened", hosts: [{ id: AWAY, name: "Box" }] }; },
+    publishProof: () => false,
+    verdict: async () => null,
+  };
+  const commands = createPlacementCommands({ bb, placement, checkouts });
   const cli = defineCli({ name: "pstack", summary: "pstack", commands });
-  return { spawns, reads, requested, commands, service, run: (argv: string[], ctx = { threadId: "thr_origin", cwd: "/repo" }) => cli.run(argv, ctx) };
+  return { spawns, reads, requested, commands, service, notices, asks, run: (argv: string[], ctx = { threadId: "thr_origin", cwd: "/repo" }) => cli.run(argv, ctx) };
 }
 
 test("CLI spawns once with parent identity, inherited execution, permission, and chosen environment", async () => {
@@ -176,4 +186,28 @@ test("machines prints host and global load and validates model pairs", async () 
 
 test("prompt exposes the SDK stdin option for --prompt-stdin transport rewriting", () => {
   assert.equal(harness().commands.spawn.options?.prompt.stdin, true);
+});
+
+test("a spawn that finds home full and a machine without a checkout asks about it after spawning", async () => {
+  const h = harness({ sources: [HERE] });
+  const result = await h.run(["spawn", "--new-environment", "worktree", "--prompt", "brief", "--json"]);
+  assert.equal(result.exitCode, 0, result.stdout);
+  assert.equal(JSON.parse(result.stdout!).target.where, "home");
+  assert.equal(h.spawns.length, 1);
+  assert.deepEqual(h.notices, [["thr_origin", "p1", [{ id: AWAY, name: "Box" }]]]);
+  await h.run(["spawn", "--new-environment", "worktree", "--prompt", "brief", "--dry-run"]);
+  assert.equal(h.notices.length, 1);
+  const checkedOut = harness();
+  await checkedOut.run(["spawn", "--new-environment", "worktree", "--prompt", "brief"]);
+  assert.deepEqual(checkedOut.notices, []);
+});
+
+test("machines shows clone consent for machines without a checkout and asks on request", async () => {
+  const h = harness({ sources: [HERE] });
+  assert.match((await h.run(["machines"])).stdout!, /host_away.*no checkout of this project; clone undecided, ask with --ask-clone/);
+  assert.deepEqual(h.asks, []);
+  const asked = await h.run(["machines", "--ask-clone"]);
+  assert.deepEqual(h.asks, [["thr_origin", "p1"]]);
+  assert.match(asked.stdout!, /opened the checkout form in this thread for Box/);
+  assert.deepEqual(JSON.parse((await h.run(["machines", "--ask-clone", "--json"])).stdout!).askClone.kind, "opened");
 });

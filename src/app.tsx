@@ -5,6 +5,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import { Button } from "../components/ui/button.tsx";
 import type { rpcContract } from "./rpc.ts";
+import { CHECKOUT_RENDERER } from "./checkout-form.ts";
+import { CheckoutConsent } from "./ui/consent.tsx";
 import { bannerSummary, directiveRunId, panelRunId } from "./ui/layout.ts";
 import { useRunView, useThreadView } from "./ui/live.ts";
 import { Agreement, ChecklistPanel, Disclosure, Findings, LoadMessage, PanelFlow, RunHeading, RunOverview, Timeline, Workers } from "./ui/views.tsx";
@@ -119,5 +121,6 @@ function Inspector({ threadId, params }: PluginThreadPanelProps) {
 export default definePluginApp((app) => {
   app.slots.messageDirective({ id: "pstack-run", component: RunDirective });
   app.composer.customize({ id: "pstack-status", scopes: ["thread"], banners: [{ id: "runs-and-checklist", chrome: "bare", component: ComposerBanner }] });
+  app.slots.pendingInteraction({ id: CHECKOUT_RENDERER, component: CheckoutConsent });
   app.slots.threadPanelAction({ id: PANEL_ACTION, title: "pstack runs and checklist", icon: "Layers", layout: "flush", component: Inspector });
 });

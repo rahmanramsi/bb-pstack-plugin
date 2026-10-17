@@ -11,6 +11,7 @@ import { openDatabase } from "./store.ts";
 import { createPlacement } from "./placement.ts";
 import { createPlacementCommands } from "./placement-commands.ts";
 import { registerDispatchGuard } from "./dispatch-guard.ts";
+import { createCheckouts, parseCheckouts } from "./checkouts.ts";
 import {
   PluginCliError,
   cliCommand,
@@ -42,6 +43,11 @@ const EMPTY_CONFIG: ModelConfig = { budget: null, roles: new Map() };
 
 const modelsSchema = z.string().superRefine((value, ctx) => {
   const parsed = parseModelConfig(value);
+  if (!parsed.ok) ctx.addIssue({ code: "custom", message: parsed.errors.join("; ") });
+});
+
+const checkoutsSchema = z.string().superRefine((value, ctx) => {
+  const parsed = parseCheckouts(value);
   if (!parsed.ok) ctx.addIssue({ code: "custom", message: parsed.errors.join("; ") });
 });
 
@@ -104,6 +110,15 @@ export default async function plugin(bb: BbPluginApi) {
         "Refuse an agent's plain `bb thread spawn` into a fresh worktree when its machine is full and another machine has room, and point the agent at `bb pstack spawn`.",
       default: true,
     },
+    checkouts: {
+      type: "string",
+      label: "Checkouts",
+      description:
+        "Where pstack may clone a project so delegates can run there. One `<projectId|*> allow|deny <hostId|*>` line per rule. The most specific rule wins; deny wins a tie. A machine with no rule is asked about in the thread when it would help.",
+      experimental_multiline: true,
+      experimental_schema: checkoutsSchema,
+      default: "",
+    },
   });
 
   let { models: modelsText, placementGuard } = await settings.get();
@@ -126,6 +141,10 @@ export default async function plugin(bb: BbPluginApi) {
   const isRunWorker = (threadId: string) => runStore.attemptByThread(threadId) !== null;
   const placement = createPlacement(bb);
   registerDispatchGuard(bb, placement, () => placementGuard);
+  const checkouts = createCheckouts(bb, {
+    get: async () => (await settings.get()).checkouts,
+    set: async (text) => { await settings.experimental_set({ checkouts: text }); },
+  });
   const checklistStore = openChecklistStore(db);
   const runner = createRunner(bb, runStore, {
     resolveRole,
@@ -207,6 +226,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
     pstackStopRun: async ({ threadId, runId }) => ({ stopped: await runner.stop(runId as RunId, threadId) }),
+    pstackCheckoutProof: async ({ formId }) => ({ sent: checkouts.publishProof(formId) }),
   });
 
   bb.cli.register(
@@ -216,7 +236,7 @@ export default async function plugin(bb: BbPluginApi) {
       commands: {
         ...checklist.commands,
         ...runs.commands,
-        ...createPlacementCommands({ bb, placement }),
+        ...createPlacementCommands({ bb, placement, checkouts }),
         models: cliCommand({
           summary:
             "Print the effective role-to-model table (configured values merged over defaults)",
