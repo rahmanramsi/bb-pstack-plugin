@@ -358,7 +358,7 @@ test("a spawn spec takes only the reasoning levels bb's SDK accepts", () => {
 
 test("feedback counts per the operator's rules: /agent conversation comments, and reviews that are not approved or dismissed", () => {
   const item = (kind: "review" | "review-comment" | "pr-comment", body: string, reviewState: string | null) =>
-    counts({ kind, id: 1, pr: 7, author: "maya", body, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, reviewState });
+    counts({ kind, id: 1, pr: 7, author: "maya", body, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, postedAt: NOW, reviewState });
   assert.equal(item("pr-comment", "  /Agent please add a test", null), true);
   assert.equal(item("pr-comment", "Looks good, but please add a test", null), false);
   assert.equal(item("pr-comment", "/agents", null), false);
@@ -385,8 +385,9 @@ const inline = (id: number, createdAt: number, author = "maya"): Feedback => ({
   inReplyTo: null,
   reviewId: 500,
   createdAt,
+  postedAt: createdAt,
 });
-const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A few things.\nSee inline.", path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW - 3 * MIN };
+const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A few things.\nSee inline.", path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW - 3 * MIN, postedAt: NOW - 3 * MIN };
 const inReview = (overrides: Partial<Job> = {}) =>
   job({ phase: { state: "review" }, threadId: "thr_w", pushedSha: PUSHED, pr: PR, worker: WORKER, report: { ...REPORT, headSha: PUSHED, acceptedAt: NOW - 60 * MIN }, ...overrides });
 const pending = (items: Feedback[]) => ({ feedback: { pending: items, rounds: [{ ordinal: 1, summary: "Footer overlap fixed." }] }, pr: { state: "open" as const }, slotFree: true, thread: { kind: "idle" as const, since: NOW - MIN } });
@@ -556,7 +557,7 @@ test("text posted on GitHub carries no pstack marker the service did not append 
   const marker = "<!-- pstack:reply:psi_x:2:review-comment:9 -->";
   const nested = "<!-<!-- pstack:a -->- pstack:b -->";
   assert.equal(prBody(`Fixed.${marker}\n${nested}`, 41), "Fixed.\n\nCloses #41");
-  const quoted = { kind: "review", id: 5, author: "maya", body: `Please rename ${marker}`, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW } as const;
+  const quoted = { kind: "review", id: 5, author: "maya", body: `Please rename ${marker}`, path: null, line: null, diffHunk: null, inReplyTo: null, reviewId: null, createdAt: NOW, postedAt: NOW } as const;
   assert.equal(replyText(`Renamed. ${marker}`, quoted), "> Please rename \n\nRenamed.");
   assert.doesNotMatch(issueText(nested), /pstack:/);
 });

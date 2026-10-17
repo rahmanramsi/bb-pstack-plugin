@@ -166,6 +166,9 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     return [201, reply];
   }
   if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)\/reviews$/.exec(path)) && method === "GET") return etagged(gh.reviews.get(Number(match[1])) ?? []);
+  if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)\/reviews\/(\d+)\/comments$/.exec(path)) && method === "GET") {
+    return [200, (gh.reviewComments.get(Number(match[1])) ?? []).filter((comment) => comment.pull_request_review_id === Number(match![2]))];
+  }
   if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)\/requested_reviewers$/.exec(path)) && method === "POST") {
     if (body.reviewers.some((reviewer: string) => !["write", "maintain", "admin"].includes(gh.permissions.get(reviewer) ?? ""))) return [422, { message: "Reviews may only be requested from collaborators." }];
     for (const reviewer of body.reviewers) pullOf(match[1]!).requested.add(reviewer);
@@ -465,11 +468,13 @@ export function harness() {
     return { job, pr: job.pr!.number };
   };
   /** A submitted review with its inline comments, now. Returns the review id and the comment ids. */
-  const review = (pr: number, input: { author?: string; state?: string; body?: string; comments?: string[] }) => {
+  /** `draftedAt`: when the reviewer wrote the inline comments, which GitHub keeps as their times after submission. */
+  const review = (pr: number, input: { author?: string; state?: string; body?: string; comments?: string[]; draftedAt?: number }) => {
     const user = { login: input.author ?? "maya" };
     const at = iso(clock.now);
+    const drafted = iso(input.draftedAt ?? clock.now);
     const id = gh.nextId++;
-    const comments = (input.comments ?? []).map((text, index) => ({ id: gh.nextId++, body: text, user, path: "src/login.ts", line: 10 + index, diff_hunk: "@@ -8,3 +8,3 @@\n-old\n+new", pull_request_review_id: id, created_at: at, updated_at: at }));
+    const comments = (input.comments ?? []).map((text, index) => ({ id: gh.nextId++, body: text, user, path: "src/login.ts", line: 10 + index, diff_hunk: "@@ -8,3 +8,3 @@\n-old\n+new", pull_request_review_id: id, created_at: drafted, updated_at: drafted }));
     gh.reviewComments.set(pr, [...(gh.reviewComments.get(pr) ?? []), ...comments]);
     gh.reviews.set(pr, [...(gh.reviews.get(pr) ?? []), { id, body: input.body ?? "", user, state: input.state ?? "CHANGES_REQUESTED", submitted_at: at }]);
     return { id, comments: comments.map((comment) => comment.id) };

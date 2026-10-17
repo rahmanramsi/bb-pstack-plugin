@@ -305,3 +305,24 @@ test("a pull request's last polled state is stored, so a restarted service acts 
   await h.settle();
   assert.equal((await h.only()).state, "addressing");
 });
+
+test("a review whose comments were drafted before the App's last replies is answered in full, and its quiet period runs from its submission", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const first = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: first.comments[0]!, body: "Renamed in 3333333." }]), { headSha: SHA3 })).exitCode, 0);
+  await h.settle();
+  assert.equal(appReplies(h, pr).length, 1, "the App replied, which moves the inline comment cursor");
+
+  h.clock.now += 5 * MIN;
+  const second = h.review(pr, { author: "lee", body: "", comments: ["Rename `y`.", "Rename `z`."], draftedAt: h.clock.now - 60 * MIN });
+  await h.settle();
+  assert.equal((await h.only()).state, "review", "comments drafted an hour ago still wait two minutes from the review's submission");
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  const text: string = h.sent.at(-1)!.input[0].text;
+  for (const id of second.comments) assert.match(text, new RegExp(`"commentId": ${id}`));
+});

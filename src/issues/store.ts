@@ -135,6 +135,7 @@ type FeedbackRow = {
   in_reply_to: number | null;
   review_id: number | null;
   created_at: number;
+  posted_at: number | null;
 };
 
 const parseFeedback = (row: FeedbackRow): Feedback => ({
@@ -148,6 +149,7 @@ const parseFeedback = (row: FeedbackRow): Feedback => ({
   inReplyTo: row.in_reply_to,
   reviewId: row.review_id,
   createdAt: row.created_at,
+  postedAt: row.posted_at ?? row.created_at,
 });
 
 function parsePhase(row: JobRow): Phase {
@@ -271,12 +273,12 @@ export function openIssueStore(db: Db): IssueStore {
 
   const addFeedback = db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
     const insert = db.prepare(
-      `INSERT OR IGNORE INTO issue_feedback (repo, kind, github_id, job_id, pr_number, author, body, path, line, diff_hunk, in_reply_to, review_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO issue_feedback (repo, kind, github_id, job_id, pr_number, author, body, path, line, diff_hunk, in_reply_to, review_id, created_at, posted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     let added = 0;
     for (const { jobId, pr, feedback: item } of items) {
-      added += insert.run(repo, item.kind, item.id, jobId, pr, item.author, item.body, item.path, item.line, item.diffHunk, item.inReplyTo, item.reviewId, item.createdAt).changes;
+      added += insert.run(repo, item.kind, item.id, jobId, pr, item.author, item.body, item.path, item.line, item.diffHunk, item.inReplyTo, item.reviewId, item.createdAt, item.postedAt).changes;
     }
     return added;
   });

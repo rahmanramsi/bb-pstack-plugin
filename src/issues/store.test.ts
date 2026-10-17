@@ -141,6 +141,7 @@ const comment = (id: number, createdAt: number, kind: Feedback["kind"] = "review
   inReplyTo: null,
   reviewId: 500,
   createdAt,
+  postedAt: createdAt,
 });
 
 /** A job resting in review on pull request 7, as step 1 leaves it. */

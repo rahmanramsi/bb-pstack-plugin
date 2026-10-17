@@ -165,6 +165,11 @@ export type Feedback = FeedbackRef & {
   inReplyTo: number | null;
   reviewId: number | null;
   createdAt: number;
+  /**
+   * When the item became visible, which the quiet period runs from: a review's submission for the review and its
+   * inline comments, which GitHub dates from when they were drafted, and otherwise the comment's last update.
+   */
+  postedAt: number;
 };
 /** Feedback as polled, with the state of the review it is or belongs to, before the operator's rules filter it. */
 export type PolledFeedback = Feedback & { pr: number; reviewState: string | null };
@@ -390,7 +395,7 @@ function next(job: Job, facts: Facts): Action | null {
       if (job.round > MAX_FEEDBACK_ROUNDS) {
         return { type: "change", change: stick(job, `new feedback after ${MAX_FEEDBACK_ROUNDS} feedback rounds; the pull request needs a person now`) };
       }
-      const quietAt = Math.max(...feedback.pending.map((item) => item.createdAt)) + FEEDBACK_QUIET_MS;
+      const quietAt = Math.max(...feedback.pending.map((item) => item.postedAt)) + FEEDBACK_QUIET_MS;
       if (quietAt > now) return { type: "sleep", until: quietAt };
       if (!facts.slotFree || !facts.thread) return null;
       // A failed thread cannot take the round's message; it is replaced like a gone one.

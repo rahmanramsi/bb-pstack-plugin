@@ -240,6 +240,8 @@ test("feedback reads each pull request's inline comments, conversation comments,
   routes["GET /repos/acme/web/issues/7/comments"] = etagged([{ id: 12, body: "/agent also add a test", user: user("maya"), created_at: "2026-10-17T10:01:00Z", updated_at: "2026-10-17T10:01:00Z" }], '"i1"');
   routes["GET /repos/acme/web/pulls/7/reviews"] = etagged([{ id: 21, body: "A few things.", user: user("maya"), state: "CHANGES_REQUESTED", submitted_at: "2026-10-17T10:00:00Z" }, { id: 22, body: "", user: user("maya"), state: "PENDING" }], '"r1"');
   routes["GET /repos/acme/web/pulls/7"] = (request) => (request.headers["if-none-match"] === '"p1"' ? { status: 304 } : { status: 200, json: { state: "open", merged: false }, headers: { etag: '"p1"' } });
+  routes["GET /app"] = () => ({ status: 200, json: { slug: "pstack-dev" } });
+  routes["GET /repos/acme/web/pulls/7/reviews/21/comments"] = () => ({ status: 200, json: inline.slice(0, 1) });
 
   const first = await repo.pullActivity(7, null);
   assert.equal(first.state, "open");
@@ -247,19 +249,19 @@ test("feedback reads each pull request's inline comments, conversation comments,
     first.items.map((item) => [item.kind, item.id, item.reviewState]),
     [["review-comment", 11, "CHANGES_REQUESTED"], ["pr-comment", 12, null], ["review", 21, "CHANGES_REQUESTED"]],
   );
-  assert.deepEqual(first.items[0], { kind: "review-comment", id: 11, pr: 7, author: "maya", body: "Rename this.", path: "src/a.ts", line: 4, diffHunk: "@@ -1 +1 @@", inReplyTo: null, reviewId: 21, createdAt: Date.parse("2026-10-17T10:00:00Z"), reviewState: "CHANGES_REQUESTED" });
+  assert.deepEqual(first.items[0], { kind: "review-comment", id: 11, pr: 7, author: "maya", body: "Rename this.", path: "src/a.ts", line: 4, diffHunk: "@@ -1 +1 @@", inReplyTo: null, reviewId: 21, createdAt: Date.parse("2026-10-17T10:00:00Z"), postedAt: Date.parse("2026-10-17T10:00:00Z"), reviewState: "CHANGES_REQUESTED" });
 
   seen = [];
   inline = [...inline, { ...inline[0]!, id: 13, body: "And this.", created_at: "2026-10-17T10:05:00Z", updated_at: "2026-10-17T10:05:00Z" }];
   const second = await repo.pullActivity(7, first.next);
-  assert.match(seen.find((request) => request.path.startsWith("/repos/acme/web/pulls/7/comments"))!.path, /since=2026-10-17T10%3A00%3A00Z/);
-  assert.deepEqual(second.items.map((item) => item.id), [11, 13, 12], "items at the since boundary repeat; callers dedupe");
+  assert.match(seen.find((request) => request.path.startsWith("/repos/acme/web/pulls/7/comments"))!.path, /since=2026-10-17T09%3A50%3A00\.000Z/);
+  assert.deepEqual(second.items.map((item) => item.id), [11, 13, 12], "items inside the overlap repeat; callers dedupe");
   assert.equal(second.items[1]!.reviewState, "CHANGES_REQUESTED", "a review answered 304 keeps its known state");
   assert.equal(second.state, "open", "a pull request answered 304 keeps its known state");
 
   seen = [];
   const third = await repo.pullActivity(7, second.next);
-  assert.deepEqual(third.items.map((item) => item.id), [13]);
+  assert.deepEqual(third.items.map((item) => item.id), [11, 13]);
   assert.deepEqual(seen.map((request) => request.headers["if-none-match"]), [undefined, '"i1"', '"r1"', '"p1"'], "a list whose since moved sends no stale tag");
 
   routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "closed", merged: true } });
@@ -295,4 +297,37 @@ test("replies, review requests and pull request edits go to GitHub's endpoints; 
   });
   assert.deepEqual(await repo.findReviewComment(7, "<!-- pstack:reply:x -->", NOW), { id: 31 });
   assert.equal(await repo.findReviewComment(7, "<!-- pstack:reply:y -->", NOW), null, "only the marker on the last line counts");
+});
+
+test("inline comments overlap the cursor, a new review's own comments are read, and a comment whose review is not listed yet waits", async () => {
+  const { repo } = setup();
+  const user = (login: string) => ({ login });
+  const comment = (id: number, review: number, at: string, login = "maya") => ({ id, body: `c${id}`, user: user(login), path: "a.ts", line: 1, diff_hunk: "@@", pull_request_review_id: review, created_at: at, updated_at: at });
+  let inline = [comment(11, 21, "2026-10-17T10:00:00Z"), comment(12, 99, "2026-10-17T10:30:00Z", "pstack-dev[bot]")];
+  let reviews: unknown[] = [{ id: 21, body: "", user: user("maya"), state: "COMMENTED", submitted_at: "2026-10-17T10:00:00Z" }];
+  const byReview: Record<string, unknown[]> = {};
+  routes["GET /app"] = () => ({ status: 200, json: { slug: "pstack-dev" } });
+  routes["GET /repos/acme/web/pulls/7/comments"] = (request) => {
+    const since = new URL(request.path, "http://x").searchParams.get("since");
+    return { status: 200, json: inline.filter((item) => !since || item.updated_at >= since) };
+  };
+  routes["GET /repos/acme/web/issues/7/comments"] = () => ({ status: 200, json: [] });
+  routes["GET /repos/acme/web/pulls/7/reviews"] = () => ({ status: 200, json: reviews });
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: { state: "open" } });
+  for (const id of [21, 22]) routes[`GET /repos/acme/web/pulls/7/reviews/${id}/comments`] = () => ({ status: 200, json: byReview[id] ?? [] });
+
+  const first = await repo.pullActivity(7, null);
+  assert.deepEqual(first.items.filter((item) => item.kind === "review-comment").map((item) => item.id), [11], "the comment of review 99, not listed yet, waits");
+
+  const drafted = comment(13, 22, "2026-10-17T09:00:00Z", "lee");
+  inline = [...inline, drafted];
+  byReview[22] = [drafted];
+  reviews = [...reviews, { id: 22, body: "", user: user("lee"), state: "CHANGES_REQUESTED", submitted_at: "2026-10-17T11:00:00Z" }, { id: 99, body: "", user: user("pstack-dev[bot]"), state: "COMMENTED", submitted_at: "2026-10-17T10:30:00Z" }];
+  seen = [];
+  const second = await repo.pullActivity(7, first.next);
+  assert.match(seen.find((request) => request.path.startsWith("/repos/acme/web/pulls/7/comments?"))!.path, /since=2026-10-17T10%3A20%3A00\.000Z/, "ten minutes before the newest comment seen");
+  const comments = second.items.filter((item) => item.kind === "review-comment");
+  assert.deepEqual(comments.map((item) => [item.id, item.reviewState]), [[12, "COMMENTED"], [13, "CHANGES_REQUESTED"]], "the overlap re-reads the waiting comment, and review 22's drafted comment arrives through the review");
+  assert.equal(comments[1]!.postedAt, Date.parse("2026-10-17T11:00:00Z"), "a review's comments count from its submission");
+  assert.ok(!seen.some((request) => request.path.includes("/reviews/99/comments")), "the App's own review is not read");
 });
