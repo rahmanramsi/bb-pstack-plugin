@@ -59,6 +59,9 @@ export interface Facts {
 }
 export const HOLD_GRACE_MS = 60_000;
 const FACT_TTL_MS = 30_000;
+export const REFRESH_MS = 30_000;
+const WARM_MS = 2 * REFRESH_MS;
+const WATCH_MS = 10 * 60_000;
 
 function environment(home: Home | Away, id: HostId): CreateThreadEnvironmentArgs {
   if (home.kind === "reuse") return { type: "reuse", environmentId: home.environmentId };
@@ -143,6 +146,8 @@ export interface Placement {
   place(need: Need, issue: (target: Target) => Promise<string | null>): Promise<{ target: Target; threadId: string | null }>;
   board(need: Need): Promise<Board>;
   wouldMove(need: Need, occupancy: Occupancy): Target | null;
+  /** Reloads facts for every need wouldMove was asked about in the last ten minutes. */
+  refresh(): Promise<void>;
 }
 
 export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; clock?: () => number } = {}): Placement {
@@ -154,10 +159,11 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
   let limitsCache: { at: number; value: Facts["limits"] } | null = null;
   let limitsPending: Promise<Facts["limits"]> | null = null;
   let occupancyPending: Promise<Occupancy> | null = null;
-  const key = (need: Need) => JSON.stringify([need.projectId, need.away, need.model]);
+  const watched = new Map<string, { need: Need; at: number }>();
+  const key = (need: Need) => JSON.stringify([need.projectId, need.away && { kind: need.away.kind, pin: need.away.pin }, need.model]);
 
-  async function limits(): Promise<Facts["limits"]> {
-    if (limitsCache && clock() - limitsCache.at < FACT_TTL_MS) return limitsCache.value;
+  async function limits(force = false): Promise<Facts["limits"]> {
+    if (!force && limitsCache && clock() - limitsCache.at < FACT_TTL_MS) return limitsCache.value;
     if (limitsPending) return limitsPending;
     limitsPending = (async () => {
       let value: Facts["limits"] = null;
@@ -181,14 +187,14 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     return occupancyPending;
   }
 
-  async function factsFor(need: Need): Promise<Facts> {
+  async function factsFor(need: Need, force = false): Promise<Facts> {
     const id = key(need);
     const cached = cache.get(id);
-    if (cached && clock() - cached.at < FACT_TTL_MS) return cached.facts;
+    if (!force && cached && clock() - cached.at < FACT_TTL_MS) return cached.facts;
     const pending = loading.get(id);
     if (pending) return pending;
     const promise = (async (): Promise<Facts> => {
-      const [hosts, capacity] = await Promise.all([bb.sdk.hosts.list(), limits()]);
+      const [hosts, capacity] = await Promise.all([bb.sdk.hosts.list(), limits(force)]);
       const facts: Facts = {
         hosts: hosts.map((host) => ({ id: hostId.parse(host.id), name: host.name, connected: host.status === "connected", phase: host.lifecycle.phase })),
         limits: capacity, occupancy: { requestedAt: clock(), threads: [] },
@@ -257,11 +263,20 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     async board(need) { return choose(await fresh(need), holds, need, clock()).board; },
     wouldMove(need, occupancy) {
       try {
-        const cached = cache.get(key(need));
-        if (!cached || clock() - cached.at >= FACT_TTL_MS) return null;
+        const id = key(need);
+        watched.set(id, { need, at: clock() });
+        const cached = cache.get(id);
+        if (!cached || clock() - cached.at >= WARM_MS) {
+          void factsFor(need);
+          return null;
+        }
         const { target } = choose({ ...cached.facts, occupancy }, holds, need, clock());
         return target.where === "away" ? target : null;
       } catch { return null; }
+    },
+    async refresh() {
+      for (const [id, { at }] of watched) if (clock() - at >= WATCH_MS) watched.delete(id);
+      await Promise.all([...watched.values()].map(({ need }) => factsFor(need, true)));
     },
   };
 }

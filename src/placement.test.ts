@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { choose, createPlacement, HOLD_GRACE_MS, hostId, type Facts, type Hold, type Need, type Target } from "./placement.ts";
+import { choose, createPlacement, HOLD_GRACE_MS, hostId, REFRESH_MS, type Facts, type Hold, type Need, type Target } from "./placement.ts";
 
 const HOME = hostId.parse("local");
 const BOX = hostId.parse("box");
@@ -206,11 +206,48 @@ test("a fresh occupancy read replaces bound holds without counting twice", async
 test("wouldMove uses only warm facts and fresh supplied occupancy, and expires", async () => {
   const h = service();
   const occupancy = { requestedAt: 0, threads: threads(HOME, 4) };
-  assert.equal(h.placement.wouldMove(need, occupancy), null);
   await h.placement.board(need);
   assert.equal(h.placement.wouldMove(need, occupancy)?.hostId, BOX);
-  h.advance(30_000);
+  assert.equal(h.placement.wouldMove(need, { requestedAt: 0, threads: threads(HOME, 3) }), null);
+  h.advance(REFRESH_MS + REFRESH_MS / 2);
+  assert.equal(h.placement.wouldMove(need, occupancy)?.hostId, BOX, "a refresh running late leaves the facts usable");
+  h.advance(2 * REFRESH_MS);
   assert.equal(h.placement.wouldMove(need, occupancy), null);
+});
+
+test("a need wouldMove was asked about stays warm across refreshes", async () => {
+  const h = service();
+  const occupancy = { requestedAt: 0, threads: threads(HOME, 4) };
+  assert.equal(h.placement.wouldMove(need, occupancy), null);
+  await h.placement.refresh();
+  assert.equal(h.placement.wouldMove(need, occupancy)?.hostId, BOX);
+  for (let tick = 1; tick <= 4; tick++) {
+    h.advance(tick * REFRESH_MS);
+    await h.placement.refresh();
+    assert.equal(h.placement.wouldMove(need, occupancy)?.hostId, BOX);
+  }
+});
+
+test("refresh reloads limits, and stops reloading a need nobody asked about for ten minutes", async () => {
+  const h = service();
+  h.placement.wouldMove(need, { requestedAt: 0, threads: [] });
+  await h.placement.refresh();
+  const calls = h.execCalls.length;
+  h.advance(REFRESH_MS / 2);
+  await h.placement.refresh();
+  assert.equal(h.execCalls.length, calls + 1);
+  h.advance(10 * 60_000);
+  await h.placement.refresh();
+  assert.equal(h.execCalls.length, calls + 1);
+});
+
+test("facts warmed for one base branch answer for another", async () => {
+  const h = service();
+  h.placement.wouldMove(need, { requestedAt: 0, threads: [] });
+  await h.placement.refresh();
+  const named: Need = { ...need, home: { ...need.home, baseBranch: "release" } as Need["home"], away: { kind: "worktree", baseBranch: "release", pin: null } };
+  const target = h.placement.wouldMove(named, { requestedAt: 0, threads: threads(HOME, 4) });
+  assert.deepEqual(target?.environment, { type: "host", hostId: BOX, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "release" } } });
 });
 
 test("malformed external limit data falls back home", async () => {
