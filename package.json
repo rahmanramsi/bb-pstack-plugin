@@ -22,7 +22,8 @@
     "skills": [
       "skills"
     ],
-    "app": "./src/app.tsx"
+    "app": "./src/app.tsx",
+    "host": "./src/host.ts"
   },
   "keywords": [
     "bb-plugin",

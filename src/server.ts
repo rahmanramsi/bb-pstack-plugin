@@ -1,8 +1,14 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { gate } from "./checklist.ts";
 import { createChecklistFeature } from "./checklist-commands.ts";
 import { openChecklistStore } from "./checklist-store.ts";
 import { STATE_CHANNEL } from "./contract.ts";
+import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
+import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
+import { createIssues } from "./issues/engine.ts";
+import { createGitHub, decodePrivateKey } from "./issues/github.ts";
+import { openIssueStore } from "./issues/store.ts";
 import { rpcContract } from "./rpc.ts";
 import { createRunFeature } from "./run-commands.ts";
 import { openRunStore } from "./run-store.ts";
@@ -94,10 +100,13 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_schema: modelsSchema,
       default: "",
     },
+    ...ISSUE_SETTINGS,
   });
 
-  let modelsText = (await settings.get()).models;
+  let current = await settings.get();
+  let modelsText = current.models;
   settings.onChange((next) => {
+    current = next;
     modelsText = next.models;
   });
 
@@ -147,13 +156,37 @@ export default async function plugin(bb: BbPluginApi) {
   const runs = createRunFeature({ bb, runner, footer: checklist.footer, skills: skillNames() });
   runs.register();
 
+  const hosts = bb.hosts.experimental_client({ contract: hostContract });
+  const issues = createIssues({
+    bb,
+    store: openIssueStore(db),
+    github: createGitHub({
+      credentials: () => {
+        const key = current.githubPrivateKey ? decodePrivateKey(current.githubPrivateKey) : null;
+        return current.githubAppId && key?.ok ? { appId: current.githubAppId, privateKey: key.pem } : null;
+      },
+    }),
+    hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),
+    repos: () => {
+      if (!current.githubAppId || !current.githubPrivateKey) return [];
+      const parsed = parseIssueRepos(current.issueRepos);
+      return parsed.ok ? parsed.repos : [];
+    },
+    resolveRole,
+    prGate: (threadId) => {
+      const result = gate("pr", checklistStore.checklist(threadId));
+      return result.pass ? result : { pass: false, reason: result.reason };
+    },
+  });
+  issues.register();
+
   bb.events.on("thread.idle", ({ thread }) => {
-    if (thread.originPluginId === bb.pluginId) return;
+    if (thread.originPluginId === bb.pluginId && !issues.isWorker(thread.id)) return;
     return checklist.onIdle(thread.id).catch((error) => bb.log.error(`pstack nudge: ${error instanceof Error ? error.message : String(error)}`));
   });
 
   bb.agents.contributeInstructions(({ threadId }) => {
-    const parts = [instructionsFor(modelsText), checklist.instructions(threadId)].filter((part): part is string => !!part);
+    const parts = [issues.instructions(threadId), instructionsFor(modelsText), checklist.instructions(threadId)].filter((part): part is string => !!part);
     return parts.length > 0 ? parts.join("\n\n").slice(0, INSTRUCTIONS_MAX) : null;
   });
 
@@ -194,10 +227,11 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register(
     defineCli({
       name: "pstack",
-      summary: "pstack model roles, panel and swarm runs, and playbook checklists",
+      summary: "pstack model roles, panel and swarm runs, playbook checklists, and GitHub issue workers",
       commands: {
         ...checklist.commands,
         ...runs.commands,
+        ...issues.commands,
         models: cliCommand({
           summary:
             "Print the effective role-to-model table (configured values merged over defaults)",
