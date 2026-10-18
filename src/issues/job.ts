@@ -51,10 +51,6 @@ export type JobState = TransitState | RestingState;
 
 /** A new label event on the issue may start a new job only once its last job is in one of these. */
 export const TERMINAL: ReadonlySet<JobState> = new Set(["ignored", "done", "stopped", "stuck"]);
-/** States that hold one of the worker slots: a worker turn runs or its result is being published. */
-export const BUSY: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "sending", "respawning", "addressing", "republishing", "replying"]);
-/** At most this many jobs are BUSY at once. */
-export const CONCURRENCY = 3;
 
 /** States in which the worker's report is the next step. */
 export const REPORTING: ReadonlySet<JobState> = new Set(["working", "addressing"]);
@@ -335,7 +331,6 @@ export type RoundSummary = { ordinal: number; summary: string | null };
 /** Observations the row does not own. The engine gathers only those FACTS_FOR names for the state. */
 export type Facts = {
   now: number;
-  slotFree: boolean | null;
   worker: WorkerSettings | WorkerProblem | null;
   thread: ThreadFact | null;
   /**
@@ -361,7 +356,7 @@ export type FactName = Exclude<keyof Facts, "now">;
 
 export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   ignored: [],
-  queued: ["blockers", "slotFree", "worker"],
+  queued: ["blockers", "worker"],
   starting: [],
   working: ["thread", "waiting", "gate"],
   publishing: [],
@@ -387,7 +382,7 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
  * What `review` needs once a round is due, and only then: a pull request can wait days for review, and these cost a bb
  * call and store reads per job on every sweep.
  */
-export const ROUND_FACTS: readonly FactName[] = ["slotFree", "thread", "rounds", "remote"];
+export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
@@ -460,9 +455,9 @@ function next(job: Job, facts: Facts): Action | null {
         const error = `waiting for ${facts.blockers.join(", ")}`;
         return job.error === error ? null : { type: "change", change: { error } };
       }
-      // An unblocked child must count in slots().ahead again while it waits for a slot.
+      // An unblocked child drops its waiting reason before it starts.
       if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
-      if (!facts.slotFree || !facts.worker) return null;
+      if (!facts.worker) return null;
       if ("error" in facts.worker) {
         if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
         return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
@@ -479,7 +474,7 @@ function next(job: Job, facts: Facts): Action | null {
       }
       const quiet = quietAt(feedback.pending);
       if (quiet > now) return { type: "sleep", until: quiet };
-      if (!facts.slotFree || !facts.thread || !facts.rounds || !facts.remote) return null;
+      if (!facts.thread || !facts.rounds || !facts.remote) return null;
       if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
       // A failed thread cannot take the round's message; it is replaced like a gone one.
       const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";

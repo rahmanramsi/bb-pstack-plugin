@@ -5,8 +5,6 @@
  */
 import type { Db } from "../store.ts";
 import {
-  BUSY,
-  CONCURRENCY,
   TERMINAL,
   TRANSIT,
   WATCHED,
@@ -67,14 +65,8 @@ export type IssueStore = {
   /** Newest first; terminal jobs only with `all`. */
   list(filter: { repo?: RepoName; all: boolean }): Job[];
   /**
-   * Jobs holding a worker slot, and how many queued jobs created before this one could start. A queued job's error is
-   * why its worker could not be resolved, so one with an error does not hold back the jobs behind it.
-   */
-  slots(id: JobId): { busy: number; ahead: number };
-  /**
-   * The one write. Returns the new row, or null when the version moved (re-read and replan), when the change would
-   * make the job BUSY while CONCURRENCY other jobs already are (both checks are in the same statement), or when a
-   * round start does not list every pending item. In the same
+   * The one write. Returns the new row, or null when the version moved (re-read and replan), or when a round start
+   * does not list every pending item. In the same
    * transaction, a round start inserts the round's row and marks its feedback as sent, and the current round's row
    * records the accepted report, the pushed commit, and, once, when the change says the round finished.
    */
@@ -250,7 +242,6 @@ function columns(change: Change): Record<string, unknown> {
 }
 
 const TERMINAL_LIST = [...TERMINAL];
-const BUSY_LIST = [...BUSY];
 const TRANSIT_LIST = Object.keys(TRANSIT);
 const placeholders = (values: readonly unknown[]) => values.map(() => "?").join(", ");
 
@@ -345,18 +336,6 @@ export function openIssueStore(db: Db): IssueStore {
         .all(...(repo ? [repo] : []), ...(all ? [] : TERMINAL_LIST)) as JobRow[];
       return rows.map(parse);
     },
-    slots(id) {
-      const { busy } = db
-        .prepare(`SELECT count(*) AS busy FROM issue_jobs WHERE state IN (${placeholders(BUSY_LIST)})`)
-        .get(...BUSY_LIST) as { busy: number };
-      const { ahead } = db
-        .prepare(
-          `SELECT count(*) AS ahead FROM issue_jobs q, issue_jobs me WHERE me.id = ? AND q.state = 'queued' AND q.error IS NULL
-             AND (q.created_at < me.created_at OR (q.created_at = me.created_at AND q.id < me.id))`,
-        )
-        .get(id) as { ahead: number };
-      return { busy, ahead };
-    },
     write: db.transaction((id: JobId, version: number, change: Change, now: number): Job | null => {
       // Feedback that arrived after plan() read the queue is newer than the quiet period it checked: refuse, so the
       // replan sees it and waits again, instead of leaving it for a round of its own.
@@ -366,19 +345,8 @@ export function openIssueStore(db: Db): IssueStore {
       }
       const set = columns(change);
       const names = Object.keys(set);
-      const slotGuard =
-        change.phase && BUSY.has(change.phase.state)
-          ? ` AND (state IN (${placeholders(BUSY_LIST)}) OR (SELECT count(*) FROM issue_jobs WHERE state IN (${placeholders(BUSY_LIST)})) < ?)`
-          : "";
-      const params = [
-        ...Object.values(set),
-        now,
-        id,
-        version,
-        ...(slotGuard ? [...BUSY_LIST, ...BUSY_LIST, CONCURRENCY] : []),
-      ];
       const assignments = [...names.map((name) => `${name} = ?`), "version = version + 1", "updated_at = ?"].join(", ");
-      const changed = db.prepare(`UPDATE issue_jobs SET ${assignments} WHERE id = ? AND version = ?${slotGuard}`).run(...params).changes;
+      const changed = db.prepare(`UPDATE issue_jobs SET ${assignments} WHERE id = ? AND version = ?`).run(...Object.values(set), now, id, version).changes;
       if (changed !== 1) return null;
       const job = get(id)!;
       if (change.startRound) {

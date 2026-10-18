@@ -73,7 +73,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, slotFree: null, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);
@@ -92,18 +92,18 @@ function apply(current: Job, change: Change): Job {
   return { ...current, ...rest, ...(startRound ? { round: startRound.ordinal } : {}), version: current.version + 1, updatedAt: NOW };
 }
 
-test("a queued job starts only with a free slot and resolved worker settings, labelling before it spawns", () => {
+test("a queued job starts only with resolved worker settings, labelling before it spawns", () => {
   const queued = job();
-  assert.equal(plan(queued, facts({ slotFree: false, worker: WORKER })), null);
+  assert.equal(plan(queued, facts()), null);
   const offline = { error: "the host is offline", permanent: false };
-  assert.deepEqual(plan(queued, facts({ slotFree: true, worker: offline })), { type: "change", change: { error: "the host is offline" } });
-  assert.equal(plan(job({ error: "the host is offline" }), facts({ slotFree: true, worker: offline })), null);
-  assert.deepEqual(plan(queued, facts({ slotFree: true, worker: { error: "no model for issue worker", permanent: true } })), {
+  assert.deepEqual(plan(queued, facts({ worker: offline })), { type: "change", change: { error: "the host is offline" } });
+  assert.equal(plan(job({ error: "the host is offline" }), facts({ worker: offline })), null);
+  assert.deepEqual(plan(queued, facts({ worker: { error: "no model for issue worker", permanent: true } })), {
     type: "change",
     change: { phase: { state: "stuck" }, deadline: null, error: "no model for issue worker" },
   });
 
-  const action = plan(queued, facts({ slotFree: true, worker: WORKER }));
+  const action = plan(queued, facts({ worker: WORKER }));
   assert.equal(action?.type, "change");
   const started = apply(queued, (action as { change: Change }).change);
   assert.equal(started.phase.state, "starting");
@@ -410,14 +410,13 @@ const reviewBody: Feedback = { kind: "review", id: 500, author: "lee", body: "A 
 const inReview = (overrides: Partial<Job> = {}) =>
   job({ phase: { state: "review" }, threadId: "thr_w", pushedSha: PUSHED, pr: PR, worker: WORKER, report: { ...REPORT, headSha: PUSHED, acceptedAt: NOW - 60 * MIN }, ...overrides });
 const ROUNDS = [{ ordinal: 1, summary: "Footer overlap fixed." }];
-const pending = (items: Feedback[]) => ({ feedback: { pending: items }, rounds: ROUNDS, remote: { head: PUSHED }, pr: { state: "open" as const }, slotFree: true, thread: { kind: "idle" as const, since: NOW - MIN } });
+const pending = (items: Feedback[]) => ({ feedback: { pending: items }, rounds: ROUNDS, remote: { head: PUSHED }, pr: { state: "open" as const }, thread: { kind: "idle" as const, since: NOW - MIN } });
 
 test("a round starts only once the newest pending feedback has been quiet for two minutes, with every pending item", () => {
   const review = inReview();
   assert.equal(plan(review, facts({ ...pending([]) })), null, "no feedback, nothing to do");
   const fresh = [inline(1, NOW - 5 * MIN), inline(2, NOW - MIN)];
   assert.deepEqual(plan(review, facts(pending(fresh))), { type: "sleep", until: NOW - MIN + FEEDBACK_QUIET_MS }, "a comment a minute ago holds the round");
-  assert.equal(plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), slotFree: false })), null, "every worker slot is taken");
 
   const items = [inline(1, NOW - 5 * MIN), inline(2, NOW - FEEDBACK_QUIET_MS)];
   const action = plan(review, facts(pending(items)));
