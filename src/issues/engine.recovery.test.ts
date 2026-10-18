@@ -119,3 +119,72 @@ test("pre-spawn transient observations grow backoff across restart and exhaust a
   assert.ok(observations.length <= 10);
   assert.equal(h.store.get(original.id)!.control.recoveries, 1);
 });
+
+test("a corrected report is retained while its asynchronous rejection notice is in flight", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  h.gh().outages.push({ key: "GET /repos/acme/web/installation", times: Infinity });
+  const saved = await h.report(job.threadId!, { ...GOOD, pr: { ...GOOD.pr, title: "invalid" } });
+  assert.equal(saved.exitCode, 0);
+  const hold = h.holdAt("send", "sdk");
+  h.gh().outages.length = 0;
+  const sweeping = h.engine().issues.sweep();
+  await hold.hit;
+  const foreign = { ...h.threads.get(job.threadId!)!, id: "foreign", metadata: { pstackIssue: 1, jobId: job.id, epoch: 0 } };
+  h.threads.set(foreign.id, foreign);
+  const unauthorized = await h.report(foreign.id, GOOD);
+  assert.equal(unauthorized.exitCode, 1);
+  const corrected = await h.report(job.threadId!, GOOD);
+  assert.equal(corrected.exitCode, 0, corrected.stderr);
+  assert.equal(h.store.pendingSubmissions(job.id).length, 1);
+  h.restart(); hold.free(); await sweeping;
+  h.clock.now += EFFECT_POLICY["send-round"].leaseMs;
+  await h.settle(); await h.advance(2 * MIN);
+  assert.equal((await h.only()).outcome, "ready");
+  assert.equal(h.store.get(job.id)!.report!.headSha, SHA2);
+  assert.equal(h.spawned.length, 1);
+});
+
+for (const state of ["done", "stopped", "stuck", "ignored"] as const) {
+  test(`late worker events and pending submissions cannot reopen ${state}`, async () => {
+    const h = harness();
+    h.label(41); await h.settle();
+    const current = h.store.get((await h.only()).id)!;
+    const terminal = h.store.write(current.id, current.version, { phase: { state }, control: { ...current.control, disposition: state === "done" ? "no-change" : state === "stopped" ? "stopped" : state === "stuck" ? "failure" : null } }, h.clock.now)!;
+    h.store.submit(terminal, terminal.threadId!, JSON.stringify(GOOD), h.clock.now);
+    h.engine().issues.register();
+    await h.events.get("thread.idle")!({ thread: { id: terminal.threadId, originPluginId: "pstack" } });
+    await h.settle();
+    assert.equal(h.store.get(current.id)!.phase.state, state);
+    assert.equal(h.store.get(current.id)!.version, terminal.version);
+    assert.deepEqual(h.store.get(current.id)!.control, terminal.control);
+    assert.equal(h.store.pendingSubmissions(current.id).length, 0);
+    assert.equal(h.pushes.length, 0);
+  });
+}
+
+for (const status of ["error", "destroyed", "missing"] as const) {
+  test(`a report records confirmed environment ${status} as failure without waiting forever`, async () => {
+    let failed = false;
+    const h = harness({ configureDeps(deps) {
+      const get = deps.bb.sdk.environments.get;
+      deps.bb.sdk.environments.get = async (args) => {
+        if (failed && status === "missing") throw Object.assign(new Error("environment not found"), { status: 404 });
+        return { ...await get(args), ...(failed && status !== "missing" ? { status } : {}) };
+      };
+    } });
+    h.label(41); await h.settle();
+    const job = await h.only();
+    h.gh().outages.push({ key: "GET /repos/acme/web/installation", times: Infinity });
+    const response = await h.report(job.threadId!, GOOD);
+    assert.equal(response.exitCode, 0);
+    failed = true;
+    h.gh().outages.length = 0;
+    await h.settle();
+    assert.equal((await h.only()).outcome, "failure");
+    assert.equal(h.store.pendingSubmissions(job.id).length, 0);
+    assert.equal(h.spawned.length, 1);
+    assert.equal(h.pushes.length, 0);
+  });
+}

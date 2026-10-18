@@ -211,13 +211,15 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (!job.threadId) return { ok: false, transient: false, error: "the job has no worker thread" };
     const thread = await bb.sdk.threads.get({ threadId: job.threadId, ...(signal ? { signal } : {}) });
     if (!thread.environmentId) return { ok: false, transient: true, error: "the worker's worktree is not ready" };
-    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) });
+    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) }).catch((error) => { if (isMissing(error)) return null; throw error; });
+    if (!environment || environment.status === "error" || environment.status === "destroyed") return { ok: false, transient: false, error: `the worker environment is ${environment?.status ?? "missing"}; original work location retained` };
     if (environment.hostId !== job.hostId) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the mapped host ${job.hostId}` };
-    if (environment.status !== "ready" || !environment.path) return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
+    if (environment.status === "creating" || environment.status === "provisioning") return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
+    if (!environment.path) return { ok: false, transient: false, error: "the ready worker environment has no workspace path" };
     const origin = await deps.inspectOrigin(job.hostId, environment.path);
     if (!origin || repoFromRemote(origin) !== job.repo.toLowerCase()) return { ok: false, transient: false, error: "the recorded workspace origin does not match the authorized repository" };
     const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
-    if (status.outcome === "unavailable") return { ok: false, transient: true, error: `the worktree status is unavailable: ${status.failure.message}` };
+    if (status.outcome === "unavailable") return { ok: false, transient: status.failure.code === "unknown", error: `the worktree status is unavailable: ${status.failure.message}` };
     if (status.outcome !== "available") return { ok: false, transient: false, error: status.message };
     const { checkout, workingTree, mergeBase } = status.workspace;
     const headSha = checkout.kind === "branch" || checkout.kind === "detached" ? checkout.headSha : null;
@@ -294,6 +296,9 @@ export function createIssues(deps: IssuesDeps): Issues {
         const tree = await worktree(job, until(deadline));
         if (!tree.ok) return tree.transient ? { kind: "retry", error: tree.error, notBefore: null } : { kind: "fail", error: tree.error };
         const repo = github.repo(job.repo, until(deadline));
+        const remoteSha = await repo.branchSha(job.branch);
+        if (remoteSha === effect.sha) return done({ pushedSha: effect.sha });
+        if (remoteSha !== effect.expectedRemoteSha) return remoteSha ? { kind: "publication-diverged", remoteSha, reason: "stale-remote" } : { kind: "fail", error: "the publication branch disappeared; accepted work is preserved" };
         const capabilities = await repo.capabilities({ fresh: true });
         if (capabilities.archived || capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return { kind: "fail", error: "publication requires existing contents and pull requests write grants on an active repository", publicFailure: { kind: "publication-denied" } };
         const comparisonSha = job.report?.outcome === "changes" && job.report.headSha === effect.sha && job.report.comparisonSha ? job.report.comparisonSha : capabilities.defaultHead;

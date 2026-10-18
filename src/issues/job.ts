@@ -273,8 +273,8 @@ export type Control = {
   bestReasons: readonly string[] | null;
   milestones: readonly string[];
   readiness: ReviewTarget | null;
-  mergedHead?: Sha | null;
-  recoveryObservation?: { effectKey: string; attempts: number; firstAt: number } | null;
+  mergedHead: Sha | null;
+  recoveryObservation: { effectKey: string; attempts: number; firstAt: number } | null;
   reviewIntent: ReviewTarget | null;
   localEvidence: { head: Sha; base: Sha } | null;
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;

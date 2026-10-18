@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { GitHubTransientError } from "./github.ts";
 import { GOOD, MIN, harness } from "./engine-harness.ts";
 
-function withParent(subIssues = [51, 52]) {
-  const h = harness();
+function withParent(subIssues = [51, 52], options: Parameters<typeof harness>[0] = {}) {
+  const h = harness(options);
   const gh = h.gh();
   for (const number of subIssues) gh.issues.set(number, { number, title: `Part ${number}`, body: `Do part ${number}.`, user: "maya", updatedAt: h.clock.now, labels: new Set() });
   gh.issues.set(50, { number: 50, title: "Checkout redesign", body: "The whole checkout flow.", user: "maya", updatedAt: h.clock.now, labels: new Set(), subIssues });
@@ -302,3 +303,46 @@ for (const fault of ["transient", "permanent"] as const) {
     }
   });
 }
+
+test("historical merged-head Retry-After survives restart without early reads or false failure", async () => {
+  let target = 0;
+  let retryAt = 0;
+  let failed = true;
+  let reads = 0;
+  const h = withParent([51], { configureDeps(deps) {
+    const repo = deps.github.repo;
+    deps.github = { repo: (name, signal) => {
+      const client = repo(name, signal);
+      return { ...client, reviewSnapshot: async (pr) => {
+        if (pr === target) {
+          reads++;
+          if (failed) throw new GitHubTransientError("prerequisite read cooling down", retryAt);
+        }
+        return client.reviewSnapshot(pr);
+      } };
+    } };
+  } });
+  await h.settle();
+  const child = await h.byIssue(51);
+  await h.report(child.threadId!, GOOD); await h.settle(); await h.advance(MIN);
+  const merged = h.store.get(child.id)!;
+  target = merged.pr!.number;
+  retryAt = h.clock.now + 30 * MIN;
+  h.store.write(merged.id, merged.version, { phase: { state: "done" }, control: { ...merged.control, disposition: "merged", readiness: null, mergedHead: null } }, h.clock.now);
+  h.db.prepare("UPDATE issue_job_polls SET pr_state = 'merged' WHERE job_id = ?").run(child.id);
+  h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now, child.id);
+  Object.assign(h.gh().pulls.get(target)!, { state: "closed", merged: true });
+  h.gh().refs.set(child.branch, "3".repeat(40));
+  await h.settle();
+  assert.equal(reads, 1);
+  h.restart(); await h.advance(3 * MIN);
+  h.clock.now = retryAt - 1; await h.settle();
+  assert.equal(reads, 1);
+  assert.equal(h.store.get(child.id)!.control.mergedHead, null);
+  assert.notEqual((await h.byIssue(50)).outcome, "failure");
+  failed = false;
+  h.clock.now = retryAt; await h.settle();
+  assert.equal(reads, 2);
+  assert.equal(h.store.get(child.id)!.control.mergedHead, "3".repeat(40));
+  assert.equal(h.store.get((await h.byIssue(50)).id)!.control.prerequisites[0]!.sha, "3".repeat(40));
+});
