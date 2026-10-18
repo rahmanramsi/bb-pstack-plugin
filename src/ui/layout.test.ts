@@ -68,9 +68,9 @@ test("checklist retains status, evidence and skip reason within its original sec
 
 test("an issue job in transit names the state it heads for, its step, and its retry count", () => {
   assert.equal(issueNext({ next: null }), null);
-  assert.equal(issueNext({ next: { state: "review", op: "open-pr", tries: 0, retryAt: null } }), "Next: In review · open-pr");
+  assert.equal(issueNext({ next: { state: "checking", op: "open-pr", tries: 0, retryAt: null } }), "Next: Checking CI · open-pr");
   assert.equal(issueNext({ next: { state: "stopped", op: "labels", tries: 1, retryAt: null } }), "Next: Stopped · labels · try 2");
-  assert.match(issueNext({ next: { state: "review", op: "push", tries: 2, retryAt: 0 } })!, /^Next: In review · push · try 3 · retry at \S/);
+  assert.match(issueNext({ next: { state: "checking", op: "push", tries: 2, retryAt: 0 } })!, /^Next: Checking CI · push · try 3 · retry at \S/);
 });
 
 test("ages read in minutes, then hours, then days", () => {

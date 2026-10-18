@@ -1,0 +1,95 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
+import entry from "../host.ts";
+import { GOOD, MIN, harness } from "./engine-harness.ts";
+
+test("repair publication uses real Git contribution objects independently from its remote lease", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pstack-issue-git-"));
+  const main = join(root, "main");
+  const worker = join(root, "worker");
+  const remote = join(root, "remote.git");
+  mkdirSync(main);
+  mkdirSync(join(root, "temp"));
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@example.test", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "test@example.test" } }).trim();
+  const commit = (cwd: string, path: string, body: string) => {
+    writeFileSync(join(cwd, path), body); git(cwd, "add", path); git(cwd, "commit", "-qm", "update implementation");
+    return git(cwd, "rev-parse", "HEAD");
+  };
+  git(main, "init", "-qb", "main");
+  const base = commit(main, "README.md", "Application\n");
+  git(main, "init", "--bare", "-q", remote);
+  git(main, "worktree", "add", "-qb", "worker", worker);
+  const host = experimental_createHostEntryHarness(entry, { experimental_paths: { dataDir: join(root, "data"), tempDir: join(root, "temp") } });
+  t.after(async () => { await host.experimental_dispose(); rmSync(root, { recursive: true, force: true }); });
+  let publishCollaborator: (() => void) | null = null;
+  const h = harness({ configureDeps(deps) {
+    deps.inspectCommit = async (_hostId, input) => {
+      const result = await host.experimental_call("inspectCommit", { ...input, worktreePath: worker });
+      if (input.ancestorShas && publishCollaborator) { const publish = publishCollaborator; publishCollaborator = null; publish(); }
+      return result;
+    };
+    deps.hostPush = async (_hostId, input) => {
+      const result = await host.experimental_call("push", { ...input, worktreePath: worker, remoteUrl: `file://${remote}` });
+      if (result.status === "pushed") h.gh().refs.set(input.branch, result.sha);
+      h.pushes.push(input);
+      return result;
+    };
+  } });
+  h.gh().refs.set("main", base);
+  h.gh().grants.workflows = "read";
+  h.label(41); await h.settle();
+  const job = await h.only();
+  const published = commit(worker, "feature.txt", "Implementation\n");
+  assert.equal((await h.report(job.threadId!, GOOD, { headSha: published, commits: [published], ahead: 1 })).exitCode, 0);
+  await h.settle(); await h.advance(MIN);
+  assert.equal((await h.only()).outcome, "ready");
+  mkdirSync(join(main, ".github/workflows"), { recursive: true });
+  const nextBase = commit(main, ".github/workflows/check.yml", "name: upstream CI\n");
+  h.gh().refs.set("main", nextBase);
+  await h.advance(2 * MIN);
+  const repair = await h.only();
+  assert.equal(repair.state, "addressing");
+  git(worker, "merge", "--no-edit", nextBase);
+  const head = git(worker, "rev-parse", "HEAD");
+  const response = await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [], summary: "The implementation includes the current base.", verification: ["integration tests passed"] }, { headSha: head, commits: [head, published], ahead: 2 });
+  assert.equal(response.exitCode, 0, response.stderr);
+  await h.settle(); await h.advance(2 * MIN);
+  assert.equal((await h.only()).outcome, "ready");
+  assert.equal(h.pushes[1]!.expectedRemoteSha, published);
+  assert.equal(h.pushes[1]!.comparisonSha, nextBase);
+  assert.equal(h.pushes[1]!.workflows, false);
+  assert.equal(git(main, "--git-dir", remote, "rev-parse", `refs/heads/${job.branch}`), head);
+  h.review((await h.only()).pr!.number, { body: "Verify the expanded implementation." });
+  await h.advance(3 * MIN);
+  const feedbackRound = await h.only();
+  const assigned = h.store.roundFeedback(job.id, feedbackRound.round);
+  git(main, "checkout", "-qb", "collaborator", head);
+  const collaborator = commit(main, ".github/workflows/collaborator.yml", "name: collaborator CI\n");
+  git(worker, "merge", "--no-edit", collaborator);
+  const accepted = commit(worker, "expanded.txt", "Expanded implementation\n");
+  publishCollaborator = () => {
+    git(main, "push", `file://${remote}`, `${collaborator}:refs/heads/${job.branch}`);
+    h.gh().refs.set(job.branch, collaborator);
+  };
+  const report = { outcome: "changes", round: feedbackRound.round - 1, replies: assigned.map((item) => ({ kind: item.kind, commentId: item.id, body: "The expanded implementation is verified." })), summary: "The expanded implementation includes collaborator work.", verification: ["integration tests passed"] };
+  assert.equal((await h.report(job.threadId!, report, { headSha: accepted, commits: [accepted], ahead: 4 })).exitCode, 0);
+  await h.settle();
+  const divergence = h.store.get(job.id)!;
+  assert.equal(divergence.phase.state, "addressing");
+  assert.equal(divergence.control.publicationRepair!.acceptedSha, accepted);
+  assert.equal(divergence.control.publicationRepair!.remoteSha, collaborator);
+  assert.equal(h.pushes.length, 2, "stale lease is reconciled before workflow grant classification");
+  assert.equal(git(main, "--git-dir", remote, "rev-parse", `refs/heads/${job.branch}`), collaborator);
+  const verified = await h.report(job.threadId!, { ...report, round: divergence.round - 1, verification: ["integration tests passed again after remote adoption"] }, { headSha: accepted, commits: [accepted], ahead: 4 });
+  assert.equal(verified.exitCode, 0, verified.stderr);
+  await h.settle(); await h.advance(2 * MIN);
+  assert.equal((await h.only()).outcome, "ready");
+  assert.equal(h.pushes.at(-1)!.expectedRemoteSha, collaborator);
+  assert.equal(h.pushes.at(-1)!.workflows, false);
+  assert.equal(git(main, "--git-dir", remote, "rev-parse", `refs/heads/${job.branch}`), accepted);
+});

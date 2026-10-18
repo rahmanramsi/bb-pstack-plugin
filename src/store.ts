@@ -297,6 +297,154 @@ export const MIGRATIONS: readonly string[] = [
   // A sub-issue gets at most one child job per parent, so a stuck child is never recreated in a loop.
   `CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL`,
   `ALTER TABLE issue_job_polls ADD COLUMN children_json TEXT`,
+  // Manual starts have neither a GitHub label event nor a parent job.
+  `CREATE TABLE issue_jobs_next (
+     id TEXT PRIMARY KEY,
+     version INTEGER NOT NULL DEFAULT 0,
+     repo TEXT NOT NULL,
+     issue INTEGER NOT NULL,
+     generation INTEGER NOT NULL,
+     trigger_event_id INTEGER UNIQUE,
+     triggered_by TEXT NOT NULL,
+     triggered_at INTEGER NOT NULL,
+     issue_json TEXT NOT NULL,
+     project_id TEXT NOT NULL,
+     host_id TEXT NOT NULL,
+     base_branch TEXT NOT NULL,
+     branch TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN (
+       'ignored','queued','working','needs-info','review','addressing','tracking','done','stopped','stuck',
+       'starting','publishing','asking','closing','stopping','sticking','sending','respawning','republishing','replying','updating')),
+     effects_json TEXT,
+     effect_tries INTEGER NOT NULL DEFAULT 0,
+     effect_first_at INTEGER,
+     effect_lease_until INTEGER,
+     effect_next_at INTEGER,
+     thread_id TEXT UNIQUE,
+     deadline INTEGER,
+     rejections INTEGER NOT NULL DEFAULT 0,
+     nudges INTEGER NOT NULL DEFAULT 0,
+     report_json TEXT,
+     pushed_sha TEXT,
+     pr_number INTEGER,
+     pr_url TEXT,
+     error TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     round INTEGER NOT NULL DEFAULT 1,
+     worker_json TEXT,
+     round_base TEXT,
+     parent_id TEXT,
+     progress TEXT,
+     CHECK ((state IN ('starting','publishing','asking','closing','stopping','sticking','sending','respawning','republishing','replying','updating')) = (effects_json IS NOT NULL)),
+     CHECK (state NOT IN ('working','needs-info','review','addressing','sending') OR thread_id IS NOT NULL),
+     CHECK (state NOT IN ('review','addressing','sending','respawning','republishing','replying') OR (pr_number IS NOT NULL AND pushed_sha IS NOT NULL)),
+     CHECK (parent_id IS NULL OR trigger_event_id IS NULL)
+   )`,
+  `INSERT INTO issue_jobs_next SELECT * FROM issue_jobs`,
+  `DROP TABLE issue_jobs`,
+  `ALTER TABLE issue_jobs_next RENAME TO issue_jobs`,
+  `CREATE UNIQUE INDEX issue_jobs_open ON issue_jobs (repo, issue)
+     WHERE state NOT IN ('ignored','done','stopped','stuck')`,
+  `CREATE INDEX issue_jobs_due ON issue_jobs (state, created_at)`,
+  `CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL`,
+  `CREATE TABLE issue_legacy_archive AS SELECT * FROM issue_jobs;
+CREATE TABLE issue_jobs_unattended (
+     id TEXT PRIMARY KEY,
+     version INTEGER NOT NULL DEFAULT 0,
+     repo TEXT NOT NULL,
+     issue INTEGER NOT NULL,
+     generation INTEGER NOT NULL,
+     trigger_event_id INTEGER UNIQUE,
+     triggered_by TEXT NOT NULL,
+     triggered_at INTEGER NOT NULL,
+     issue_json TEXT NOT NULL,
+     project_id TEXT NOT NULL,
+     host_id TEXT NOT NULL,
+     base_branch TEXT NOT NULL,
+     branch TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN (
+       'ignored','queued','working','checking','review','addressing','tracking','done','stopped','stuck',
+       'starting','publishing','recovering','repairing','readifying','drafting','closing','stopping','sticking','sending','respawning','republishing','replying','updating')),
+     effects_json TEXT,
+     effect_tries INTEGER NOT NULL DEFAULT 0,
+     effect_first_at INTEGER,
+     effect_lease_until INTEGER,
+     effect_next_at INTEGER,
+     thread_id TEXT UNIQUE,
+     deadline INTEGER,
+     rejections INTEGER NOT NULL DEFAULT 0,
+     nudges INTEGER NOT NULL DEFAULT 0,
+     report_json TEXT,
+     pushed_sha TEXT,
+     pr_number INTEGER,
+     pr_url TEXT,
+     error TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     round INTEGER NOT NULL DEFAULT 1,
+     worker_json TEXT,
+     round_base TEXT,
+     parent_id TEXT,
+     progress TEXT,
+     control_json TEXT NOT NULL DEFAULT '{}',
+     runtime_protocol INTEGER NOT NULL DEFAULT 0 CHECK (runtime_protocol = 1),
+     runtime_revision INTEGER NOT NULL DEFAULT 0,
+     CHECK ((state IN ('starting','publishing','recovering','repairing','readifying','drafting','closing','stopping','sticking','sending','respawning','republishing','replying','updating')) = (effects_json IS NOT NULL)),
+     CHECK (state NOT IN ('working','checking','review','addressing','sending') OR thread_id IS NOT NULL),
+     CHECK (state NOT IN ('review','addressing','sending','respawning','republishing','replying') OR (pr_number IS NOT NULL AND pushed_sha IS NOT NULL)),
+     CHECK (parent_id IS NULL OR trigger_event_id IS NULL)
+   );
+   INSERT INTO issue_jobs_unattended (id, version, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch, state, effects_json, effect_tries, effect_first_at, effect_lease_until, effect_next_at, thread_id, deadline, rejections, nudges, report_json, pushed_sha, pr_number, pr_url, error, created_at, updated_at, round, worker_json, round_base, parent_id, progress, control_json, runtime_protocol)
+     SELECT id, version + 1, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch, CASE WHEN state IN ('asking','needs-info') THEN 'recovering' WHEN state = 'review' THEN 'checking' ELSE state END, CASE WHEN state IN ('asking','needs-info') THEN json_array(json_object('op','stop-thread','key','recover-stop:' || id || ':1'), json_object('op','recover-worker','key','recover:' || id || ':1','epoch',1)) ELSE effects_json END, effect_tries, effect_first_at, effect_lease_until, effect_next_at, thread_id, NULL, rejections, nudges, report_json, pushed_sha, pr_number, pr_url, error, created_at, updated_at, round, worker_json, round_base, parent_id, progress, json_object('feedbackRounds', max(round - 1, 0), 'epoch', CASE WHEN state IN ('asking','needs-info') THEN 1 ELSE 0 END, 'workspace', NULL, 'recoveries', CASE WHEN state IN ('asking','needs-info') THEN 1 ELSE 0 END, 'invalid', 0, 'bestReasons', NULL, 'milestones', json('[]'), 'readiness', NULL, 'repair', NULL, 'disposition', CASE WHEN state = 'stopped' THEN 'stopped' WHEN state = 'stuck' THEN 'failure' ELSE NULL END, 'preservation', NULL), 1 FROM issue_jobs;
+   DROP TABLE issue_jobs;
+   ALTER TABLE issue_jobs_unattended RENAME TO issue_jobs;
+   CREATE UNIQUE INDEX issue_jobs_open ON issue_jobs (repo, issue) WHERE state NOT IN ('ignored','done','stopped','stuck');
+   CREATE INDEX issue_jobs_due ON issue_jobs (state, created_at);
+   CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL;
+   CREATE TRIGGER issue_runtime_gate BEFORE UPDATE ON issue_jobs
+     WHEN NEW.version > OLD.version AND NEW.runtime_revision = OLD.runtime_revision
+     BEGIN SELECT RAISE(ABORT, 'incompatible issue runtime; reload the plugin'); END;
+   ALTER TABLE issue_rounds ADD COLUMN cause TEXT;
+   ALTER TABLE issue_rounds ADD COLUMN target_json TEXT;
+   ALTER TABLE issue_rounds ADD COLUMN outcome_json TEXT;
+   UPDATE issue_rounds SET cause = kind;
+   CREATE TABLE issue_submissions (
+     id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, epoch INTEGER NOT NULL, round INTEGER NOT NULL,
+     thread_id TEXT NOT NULL, hash TEXT NOT NULL, raw TEXT NOT NULL, submitted_at INTEGER NOT NULL,
+     evaluated_at INTEGER, result TEXT, snapshot_json TEXT, UNIQUE(job_id, epoch, round, thread_id, hash)
+   );
+   CREATE INDEX issue_submissions_pending ON issue_submissions (evaluated_at, job_id);
+   CREATE TABLE issue_status (
+     repo TEXT NOT NULL, issue INTEGER NOT NULL, job_id TEXT NOT NULL, generation INTEGER NOT NULL,
+     revision INTEGER NOT NULL, body TEXT NOT NULL, delivered_revision INTEGER NOT NULL DEFAULT 0,
+     lease_until INTEGER, next_at INTEGER NOT NULL DEFAULT 0, error TEXT,
+     decorations_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(repo, issue)
+   );
+   INSERT INTO issue_status (repo, issue, job_id, generation, revision, body)
+     SELECT j.repo, j.issue, j.id, j.generation, 1, 'Issue #' || j.issue || ': ' || j.state
+     FROM issue_jobs j WHERE j.state != 'ignored' AND NOT EXISTS (
+       SELECT 1 FROM issue_jobs newer WHERE newer.repo = j.repo AND newer.issue = j.issue AND newer.state != 'ignored'
+         AND (newer.generation > j.generation OR (newer.generation = j.generation AND newer.created_at > j.created_at))
+     );`,
+  `ALTER TABLE issue_submissions ADD COLUMN intended_sha TEXT`,
+  `UPDATE issue_jobs SET
+     control_json = json_set(control_json, '$.disposition', CASE
+       WHEN (SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) = 'merged' THEN 'merged'
+       WHEN (SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) = 'closed' THEN 'closed'
+       WHEN json_extract(report_json, '$.outcome') = 'no-change' THEN 'no-change'
+     END), version = version + 1, runtime_revision = runtime_revision + 1
+   WHERE state = 'done' AND json_extract(control_json, '$.disposition') IS NULL
+     AND ((SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) IN ('merged','closed')
+       OR json_extract(report_json, '$.outcome') = 'no-change')`,
+  `ALTER TABLE issue_rounds ADD COLUMN feedback_round INTEGER`,
+  `ALTER TABLE issue_status ADD COLUMN lease_owner TEXT;
+   ALTER TABLE issue_status ADD COLUMN retry_not_before INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE issue_status ADD COLUMN desired_labels_key TEXT;
+   CREATE TABLE issue_review_schedule (
+     job_id TEXT PRIMARY KEY REFERENCES issue_jobs(id) ON DELETE CASCADE,
+     next_at INTEGER NOT NULL
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

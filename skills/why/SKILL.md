@@ -26,7 +26,7 @@ If the target is vague ("why do we do it this way?" with no clear referent), mak
 
 ## Step 2. Establish the Code Anchor
 
-Before spawning investigators, build the seed context inline: file paths and line ranges, key symbols (functions, classes, constants), the last few commits touching the target, PR numbers from merge commits (pattern `(#1234)` in the subject line), and any linked ticket IDs. Run `git blame -L <start>,<end> <file>` for last-touch commits, `git log --follow -p -- <file>` for full history with patches through renames, `git log --oneline -20 -- <file>` for recent commits with PR numbers visible, and `git log -1 --format=%B <commit>` to extract PR numbers. Then pull the PR bodies and discussion for any substantive commit: `gh pr view <number> --json title,body,author,createdAt,mergedAt,labels,closingIssuesReferences,comments,reviews`. This anchor goes to every investigator and to the synthesizer.
+Before spawning investigators, build the seed context inline: file paths and line ranges, key symbols (functions, classes, constants), the last few commits touching the target, PR numbers from merge commits (pattern `(#1234)` in the subject line), and any linked ticket IDs. Run `git blame -L <start>,<end> <file>` for last-touch commits, `git log --follow -p -- <file>` for full history with patches through renames, `git log --oneline -20 -- <file>` for recent commits with PR numbers visible, and `git log -1 --format=%B <commit>` to extract PR numbers. Then pull the PR bodies and discussion for any substantive commit: `gh pr view <number> --json title,body,author,createdAt,mergedAt,labels,closingIssuesReferences,comments,reviews`, or `bb pstack gh pr view <number>` and `bb pstack gh pr feedback <number>` when agents hold no GitHub token (the **github** skill). This anchor goes to every investigator and to the synthesizer.
 
 ## Step 3. Spawn Parallel Investigators
 
@@ -46,7 +46,7 @@ Map each available MCP to one evidence category:
 6. Error / exception tracking
 7. Product analytics warehouse
 
-Source control is always available through git and `gh`. For the other six, classify using the MCP name, server instructions, tool names, and resource descriptors. If an MCP could fit more than one category, choose the one matching its primary evidence. Record ambiguous cases in the coverage map.
+Source control is always available through git and `gh`, or `bb pstack gh` when agents hold no GitHub token. For the other six, classify using the MCP name, server instructions, tool names, and resource descriptors. If an MCP could fit more than one category, choose the one matching its primary evidence. Record ambiguous cases in the coverage map.
 
 Launch one `panel` seat per category that has a matching MCP, so they run concurrently, each owning exactly one tool or MCP. Don't ask one agent to cover multiple MCPs. Model: `{ "role": "why investigators" }`, default `codex/gpt-6.1-sol/xhigh`.
 
