@@ -322,12 +322,12 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!tree.ok) return tree.transient ? { kind: "retry", error: tree.error, notBefore: null } : { kind: "fail", error: tree.error };
         const repo = github.repo(job.repo, until(deadline));
         const capabilities = await repo.capabilities({ fresh: true });
-        if (capabilities.archived || capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return { kind: "fail", error: "publication requires existing contents and pull requests write grants on an active repository" };
+        if (capabilities.archived || capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return { kind: "fail", error: "publication requires existing contents and pull requests write grants on an active repository", publicFailure: { kind: "publication-denied" } };
         const comparisonSha = job.report?.outcome === "changes" && job.report.headSha === effect.sha && job.report.comparisonSha ? job.report.comparisonSha : effect.expectedRemoteSha ?? capabilities.defaultHead;
         const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: effect.sha, comparisonSha }, until(deadline));
         if (inspected.kind !== "inspected") return { kind: "fail", error: `publication commit ${inspected.sha} is unavailable; original workspace retained` };
         if (!inspected.nonemptyDiff) return { kind: "fail", error: "the pinned publication has no changes against its comparison commit" };
-        if (inspected.workflows && capabilities.permissions.workflows !== "write") return { kind: "fail", error: "workflow changes require workflows write, which is not already granted; commits retained" };
+        if (inspected.workflows && capabilities.permissions.workflows !== "write") return { kind: "fail", error: "workflow changes require workflows write, which is not already granted; commits retained", publicFailure: { kind: "workflow-permission" } };
         const { remoteUrl, token } = await repo.pushCredentials({ workflows: inspected.workflows });
         try {
           const input = { worktreePath: tree.path, remoteUrl, branch: job.branch, sha: effect.sha, expectedRemoteSha: effect.expectedRemoteSha, comparisonSha, workflows: inspected.workflows, token };
@@ -339,7 +339,7 @@ export function createIssues(deps: IssuesDeps): Issues {
             if (remoteSha === effect.sha) return done({ pushedSha: effect.sha });
             return remoteSha ? { kind: "publication-diverged", remoteSha, reason: result.reason } : { kind: "fail", error: "the publication branch disappeared; accepted work is preserved" };
           }
-          if (result.status === "rejected") return { kind: "fail", error: `push rejected (${result.reason}): ${result.detail}` };
+          if (result.status === "rejected") return { kind: "fail", error: `push rejected (${result.reason}): ${result.detail}`, ...(result.reason === "denied" ? { publicFailure: { kind: "publication-denied" as const } } : {}) };
           return { kind: "unknown", error: `push failed: ${result.detail}` };
         } catch (error) {
           return { kind: "unknown", error: `push: ${message(error)}` };
@@ -524,7 +524,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     } catch (error) {
       if (error instanceof GitHubTransientError) return { kind: "retry", error: error.message, notBefore: error.notBefore };
       if (error instanceof GitHubSetupError) return { kind: "fail", error: error.message };
-      if (error instanceof GitHubPermanentError) return { kind: "fail", error: error.message };
+      if (error instanceof GitHubPermanentError) return { kind: "fail", error: error.message, ...(error.status === 403 && (effect.op === "push" || effect.op === "open-pr") ? { publicFailure: { kind: "publication-denied" as const } } : {}) };
       return { kind: "unknown", error: `${effect.op}: ${message(error)}` };
     }
   }
