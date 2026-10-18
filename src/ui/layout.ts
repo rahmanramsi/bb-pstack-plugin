@@ -120,6 +120,8 @@ export const issueStates: Record<JobState, { label: string; tone: StatusTone }> 
   replying: { label: "Replying to reviews", tone: "running" },
   asking: { label: "Asking for details", tone: "running" },
   "needs-info": { label: "Needs details", tone: "uncertain" },
+  tracking: { label: "Tracking sub-issues", tone: "blocked" },
+  updating: { label: "Updating status", tone: "running" },
   closing: { label: "Closing", tone: "running" },
   done: { label: "Done", tone: "succeeded" },
   stopping: { label: "Stopping", tone: "cancelled" },

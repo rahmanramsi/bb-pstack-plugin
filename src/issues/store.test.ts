@@ -241,7 +241,7 @@ test("the sub-issue migration keeps existing jobs, and a parent gets at most one
      VALUES ('psi_old', ?, 40, 1, 7, 'maya', 1, '{"title":"t","body":"b","url":"u","author":"maya"}', 'prj_1', 'host_1', 'main', 'agent/issue-40-t', 'queued', 5, 5)`,
   ).run(REPO);
   for (const statement of MIGRATIONS.slice(rebuild)) db.exec(statement);
-  const store = openIssueStore(db);
+  const store = openIssueStore(db, () => {});
   const old = store.get("psi_old" as JobId)!;
   assert.deepEqual([old.phase.state, old.trigger.eventId, old.parentId, old.progress], ["queued", 7, null, null]);
   const parent = store.insert(newJob({ state: "tracking" }), 10)!;
