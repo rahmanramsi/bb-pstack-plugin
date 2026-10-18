@@ -11,7 +11,7 @@ import { parseChoice } from "../models.ts";
 import { MIGRATIONS } from "../store.ts";
 import { createIssues } from "./engine.ts";
 import { createGitHub } from "./github.ts";
-import type { JobView, RepoName } from "./job.ts";
+import type { JobView, RepoName, TreeFact } from "./job.ts";
 import { openIssueStore, type IssueStore } from "./store.ts";
 
 
@@ -279,6 +279,7 @@ export function harness() {
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
+  const treeReads = { count: 0 };
   const threadReads = { count: 0 };
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
@@ -405,6 +406,7 @@ export function harness() {
   for (const statement of MIGRATIONS) db.exec(statement);
   let repoLine = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
   let workerRole = "codex/gpt-6.1-sol/high";
+  let tree = (_threadId: string): TreeFact | null => ({ lastActiveAt: clock.now, queued: false });
 
   /** A store that goes dead when its engine "crashes": reads find nothing and writes change nothing. */
   function engine() {
@@ -440,6 +442,10 @@ export function harness() {
       resolveRole: (role) => (role === "issue worker" ? [parseChoice(workerRole)!] : []),
       prGate: () => (failures.gate ? { pass: false, reason: failures.gate } : { pass: true }),
       activeWork: async () => ({ ...work }),
+      treeActivity: async (threadId: string) => {
+        treeReads.count++;
+        return tree(threadId);
+      },
       checkWorker: async (hostId: string, tuple: string) => {
         assert.equal(hostId, "host_worker");
         return CATALOG.has(tuple) ? null : `${tuple}: not in the host's catalog`;
@@ -538,6 +544,7 @@ export function harness() {
     late,
     calls,
     threadReads,
+    treeReads,
     spawned,
     sent,
     stopped,
@@ -564,6 +571,7 @@ export function harness() {
     engine: () => current,
     setRepo: (line: typeof repoLine) => (repoLine = line),
     setWorkerRole: (value: string) => (workerRole = value),
+    setTree: (value: (threadId: string) => TreeFact | null) => (tree = value),
     holdAt: (key: string, where: "sdk" | "github") => {
       const h = hold(key);
       (where === "sdk" ? holds : gh.holds).push(h);

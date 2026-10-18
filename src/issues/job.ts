@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, silenceText, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -312,6 +312,13 @@ export type ThreadFact =
   | { kind: "gone" };
 
 /**
+ * Progress across the worker's thread tree: the worker, its child threads, and the threads of the pstack runs they
+ * started. `lastActiveAt` is the newest progress event in it, or the last time a member was seen held, so time spent
+ * held never counts as silence. `queued`: a member is held right now, before its turn or waiting for a run slot.
+ */
+export type TreeFact = { lastActiveAt: number | null; queued: boolean };
+
+/**
  * Why a queued job's worker cannot be resolved. `permanent` when only an operator can fix it, such as a model the host
  * does not have: the job sticks with the reason instead of waiting.
  */
@@ -350,6 +357,7 @@ export type Facts = {
   children: readonly ChildFact[] | null;
   /** For a sub-issue's queued job: its open blockers as its parent last polled them. */
   blockers: readonly string[] | null;
+  tree: TreeFact | null;
 };
 
 export type FactName = Exclude<keyof Facts, "now">;
@@ -386,6 +394,7 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
+  if (REPORTING.has(job.phase.state)) return silencePossible(job, facts.now) ? ["tree"] : [];
   if (job.phase.state !== "review" || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.round > MAX_FEEDBACK_ROUNDS) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
 }
@@ -418,10 +427,33 @@ export type Action =
 export const MAX_NUDGES = 2;
 const THREAD_FAILED = "the worker thread failed, waiting for it to recover: ";
 const IDLE_WORKER = "the worker stopped without reporting after every reminder; message its thread or stop the job";
+/** How long the worker's tree may show no progress before it is reminded, and after MAX_NUDGES reminders, waits. */
+export const SILENCE_MS = 20 * 60_000;
+const SILENT_WORKER = `no activity from the worker or its subagents for ${SILENCE_MS / 60_000} minutes after every reminder`;
+const SILENT_IDLE = `${SILENT_WORKER}; message its thread or stop the job`;
+const SILENT_MID_TURN = `${SILENT_WORKER} while the worker was mid-turn; message its thread or stop the job`;
+/** The job waits for a person because its worker's tree went silent after every reminder. */
+export const waitsOnSilence = (job: Job) => job.error?.startsWith(SILENT_WORKER) ?? false;
+/** Progress this long after the job's last write, which a reminder makes, means work resumed since that reminder. */
+const RESUMED_AFTER_WRITE_MS = 5 * 60_000;
+/** The tree costs a bb call per member to read, so it is read only once it may be silent, or while the job waits on it. */
+const silencePossible = (job: Job, now: number) => now - job.updatedAt >= SILENCE_MS || waitsOnSilence(job);
 export const ROUND_MS = 4 * 60 * 60_000;
 
 /** States a round runs through, from its start until the job rests in review or needs-info, or heads to an end. */
 const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "asking", "sending", "respawning", "addressing", "republishing", "replying"]);
+
+function silence(job: Job, thread: "idle" | "active", tree: TreeFact | null, now: number): Action | null {
+  if (!tree || tree.queued) return null;
+  const nudges = tree.lastActiveAt !== null && tree.lastActiveAt > job.updatedAt + RESUMED_AFTER_WRITE_MS ? 0 : job.nudges;
+  if (waitsOnSilence(job)) {
+    return tree.lastActiveAt !== null && tree.lastActiveAt > job.updatedAt ? { type: "change", change: { error: null, nudges } } : null;
+  }
+  if (now - Math.max(tree.lastActiveAt ?? 0, job.updatedAt) < SILENCE_MS) return null;
+  // The reminder's write moves updatedAt, which restarts the window, so the reminder never counts as progress.
+  if (nudges < MAX_NUDGES) return { type: "nudge", text: silenceText(job, nudges), change: { nudges: nudges + 1 } };
+  return { type: "change", change: { error: thread === "active" ? SILENT_MID_TURN : SILENT_IDLE } };
+}
 
 /** Marks a change that takes the job out of its round as the round's end. */
 function rounded(job: Job, change: Change): Change {
@@ -496,14 +528,17 @@ function next(job: Job, facts: Facts): Action | null {
         }
         case "idle":
           if (job.error?.startsWith(THREAD_FAILED)) return { type: "change", change: { error: null } };
-          if (thread.since <= job.updatedAt || facts.waiting) return null;
-          if (job.nudges >= MAX_NUDGES) {
-            return job.error === IDLE_WORKER ? null : { type: "change", change: { error: IDLE_WORKER } };
+          if (job.error === IDLE_WORKER) return null;
+          if (thread.since > job.updatedAt && !facts.waiting) {
+            if (job.nudges >= MAX_NUDGES) return { type: "change", change: { error: IDLE_WORKER } };
+            return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
           }
-          return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
+          break;
         case "active":
-          return job.error?.startsWith(THREAD_FAILED) || job.error === IDLE_WORKER ? { type: "change", change: { error: null } } : null;
+          if (job.error?.startsWith(THREAD_FAILED) || job.error === IDLE_WORKER || job.error === SILENT_IDLE) return { type: "change", change: { error: null } };
+          break;
       }
+      return silence(job, thread.kind, facts.tree, now);
     }
     case "tracking":
       return facts.children ? track(job, facts.children) : null;

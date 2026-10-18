@@ -20,6 +20,7 @@ import {
   FACTS_FOR,
   LABEL,
   REPORTING,
+  SILENCE_MS,
   TERMINAL,
   acceptReport,
   parseReport,
@@ -34,6 +35,7 @@ import {
   plan,
   settle,
   stop as stopChange,
+  waitsOnSilence,
   type Action,
   type Change,
   type Effect,
@@ -51,16 +53,19 @@ import {
   type ReportFacts,
   type Sha,
   type SubIssue,
+  type TreeFact,
   type WorkerProblem,
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 import { commentBody, effectMarker, mergeNote, workerInstructions } from "./text.ts";
+import { isMissing } from "./tree.ts";
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
 const MAX_STEPS = 20;
 const SETTLE_MARGIN_MS = 5_000;
+const RECHECK_MS = 60_000;
 /** Kept back from the push so the token can still be revoked before the lease ends. */
 const REVOKE_MS = 30_000;
 
@@ -81,6 +86,8 @@ export type IssuesDeps = {
    * while the host is offline.
    */
   checkWorker: (hostId: string, tuple: string) => Promise<string | null>;
+  /** Progress across the worker's thread tree, or null when it cannot be read whole. */
+  treeActivity: (threadId: string) => Promise<TreeFact | null>;
   /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
   activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
@@ -102,10 +109,6 @@ export type Issues = {
 export type ReportResult = { ok: true; message: string } | { ok: false; code: string; message: string };
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
-const isMissing = (error: unknown) => {
-  const candidate = error as { status?: unknown; code?: unknown } | null;
-  return candidate?.status === 404 || candidate?.code === "thread_not_found";
-};
 const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
@@ -404,8 +407,27 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  /** When to walk a job's tree next, and when a walk last saw a member held. Not persisted: a restart costs one walk. */
+  type TreeWalks = { nextWalkAt: number; lastHeldAt: number | null };
+  const treeWalks = new Map<JobId, TreeWalks>();
+
+  async function treeFact(job: Job, threadId: string, now: number): Promise<TreeFact | null> {
+    const memo = treeWalks.get(job.id);
+    if (memo && now < memo.nextWalkAt) return null;
+    const tree = await deps.treeActivity(threadId).catch(() => null);
+    const lastHeldAt = tree?.queued ? now : (memo?.lastHeldAt ?? null);
+    if (!tree) {
+      treeWalks.set(job.id, { nextWalkAt: now + RECHECK_MS, lastHeldAt });
+      return null;
+    }
+    const lastActiveAt = lastHeldAt === null ? tree.lastActiveAt : Math.max(tree.lastActiveAt ?? 0, lastHeldAt);
+    const nextWalkAt = tree.queued || waitsOnSilence(job) ? now + RECHECK_MS : Math.max(lastActiveAt ?? 0, job.updatedAt) + SILENCE_MS;
+    treeWalks.set(job.id, { nextWalkAt, lastHeldAt });
+    return { lastActiveAt, queued: tree.queued };
+  }
+
   async function gather(job: Job): Promise<Facts> {
-    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, tree: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
@@ -436,6 +458,9 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       if (wanted.includes("gate")) facts.gate = deps.prGate(threadId);
     }
+    const live = facts.thread?.kind === "active" || facts.thread?.kind === "idle";
+    if (!wanted.includes("tree")) treeWalks.delete(job.id);
+    else if (live && job.threadId) facts.tree = await treeFact(job, job.threadId, facts.now);
     return facts;
   }
 

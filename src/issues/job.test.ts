@@ -74,7 +74,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, tree: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);
@@ -226,6 +226,60 @@ test("a working job waits through a failed or idle worker, nudges an idle one tw
   const silent = plan({ ...nudged, nudges: 2 }, facts({ thread: { kind: "idle", since: NOW + 10 } })) as { change: Change };
   assert.equal(silent.change.phase, undefined, "a worker silent after every reminder waits for a person");
   assert.match(silent.change.error!, /stopped without reporting after every reminder/);
+});
+
+test("a worker whose whole tree shows no progress for 20 minutes is reminded twice, then waits for a person", () => {
+  const working = job({ phase: { state: "working" }, threadId: "thr_w", updatedAt: NOW - 30 * MIN });
+  const idle = { thread: { kind: "idle", since: NOW - 25 * MIN }, waiting: true } as const;
+  const silent = { lastActiveAt: NOW - 21 * MIN, queued: false };
+  const at = (minutes: number, overrides: Partial<Facts> = {}) => facts({ ...idle, tree: silent, now: NOW + minutes * MIN, ...overrides });
+
+  assert.equal(plan(working, at(0, { tree: { lastActiveAt: NOW - 19 * MIN, queued: false } })), null, "progress within 20 minutes");
+  assert.equal(plan(working, at(0, { tree: { lastActiveAt: NOW - 60 * MIN, queued: true } })), null, "a held subagent is not silence");
+  assert.equal(plan(working, at(0, { tree: null })), null, "an unread tree gives no verdict");
+
+  const first = plan(working, at(0));
+  assert.equal(first?.type, "nudge", "an idle worker waiting on a hung child is still caught");
+  assert.deepEqual((first as { change: Change }).change, { nudges: 1 });
+  assert.match((first as { text: string }).text, /20 minutes[\s\S]*bb pstack issues report --file[\s\S]*reminder 1 of 2\.$/);
+
+  const once = { ...working, nudges: 1, updatedAt: NOW };
+  assert.equal(plan(once, at(19)), null, "the reminder restarts the window");
+  assert.deepEqual((plan(once, at(20)) as { change: Change }).change, { nudges: 2 });
+
+  const spent = { ...once, nudges: 2, updatedAt: NOW + 20 * MIN };
+  const waits = plan(spent, at(40)) as { type: string; change: Change };
+  assert.equal(waits.type, "change");
+  assert.equal(waits.change.phase, undefined, "silence after every reminder does not end the job");
+  assert.match(waits.change.error!, /^no activity from the worker or its subagents for 20 minutes after every reminder; message its thread or stop the job$/);
+  const waiting = { ...spent, error: waits.change.error!, updatedAt: NOW + 40 * MIN };
+  assert.equal(plan(waiting, at(61)), null, "the reason is written once");
+  assert.deepEqual((plan(waiting, at(41, { thread: { kind: "active" } })) as { change: Change }).change, { error: null }, "the worker went active");
+
+  const midTurn = plan(spent, at(40, { thread: { kind: "active" } })) as { change: Change };
+  assert.match(midTurn.change.error!, /^no activity from the worker or its subagents for 20 minutes after every reminder while the worker was mid-turn/);
+  const hung = { ...spent, error: midTurn.change.error!, updatedAt: NOW + 40 * MIN };
+  assert.equal(plan(hung, at(41, { thread: { kind: "active" } })), null, "an active thread that shows no progress keeps the reason");
+
+  const stopped = plan({ ...working, nudges: 2 }, facts({ thread: { kind: "idle", since: NOW } })) as { change: Change };
+  const idleWorker = { ...working, nudges: 2, error: stopped.change.error!, updatedAt: NOW };
+  assert.equal(plan(idleWorker, at(40)), null, "a worker already waiting because it stopped is not reworded by silence");
+});
+
+test("progress after a reminder starts the count again, and progress clears the wait", () => {
+  const reminded = job({ phase: { state: "working" }, threadId: "thr_w", nudges: 2, updatedAt: NOW - 60 * MIN });
+  const active = { thread: { kind: "active" } } as const;
+  const resumed = plan(reminded, facts({ ...active, tree: { lastActiveAt: NOW - 30 * MIN, queued: false } }));
+  assert.equal(resumed?.type, "nudge");
+  assert.deepEqual((resumed as { change: Change }).change, { nudges: 1 });
+  assert.match((resumed as { text: string }).text, /reminder 1 of 2/);
+
+  const blip = plan(reminded, facts({ ...active, tree: { lastActiveAt: NOW - 57 * MIN, queued: false } })) as { change: Change };
+  assert.match(blip.change.error!, /^no activity from the worker or its subagents/, "progress right after the last write is not resumed work");
+
+  const waiting = { ...reminded, error: blip.change.error! };
+  assert.deepEqual((plan(waiting, facts({ ...active, tree: { lastActiveAt: NOW - 5 * MIN, queued: false } })) as { change: Change }).change, { error: null, nudges: 0 });
+  assert.equal(plan(waiting, facts({ ...active, tree: { lastActiveAt: NOW - 50 * MIN, queued: true } })), null, "a hold alone neither clears nor renews the reason");
 });
 
 test("stop replaces a pending outbox, stops a worker that may exist, and is null once the job has ended", () => {
