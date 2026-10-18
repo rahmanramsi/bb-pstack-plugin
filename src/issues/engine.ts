@@ -553,6 +553,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt: retry.length ? Math.max(...retry) : null };
         if (thread.status === "idle" && queued.length) return { kind: "waiting" };
       }
+      if (thread.status === "idle" && (thread.activeBackgroundAgentCount > 0 || thread.runtime && !["idle", "error"].includes(thread.runtime.displayStatus))) return { kind: "waiting" };
       if (thread.status === "idle") return { kind: "idle", since: thread.updatedAt };
       return { kind: "active" };
     } catch (error) {
