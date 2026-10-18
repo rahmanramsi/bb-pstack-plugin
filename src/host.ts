@@ -116,15 +116,28 @@ async function withScratch<T>(worktreePath: string, tempDir: string, signal: Abo
 }
 
 async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<InspectCommitResult> {
-  for (const sha of [input.sha, input.comparisonSha, ...input.ancestorShas ?? []]) {
+  for (const sha of [input.sha, input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : [], ...input.ancestorShas ?? []]) {
     if ((await git(["cat-file", "-e", `${sha}^{commit}`], env, signal)).code !== 0) return { kind: "missing-object", sha };
   }
   const common = await git(["merge-base", input.comparisonSha, input.sha], env, signal);
   if (common.code !== 0) throw new Error("cannot establish a merge base for pinned Git objects");
   const diff = await git(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", common.stdout.trim(), input.sha], env, signal);
-  const history = await git(["log", "--format=", "--name-only", "--no-renames", "-z", `${input.comparisonSha}..${input.sha}`], env, signal);
+  const history = await git(["log", "--no-ext-diff", "--no-textconv", "--format=", "--name-only", "--no-renames", "--diff-merges=remerge", "-z", input.sha, "--not", input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : []], env, signal);
   if (diff.code !== 0 || history.code !== 0) throw new Error("cannot inspect pinned Git objects");
-  const workflows = `${diff.stdout}\0${history.stdout}`.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));
+  let workflows = history.stdout.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));
+  if (input.publishedSha) {
+    const ancestor = await git(["merge-base", "--is-ancestor", input.publishedSha, input.sha], env, signal);
+    if (ancestor.code !== 0 && ancestor.code !== 1) throw new Error("cannot inspect pinned publication ancestry");
+    if (ancestor.code === 1) {
+      const oldBase = await git(["merge-base", input.comparisonSha, input.publishedSha], env, signal);
+      if (oldBase.code !== 0) throw new Error("cannot establish the published contribution base");
+      const oldContribution = await git(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", oldBase.stdout.trim(), input.publishedSha, "--", ".github/workflows/"], env, signal);
+      const replaced = await git(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", input.publishedSha, input.sha, "--", ".github/workflows/"], env, signal);
+      if (oldContribution.code !== 0 || replaced.code !== 0) throw new Error("cannot inspect replaced workflow contribution");
+      const contributed = new Set(oldContribution.stdout.split("\0").filter(Boolean));
+      workflows ||= replaced.stdout.split("\0").some((path) => contributed.has(path));
+    }
+  }
   const ancestry = [];
   for (const sha of input.ancestorShas ?? []) {
     const result = await git(["merge-base", "--is-ancestor", sha, input.sha], env, signal);
@@ -155,7 +168,7 @@ async function push(input: PushInput & { rewrite?: boolean | undefined }, tempDi
       }
     }
 
-    const classified = await inspectObjects({ worktreePath: input.worktreePath, sha: input.sha, comparisonSha: input.comparisonSha }, local, signal);
+    const classified = await inspectObjects({ worktreePath: input.worktreePath, sha: input.sha, comparisonSha: input.comparisonSha, publishedSha: input.expectedRemoteSha }, local, signal);
     if (classified.kind === "missing-object") return { status: "rejected", reason: "missing-commit", detail: `missing comparison object ${classified.sha}` };
     if (classified.workflows !== input.workflows) return { status: "rejected", reason: "denied", detail: "workflow classification changed" };
     const ref = `refs/heads/${input.branch}`;

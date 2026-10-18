@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import entry from "./host.ts";
 
@@ -40,6 +40,7 @@ function filesContaining(dir: string, needle: string): string[] {
  */
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "pstack-host-"));
+  after(() => rmSync(root, { recursive: true, force: true }));
   const remote = join(root, "remote.git");
   const evil = join(root, "evil.git");
   const main = join(root, "main");
@@ -63,8 +64,8 @@ function fixture() {
 
   const harness = experimental_createHostEntryHarness(entry, { experimental_paths: { dataDir: join(root, "data"), tempDir: temp } });
   const baseSha = sh(worktree, "rev-parse", "HEAD");
-  const push = (sha: string, expectedRemoteSha: string | null, branch = BRANCH) =>
-    harness.experimental_call("push", { worktreePath: worktree, remoteUrl: `file://${remote}`, branch, sha, expectedRemoteSha, comparisonSha: expectedRemoteSha ?? baseSha, workflows: false, token: TOKEN });
+  const push = (sha: string, expectedRemoteSha: string | null, branch = BRANCH, comparisonSha = baseSha) =>
+    harness.experimental_call("push", { worktreePath: worktree, remoteUrl: `file://${remote}`, branch, sha, expectedRemoteSha, comparisonSha, workflows: false, token: TOKEN });
   const remoteHead = () => {
     try {
       return sh(root, "--git-dir", remote, "rev-parse", `refs/heads/${BRANCH}`);
@@ -72,7 +73,7 @@ function fixture() {
       return null;
     }
   };
-  return { root, remote, evil, worktree, temp, loot, push, remoteHead, harness, baseSha };
+  return { root, main, remote, evil, worktree, temp, loot, push, remoteHead, harness, baseSha };
 }
 
 test("push sends the reported commit from a scratch repository the worktree's config and hooks never touch", async () => {
@@ -158,7 +159,7 @@ test("pushBranch pushes any plain branch name and still never rewrites it", asyn
   const diverged = await call(rebased, first, "feat/thing");
   assert.equal(diverged.status === "rejected" && diverged.reason, "not-descendant");
   const leased = (expected: string) => f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: "feat/thing", sha: rebased, expectedRemoteSha: expected, comparisonSha: f.baseSha, workflows: false, token: TOKEN, rewrite: true });
-  assert.equal(((await leased("c".repeat(40))) as { reason?: string }).reason, "stale-remote", "a rewrite still needs the remote at the expected commit");
+  assert.equal(((await leased(f.baseSha)) as { reason?: string }).reason, "stale-remote", "a rewrite still needs the remote at the expected commit");
   assert.deepEqual(await leased(first), { status: "pushed", sha: rebased });
   assert.equal(sh(f.root, "--git-dir", f.remote, "rev-parse", "refs/heads/feat/thing"), rebased);
   for (const branch of ["-x", "a..b", "refs/heads/x/", "x.lock", "a b", "x@{1}"]) await assert.rejects(call(first, null, branch), branch);
@@ -201,10 +202,10 @@ test("commit inspection includes deleted and reverted workflow ancestors without
   sh(f.worktree, "rm", ".github/workflows/check.yml");
   sh(f.worktree, "commit", "-qm", "remove workflow");
   const head = commit(f.worktree, "a.txt", "change\n");
-  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base }), {
+  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { publishedSha: null, worktreePath: f.worktree, sha: head, comparisonSha: base }), {
     kind: "inspected", sha: head, comparisonSha: base, nonemptyDiff: true, workflows: true,
   });
-  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: added }), {
+  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { publishedSha: null, worktreePath: f.worktree, sha: head, comparisonSha: added }), {
     kind: "inspected", sha: head, comparisonSha: added, nonemptyDiff: true, workflows: true,
   });
   assert.equal((await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: null, comparisonSha: base, workflows: false, token: TOKEN })).status, "rejected");
@@ -220,7 +221,7 @@ test("fixed object inspection proves ancestry including default-base ancestors a
   const head = commit(f.worktree, "a.txt", "main change\n");
   sh(f.worktree, "checkout", "-qb", "side", base);
   const side = commit(f.worktree, "side.txt", "side change\n");
-  const input = { worktreePath: f.worktree, sha: head, comparisonSha: base, ancestorShas: [base, side, head] };
+  const input = { publishedSha: null, worktreePath: f.worktree, sha: head, comparisonSha: base, ancestorShas: [base, side, head] };
   const result = await f.harness.experimental_call("inspectCommit", input);
   assert.equal(result.kind, "inspected");
   if (result.kind === "inspected") assert.deepEqual(result.ancestry, [{ sha: base, included: true }, { sha: side, included: false }, { sha: head, included: true }]);
@@ -240,18 +241,93 @@ test("base-only workflows and base-only changes do not count as unpublished work
   const base = commit(f.worktree, ".github/workflows/check.yml", "name: base check\n");
   sh(f.worktree, "checkout", "-qb", "worker", common);
   const head = commit(f.worktree, "a.txt", "worker change\n");
-  const result = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base });
+  const result = await f.harness.experimental_call("inspectCommit", { publishedSha: null, worktreePath: f.worktree, sha: head, comparisonSha: base });
   assert.equal(result.kind, "inspected");
   if (result.kind === "inspected") {
     assert.equal(result.workflows, false);
     assert.equal(result.nonemptyDiff, true);
   }
-  const empty = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: common, comparisonSha: base });
+  const empty = await f.harness.experimental_call("inspectCommit", { publishedSha: null, worktreePath: f.worktree, sha: common, comparisonSha: base });
   assert.equal(empty.kind, "inspected");
   if (empty.kind === "inspected") assert.equal(empty.nonemptyDiff, false);
   const pushed = await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: null, comparisonSha: base, workflows: false, token: TOKEN });
   assert.equal(pushed.status, "pushed");
   assert.equal(f.remoteHead(), head);
+  assert.deepEqual(readdirSync(f.loot), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});
+
+test("later publication merges upstream-only workflows without requiring workflow write", async () => {
+  const f = fixture();
+  const published = commit(f.worktree, "a.txt", "worker feature\n");
+  assert.equal((await f.push(published, null)).status, "pushed");
+  mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+  const base = commit(f.main, ".github/workflows/check.yml", "name: upstream check\n");
+  sh(f.worktree, "merge", "--no-edit", base);
+  const head = sh(f.worktree, "rev-parse", "HEAD");
+  const inspected = await f.harness.experimental_call("inspectCommit", { publishedSha: published, worktreePath: f.worktree, sha: head, comparisonSha: base });
+  assert.equal(inspected.kind, "inspected");
+  if (inspected.kind === "inspected") assert.equal(inspected.workflows, false);
+  await f.harness.experimental_dispose();
+});
+
+test("rebasing onto an upstream workflow update preserves contents-only classification", async () => {
+  const f = fixture();
+  mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+  const oldBase = commit(f.main, ".github/workflows/check.yml", "name: original upstream check\n");
+  sh(f.worktree, "reset", "--hard", oldBase);
+  const published = commit(f.worktree, "a.txt", "worker feature\n");
+  assert.equal((await f.push(published, null, BRANCH, oldBase)).status, "pushed");
+  const base = commit(f.main, ".github/workflows/check.yml", "name: updated upstream check\n");
+  sh(f.worktree, "rebase", "--onto", base, oldBase);
+  const head = sh(f.worktree, "rev-parse", "HEAD");
+  const inspected = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base, publishedSha: published });
+  assert.equal(inspected.kind, "inspected");
+  if (inspected.kind === "inspected") assert.equal(inspected.workflows, false);
+  const pushed = await f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: published, comparisonSha: base, workflows: false, token: TOKEN, rewrite: true });
+  assert.equal(pushed.status, "pushed");
+  assert.equal(f.remoteHead(), head);
+  assert.deepEqual(readdirSync(f.loot), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});
+
+test("published worker workflows require no repeated grant until they change, revert or are deleted", async () => {
+  const f = fixture();
+  mkdirSync(join(f.worktree, ".github/workflows"), { recursive: true });
+  const published = commit(f.worktree, ".github/workflows/check.yml", "name: worker check\n");
+  const scope = async (sha: string) => {
+    const result = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha, comparisonSha: f.baseSha, publishedSha: published });
+    assert.equal(result.kind, "inspected");
+    return result.kind === "inspected" && result.workflows;
+  };
+  const feature = commit(f.worktree, "a.txt", "worker feature\n");
+  assert.equal(await scope(feature), false);
+  const changed = commit(f.worktree, ".github/workflows/check.yml", "name: changed worker check\n");
+  assert.equal(await scope(changed), true);
+  const reverted = commit(f.worktree, ".github/workflows/check.yml", "name: worker check\n");
+  assert.equal(await scope(reverted), true, "net-zero unpublished workflow edits still need scope");
+  sh(f.worktree, "rm", ".github/workflows/check.yml"); sh(f.worktree, "commit", "-qm", "remove worker workflow");
+  assert.equal(await scope(sh(f.worktree, "rev-parse", "HEAD")), true);
+  assert.equal(await scope(f.baseSha), true, "rewinding away published workflow work still changes the remote workflow");
+  await f.harness.experimental_dispose();
+});
+
+test("workflow conflict resolutions are inspected while clean upstream merges are excluded", async () => {
+  const f = fixture();
+  mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+  const common = commit(f.main, ".github/workflows/check.yml", "name: original\n");
+  sh(f.worktree, "reset", "--hard", common);
+  const published = commit(f.worktree, ".github/workflows/check.yml", "name: worker\n");
+  const base = commit(f.main, ".github/workflows/check.yml", "name: upstream\n");
+  assert.throws(() => sh(f.worktree, "merge", "--no-edit", base));
+  const head = commit(f.worktree, ".github/workflows/check.yml", "name: combined\n");
+  const result = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base, publishedSha: published });
+  assert.equal(result.kind, "inspected");
+  if (result.kind === "inspected") assert.equal(result.workflows, true);
+  const refused = await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: published, comparisonSha: base, workflows: false, token: TOKEN });
+  assert.equal(refused.status, "rejected");
   assert.deepEqual(readdirSync(f.loot), []);
   assert.deepEqual(readdirSync(f.temp), []);
   await f.harness.experimental_dispose();

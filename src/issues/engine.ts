@@ -296,8 +296,8 @@ export function createIssues(deps: IssuesDeps): Issues {
         const repo = github.repo(job.repo, until(deadline));
         const capabilities = await repo.capabilities({ fresh: true });
         if (capabilities.archived || capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return { kind: "fail", error: "publication requires existing contents and pull requests write grants on an active repository", publicFailure: { kind: "publication-denied" } };
-        const comparisonSha = job.report?.outcome === "changes" && job.report.headSha === effect.sha && job.report.comparisonSha ? job.report.comparisonSha : effect.expectedRemoteSha ?? capabilities.defaultHead;
-        const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: effect.sha, comparisonSha }, until(deadline));
+        const comparisonSha = job.report?.outcome === "changes" && job.report.headSha === effect.sha && job.report.comparisonSha ? job.report.comparisonSha : capabilities.defaultHead;
+        const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: effect.sha, comparisonSha, publishedSha: effect.expectedRemoteSha }, until(deadline));
         if (inspected.kind !== "inspected") return { kind: "fail", error: `publication commit ${inspected.sha} is unavailable; original workspace retained` };
         if (!inspected.nonemptyDiff) return { kind: "fail", error: "the pinned publication has no changes against its comparison commit" };
         if (inspected.workflows && capabilities.permissions.workflows !== "write") return { kind: "fail", error: "workflow changes require workflows write, which is not already granted; commits retained", publicFailure: { kind: "workflow-permission" } };
@@ -774,9 +774,9 @@ export function createIssues(deps: IssuesDeps): Issues {
       const remoteHead = job.round === 1 ? null : await github.repo(job.repo).branchSha(job.branch);
       if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub`, disposition: "fail" };
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
-      const comparisonSha = job.round === 1 ? capabilities.defaultHead : job.roundBase ?? remoteHead ?? capabilities.defaultHead;
+      const comparisonSha = capabilities.defaultHead;
       const ancestorShas = [...new Set([capabilities.defaultHead, ...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : []), ...(job.control.publicationRepair ? [job.control.publicationRepair.acceptedSha] : [])])];
-      const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha, ancestorShas });
+      const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha, publishedSha: job.roundBase ?? remoteHead, ancestorShas });
       if (inspected.kind !== "inspected") return { unavailable: `missing local commit object ${inspected.sha}`, disposition: "worker", sha: inspected.sha as Sha };
       if (ancestorShas.some((sha) => !inspected.ancestry?.some((proof) => proof.sha === sha))) return { unavailable: "the host did not establish the requested Git ancestry", disposition: "retry" };
       const gate = job.threadId ? deps.prGate(job.threadId) : { pass: false as const, reason: "the job has no worker thread" };

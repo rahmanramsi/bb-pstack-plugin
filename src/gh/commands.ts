@@ -168,9 +168,9 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
           if (expectedRemoteSha === sha) {
             return input.options.json ? json({ repo: ws.repo, branch, sha, pushed: false }) : { exitCode: 0, stdout: `${ws.repo} ${branch} is already at ${sha}.\n` };
           }
-          const comparisonSha = expectedRemoteSha ?? (await repo.capabilities({ fresh: true })).defaultHead;
+          const comparisonSha = (await repo.capabilities({ fresh: true })).defaultHead;
           if (!host.inspectCommit) throw new PluginCliError("the host cannot inspect pinned commits", { code: "unsupported_host" });
-          const classification = await host.inspectCommit(ws.hostId, { worktreePath: ws.path, sha, comparisonSha });
+          const classification = await host.inspectCommit(ws.hostId, { worktreePath: ws.path, sha, comparisonSha, publishedSha: expectedRemoteSha });
           if (classification.kind === "missing-object") throw new PluginCliError(`commit ${classification.sha} is not available in this worktree`, { code: "missing_commit" });
           if (classification.sha !== sha || classification.comparisonSha !== comparisonSha) throw new PluginCliError("the host inspected different commits", { code: "stale_inspection" });
           const workflows = classification.workflows;

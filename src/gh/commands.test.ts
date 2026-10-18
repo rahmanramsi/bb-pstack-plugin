@@ -14,7 +14,7 @@ function harness(options: { branch?: string | null; origin?: string | null; remo
   const calls: string[] = [];
   const pushes: PushBranchInput[] = [];
   const scopes: { workflows: boolean }[] = [];
-  const inspections: { sha: string; comparisonSha: string }[] = [];
+  const inspections: { sha: string; comparisonSha: string; publishedSha: string | null }[] = [];
   const created: unknown[] = [];
   const comments: { issue: number; body: string }[] = [];
   const revoked: string[] = [];
@@ -98,7 +98,7 @@ test("gh push sends HEAD to the current branch, expecting the remote head, and r
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, `Pushed ${HEAD} to acme/web feat/x.\n`);
   assert.deepEqual(h.calls, ["acme/web"]);
-  assert.deepEqual(h.pushes, [{ worktreePath: "/work/web", remoteUrl: "https://github.com/acme/web.git", branch: "feat/x", sha: HEAD, expectedRemoteSha: REMOTE, comparisonSha: REMOTE, workflows: false, token: "ghs_push", rewrite: false }]);
+  assert.deepEqual(h.pushes, [{ worktreePath: "/work/web", remoteUrl: "https://github.com/acme/web.git", branch: "feat/x", sha: HEAD, expectedRemoteSha: REMOTE, comparisonSha: MAIN, workflows: false, token: "ghs_push", rewrite: false }]);
   assert.deepEqual(h.revoked, ["ghs_push"]);
 });
 
@@ -230,9 +230,10 @@ test("gh push classifies pinned objects before requesting workflow scope and pas
     const h = harness({ remoteSha, workflows: true });
     assert.equal((await h.run(["gh", "push"])).exitCode, 0);
     assert.equal(h.inspections[0]?.sha, HEAD);
-    assert.equal(h.inspections[0]?.comparisonSha, remoteSha ?? MAIN);
+    assert.equal(h.inspections[0]?.comparisonSha, MAIN);
+    assert.equal(h.inspections[0]?.publishedSha, remoteSha);
     assert.deepEqual(h.scopes, [{ workflows: true }]);
-    assert.equal(h.pushes[0]?.comparisonSha, remoteSha ?? MAIN);
+    assert.equal(h.pushes[0]?.comparisonSha, MAIN);
     assert.equal(h.pushes[0]?.workflows, true);
   }
 });
