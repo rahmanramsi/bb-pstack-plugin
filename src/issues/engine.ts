@@ -178,7 +178,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   function recoveryPrompt(job: Job): string {
-    return [`Continue issue #${job.issue} in the existing workspace. Preserve dirty/untracked files and all local commits.`, `The previous worker stopped after ${job.error ?? "incomplete delivery"}.`, job.round > 1 ? roundPrompt(job, job.round, store.roundFeedback(job.id, job.round), store.roundSummaries(job.id), job.roundBase ?? job.pushedSha!) : workerPrompt(job), workerInstructions(job)].join("\n");
+    return [`Continue issue #${job.issue} in the existing workspace. Preserve dirty/untracked files and all local commits.`, `The previous worker stopped after ${job.error ?? "incomplete delivery"}.`, ...(job.control.bestReasons ?? []), job.round > 1 ? roundPrompt(job, job.round, store.roundFeedback(job.id, job.round), store.roundSummaries(job.id), job.roundBase ?? job.pushedSha!) : workerPrompt(job), workerInstructions(job)].join("\n");
   }
 
   function reviewObservation(job: Job, snapshot: NonNullable<Awaited<ReturnType<RepoClient["reviewSnapshot"]>>>): ReviewFact {
@@ -378,6 +378,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       async perform(job, effect) {
         if (!job.threadId) return { kind: "fail", error: "the job has no worker thread" };
         const thread = await threadFact(job.threadId);
+        if (thread?.kind === "failed" && thread.retryAt && thread.retryAt > clock()) return { kind: "retry", error: thread.error, notBefore: thread.retryAt };
+        if (thread === null) return { kind: "retry", error: "worker activity is unavailable", notBefore: null };
         if (thread?.kind === "gone" || thread?.kind === "failed") return { kind: "fail", error: "the repair worker is unavailable" };
         try {
           // Queued behind a turn that is still running, never steered into it.
@@ -386,7 +388,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           if (isMissing(error)) return { kind: "fail", error: "the worker thread is gone" };
           throw error;
         }
-        return done();
+        return done({ control: { ...job.control, idleObservation: thread.kind === "idle" ? { since: thread.since, remindedAt: clock() } : null } });
       },
     },
     reply: {
@@ -562,7 +564,6 @@ export function createIssues(deps: IssuesDeps): Issues {
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
         const retry = queued.filter((item) => item.payload.kind === "retry").map((item) => item.sendAt ?? clock() + SWEEP_MS);
         if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt: retry.length ? Math.max(...retry) : null };
-        if (queued.length) return { kind: "active" };
       }
       if (thread.status === "idle") return { kind: "idle", since: thread.updatedAt };
       return { kind: "active" };
@@ -677,7 +678,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!job) return;
       const pending = store.pendingSubmissions(id);
       if (pending.length > 0 && (REPORTING.has(job.phase.state) || TERMINAL.has(job.phase.state))) {
-        const result = await evaluateSubmission(job, pending[0]!);
+        const result = await evaluateSubmission(job, pending[0]!, true);
         if (result.code === "pending") return;
         if (result.code === "worker-action") {
           const current = store.get(id);
@@ -796,8 +797,11 @@ export function createIssues(deps: IssuesDeps): Issues {
     return { ok: true, message: `Sync accepted. pstack pushes ${short(facts.worktree.headSha)} to ${bound.branch}; checks resume before review.` };
   }
 
-  async function evaluateSubmission(job: Job, submission: Submission): Promise<{ code: string; result: ReportResult }> {
+  async function evaluateSubmission(job: Job, submission: Submission, notify = false): Promise<{ code: string; result: ReportResult }> {
     const reject = (code: string, explanation: string) => ({ code, result: { ok: false, code, message: explanation } as const });
+    const rejectedChange = (change: Change, explanation: string): Change => notify && (!change.phase || REPORTING.has(change.phase.state))
+      ? { ...change, phase: enter("recovering", [{ op: "send-round", key: `evaluation:${job.id}:${submission.id}`, text: `${explanation}\nCorrect the report in this worker and submit current verification with bb pstack issues report.` }]) }
+      : change;
     if (submission.epoch !== job.control.epoch || submission.round !== job.round || submission.threadId !== job.threadId) {
       if (awaitingThread(job) && submission.epoch === job.control.epoch) return reject("pending", "Report saved pending worker confirmation.");
       store.finishSubmission(submission.id, "stale worker or round", clock());
@@ -813,7 +817,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (!parsed.ok) {
       const result = reject(parsed.code, parsed.message);
       if (parsed.code === "other_round") { store.finishSubmission(submission.id, JSON.stringify(result.result), clock()); return result; }
-      store.write(job.id, job.version, { ...rejectReport(job, [parsed.message]), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());
+      store.write(job.id, job.version, { ...rejectedChange(rejectReport(job, [parsed.message]), parsed.message), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());
       return result;
     }
     if (parsed.parsed.report.outcome === "failure") {
@@ -836,7 +840,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (tree.ok) {
         if (submission.intendedSha && tree.headSha !== submission.intendedSha) {
           const result = reject("stale_snapshot", `The saved report is bound to ${submission.intendedSha}; the worker must verify and report the current commit.`);
-          store.finishSubmission(submission.id, JSON.stringify(result.result), clock());
+          store.write(job.id, job.version, { ...rejectedChange(rejectReport(job, [result.result.message]), result.result.message), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());
           return result;
         }
         if (!store.bindSubmission(submission.id, tree.headSha)) return reject("pending", "The report snapshot is being reconciled.");
@@ -862,12 +866,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     if (submission.intendedSha !== facts.worktree.headSha) {
       const result = reject("stale_snapshot", "The worker changed HEAD during report evaluation; current verification is required.");
-      store.finishSubmission(submission.id, JSON.stringify(result.result), clock());
+      store.write(job.id, job.version, { ...rejectedChange(rejectReport(job, [result.result.message]), result.result.message), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());
       return result;
     }
     const verdict = acceptReport({ ...job, control: { ...job.control, objectRepair: null } }, parsed.parsed, facts);
     const result: ReportResult = verdict.ok ? { ok: true, message: `Report accepted. pstack pushes ${short(facts.worktree.headSha)} to ${job.branch}; publication and verification continue automatically.` } : { ok: false, code: "rejected", message: "moved" in verdict ? `Remote moved to ${verdict.moved}. Merge it and submit current evidence.` : ["Report rejected:", ...verdict.reasons.map((reason) => `- ${reason}`)].join("\n") };
-    const written = store.write(job.id, job.version, { ...verdict.change, evaluation: { submissionId: submission.id, result: JSON.stringify(result), snapshot: { worktree: facts.worktree, gate: facts.gate, inspected: facts.inspected, baseSha: facts.baseSha } } }, clock());
+    const written = store.write(job.id, job.version, { ...(verdict.ok ? verdict.change : rejectedChange(verdict.change, result.message)), evaluation: { submissionId: submission.id, result: JSON.stringify(result), snapshot: { worktree: facts.worktree, gate: facts.gate, inspected: facts.inspected, baseSha: facts.baseSha } } }, clock());
     return written ? { code: verdict.ok ? "accepted" : "rejected", result } : reject("pending", "Report saved for automatic reevaluation.");
   }
 

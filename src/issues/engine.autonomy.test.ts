@@ -2,6 +2,59 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { harness, GOOD, MIN, SHA1, SHA2, SHA3, REPO } from "./engine-harness.ts";
 
+test("an asynchronous rejection wakes its idle worker after outage and restart", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  h.gh().outages.push({ key: "GET /repos/acme/web/installation", times: Infinity });
+  const result = await h.report(job.threadId!, { ...GOOD, pr: { ...GOOD.pr, title: "invalid title" } });
+  assert.match(result.stdout!, /saved/);
+  h.clock.now += MIN;
+  Object.assign(h.threads.get(job.threadId!)!, { status: "idle", updatedAt: h.clock.now });
+  h.restart();
+  h.gh().outages.length = 0;
+  await h.settle();
+  assert.ok(h.sent.some((message) => message.threadId === job.threadId && /title/.test(message.input[0].text)), "the current worker receives validation reasons");
+  h.clock.now += 24 * 60 * MIN;
+  await h.settle();
+  h.clock.now += MIN;
+  await h.settle();
+  h.clock.now += MIN;
+  await h.settle();
+  assert.ok(h.spawned.length > 1 || (await h.only()).outcome === "failure", "an unresponsive worker cannot remain permanently idle");
+});
+
+test("a rejection notification survives a lost response and does not consume provider retry time", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  const worker = h.threads.get(job.threadId!)!;
+  h.gh().outages.push({ key: "GET /repos/acme/web/installation", times: Infinity });
+  await h.report(worker.id, { ...GOOD, pr: { ...GOOD.pr, title: "invalid title" } });
+  await h.settle();
+  h.restart();
+  h.gh().outages.length = 0;
+  worker.status = "error";
+  h.failures.scheduledRetryAt = h.clock.now + 10 * MIN;
+  await h.settle();
+  assert.equal(h.spawned.length, 1);
+  assert.equal(h.sent.length, 0);
+  const held = h.holdAt("send", "sdk");
+  h.clock.now += 11 * MIN;
+  h.failures.scheduledRetryAt = null;
+  Object.assign(worker, { status: "idle", updatedAt: h.clock.now });
+  const sending = h.settle();
+  await held.hit;
+  h.restart();
+  held.free();
+  await sending;
+  h.clock.now += 2 * MIN;
+  await h.settle();
+  assert.equal(h.spawned.length, 1);
+  assert.ok(h.sent.length >= 2);
+  assert.ok(h.sent.every((message) => message.threadId === worker.id && /title/.test(message.input[0].text)));
+});
+
 test("accepted changes reach observed readiness with one audited issue comment", async () => {
   const h = harness();
   const { job, pr } = await h.toReview();

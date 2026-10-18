@@ -261,13 +261,14 @@ export type Control = {
   localEvidence: { head: Sha; base: Sha } | null;
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
   objectRepair: { sha: Sha } | null;
+  idleObservation: { since: number; remindedAt: number } | null;
   prerequisites: readonly { issue: number; branch: BranchName; sha: Sha }[];
   policyLimitation: string | null;
   disposition: "merged" | "closed" | "no-change" | "failure" | "stopped" | null;
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, objectRepair: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -338,7 +339,7 @@ export type Change = {
 
 export type ThreadFact =
   | { kind: "active" }
-  /** `since` is the thread's last update, compared with the job's to see whether the worker went idle again. */
+  /** `since` is the thread's last activity, independent of lifecycle writes. */
   | { kind: "idle"; since: number }
   | { kind: "failed"; error: string; retryAt?: number | null }
   | { kind: "gone" };
@@ -401,7 +402,7 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   drafting: [],
   checking: ["review", "children", "feedback", "pr"],
   review: ["feedback", "pr", "review", "children"],
-  addressing: ["thread", "waiting", "pr"],
+  addressing: ["thread", "waiting", "gate", "pr"],
   closing: [],
   done: [],
   stopping: [],
@@ -520,14 +521,13 @@ function next(job: Job, facts: Facts): Action | null {
         }
         case "idle":
           if (facts.waiting) return null;
+          if (job.control.idleObservation?.since === thread.since && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
           if (job.nudges >= MAX_NUDGES) {
-            if (now < job.updatedAt + 60_000) return { type: "sleep", until: job.updatedAt + 60_000 };
             return { type: "change", change: recover(job, "the worker stopped without reporting after two reminders") };
           }
-          if (thread.since <= job.updatedAt) return null;
-          return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
+          return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1, control: { ...job.control, idleObservation: { since: thread.since, remindedAt: now } } } };
         case "active":
-          return null;
+          return job.nudges > 0 || job.control.idleObservation !== null ? { type: "change", change: { nudges: 0, control: { ...job.control, idleObservation: null } } } : null;
       }
     }
     case "tracking":
@@ -565,7 +565,7 @@ export function rejectReport(job: Job, reasons: readonly string[]): Change {
 export function recover(job: Job, reason: string): Change {
   if (job.control.recoveries >= MAX_RECOVERIES) return stick(job, `automatic recovery exhausted: ${reason}; work is preserved in ${job.control.workspace?.path ?? "the original worker environment"}`);
   const epoch = job.control.epoch + 1;
-  return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null }, nudges: 0, deadline: null, error: reason };
+  return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null, idleObservation: null }, nudges: 0, deadline: null, error: reason };
 }
 
 export type ReviewFact =
