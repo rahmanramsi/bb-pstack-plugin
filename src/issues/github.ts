@@ -114,7 +114,8 @@ const ReviewSnapshotSchema = TargetSchema.extend({
   checks: z.array(CheckSchema).readonly(),
   required: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("known"), checks: z.array(RequiredCheckSchema).readonly(), blockers: z.array(z.string()).readonly() }),
-    z.object({ kind: z.literal("unavailable"), reason: z.string() }),
+    z.object({ kind: z.literal("unavailable"), reason: z.string(),
+      checks: z.array(RequiredCheckSchema).readonly().optional(), blockers: z.array(z.string()).readonly().optional() }),
   ]),
 });
 export type ReviewSnapshot = z.infer<typeof ReviewSnapshotSchema>;
@@ -555,22 +556,23 @@ export function createGitHub(options: GitHubOptions): GitHub {
         return items;
       }
       const suites = await collection(`${base}/commits/${head}/check-suites?per_page=100`, "check_suites", SuiteSchema);
+      const newestRuns = new Map<string, z.infer<typeof RunSchema>>();
       for (const suite of suites) {
         if (suite.head_sha !== head) complete = false;
         const runs = await collection(`${base}/check-suites/${suite.id}/check-runs?filter=all&per_page=100`, "check_runs", RunSchema);
-        const newest = new Map<string, z.infer<typeof RunSchema>>();
         for (const run of runs) {
           if (run.head_sha !== head || run.app.id !== suite.app.id) complete = false;
           const key = `${run.app.id}:${run.name}`;
-          if ((newest.get(key)?.id ?? -1) < run.id) newest.set(key, run);
+          if ((newestRuns.get(key)?.id ?? -1) < run.id) newestRuns.set(key, run);
         }
-        for (const run of newest.values()) checks.push({ id: `check-run:${run.id}`, name: run.name, source: "check-run", appId: run.app.id,
-          head: run.head_sha, state: checkState(run.status, run.conclusion), url: run.html_url });
-        if (runs.length === 0 && checkState(suite.status, suite.conclusion) !== "success") {
+        const state = checkState(suite.status, suite.conclusion);
+        if (runs.length === 0 && !["success", "neutral", "skipped"].includes(state)) {
           checks.push({ id: `check-suite:${suite.id}`, name: suite.app.slug ?? `App ${suite.app.id}`, source: "check-run", appId: suite.app.id,
-            head: suite.head_sha, state: checkState(suite.status, suite.conclusion), url: null });
+            head: suite.head_sha, state, url: null });
         }
       }
+      for (const run of newestRuns.values()) checks.push({ id: `check-run:${run.id}`, name: run.name, source: "check-run", appId: run.app.id,
+        head: run.head_sha, state: checkState(run.status, run.conclusion), url: run.html_url });
       const statuses = parsed(z.array(StatusSchema), await pages<unknown>(auth, `${base}/commits/${head}/statuses?per_page=100`), "commit statuses");
       const newest = new Map<string, z.infer<typeof StatusSchema>>();
       for (const status of statuses) {
@@ -584,9 +586,10 @@ export function createGitHub(options: GitHubOptions): GitHub {
 
     async function requiredPolicy(pull: SnapshotPull): Promise<ReviewSnapshot["required"]> {
       const branch = encodeURIComponent(pull.base.ref);
-      const unavailable = (reason: string): ReviewSnapshot["required"] => ({ kind: "unavailable", reason });
       const checks: RequiredCheck[] = [];
       const blockers: string[] = [];
+      const limitations: string[] = [];
+      const unavailable = (reason: string): ReviewSnapshot["required"] => ({ kind: "unavailable", reason, checks, blockers });
       const add = (item: z.infer<typeof PolicyCheckSchema>) => checks.push({ name: item.context, source: "either",
         appId: (item.app_id ?? item.integration_id ?? -1) > 0 ? item.app_id ?? item.integration_id ?? null : null,
         accepted: ["success", "neutral", "skipped"] });
@@ -599,18 +602,24 @@ export function createGitHub(options: GitHubOptions): GitHub {
         }
         const branchInfo = parsed(z.object({ protected: z.boolean(), commit: z.object({ sha: WireSha }) }), branchReply.json, "branch protection summary");
         if (branchInfo.commit.sha !== pull.base.sha) return unavailable("base changed during policy observation");
-        const rules = parsed(RulesSchema, await pages<unknown>(auth, `${base}/rules/branches/${branch}?per_page=100`), "active branch rules");
-        for (const rule of rules) {
-          if (rule.type === "required_status_checks") {
-            const parameters = parsed(RuleChecksSchema, rule.parameters, "required status check rule");
-            parameters.required_status_checks.forEach(add);
-            strict(parameters.strict_required_status_checks_policy);
-          } else if (rule.type === "pull_request") {
-            const parameters = parsed(z.object({ required_review_thread_resolution: z.boolean() }), rule.parameters, "pull request rule");
-            if (parameters.required_review_thread_resolution) return unavailable("required review thread resolution cannot be established from this snapshot");
-          } else if (!["creation", "deletion", "non_fast_forward", "required_linear_history"].includes(rule.type)) {
-            return unavailable(`unsupported branch requirement ${rule.type}`);
+        let rulesUrl: string | null = `${base}/rules/branches/${branch}?per_page=100`;
+        while (rulesUrl) {
+          const reply = await request(auth, "GET", rulesUrl);
+          if (reply.status !== 200) throw failure("GET", rulesUrl, reply);
+          const rules = parsed(RulesSchema, reply.json, "active branch rules");
+          for (const rule of rules) {
+            if (rule.type === "required_status_checks") {
+              const parameters = parsed(RuleChecksSchema, rule.parameters, "required status check rule");
+              parameters.required_status_checks.forEach(add);
+              strict(parameters.strict_required_status_checks_policy);
+            } else if (rule.type === "pull_request") {
+              const parameters = parsed(z.object({ required_review_thread_resolution: z.boolean() }), rule.parameters, "pull request rule");
+              if (parameters.required_review_thread_resolution) limitations.push("required review thread resolution cannot be established from this snapshot");
+            } else if (!["creation", "deletion", "non_fast_forward", "required_linear_history"].includes(rule.type)) {
+              limitations.push(`unsupported branch requirement ${rule.type}`);
+            }
           }
+          rulesUrl = nextLink(reply.headers);
         }
         if (branchInfo.protected) {
           const protection = await request(auth, "GET", `${base}/branches/${branch}/protection`);
@@ -619,17 +628,19 @@ export function createGitHub(options: GitHubOptions): GitHub {
             throw failure("GET", `${base}/branches/${branch}/protection`, protection);
           }
           const legacy = parsed(LegacyPolicySchema, protection.json, "classic branch protection");
-          if (legacy.required_conversation_resolution?.enabled || legacy.required_signatures?.enabled) return unavailable("classic protection contains requirements not observed by this snapshot");
+          if (legacy.required_conversation_resolution?.enabled || legacy.required_signatures?.enabled) limitations.push("classic protection contains requirements not observed by this snapshot");
           if (legacy.required_status_checks) {
             const required = legacy.required_status_checks;
             (required.checks ?? []).forEach(add);
-            if (required.contexts.some((context) => !required.checks?.some((check) => check.context === context))) {
-              return unavailable("classic required status contexts lack observable App bindings");
+            const unbound = required.contexts.filter((context) => !required.checks?.some((check) => check.context === context));
+            if (unbound.length) {
+              unbound.forEach((context) => add({ context }));
+              limitations.push("classic required status contexts lack observable App bindings");
             }
             strict(required.strict);
           }
         }
-        return { kind: "known", checks, blockers };
+        return limitations.length ? unavailable(limitations.join("; ")) : { kind: "known", checks, blockers };
       } catch (error) {
         if (error instanceof GitHubPermanentError && [403, 404].includes(error.status)) return unavailable(error.message);
         throw error;
@@ -671,12 +682,30 @@ export function createGitHub(options: GitHubOptions): GitHub {
         const result = parsed(z.object({ data: z.unknown().optional(), errors: z.array(z.object({ message: z.string(), type: z.string().optional() })).optional() }), reply.json, "draft mutation");
         if (result.errors?.length) {
           const denied = result.errors.some((error) => error.type === "FORBIDDEN" || error.type === "INSUFFICIENT_SCOPES");
-          throw new GitHubPermanentError(result.errors.map((error) => error.message).join("; "), denied ? 403 : 422);
+          const message = result.errors.map((error) => error.message).join("; ");
+          if (denied) throw new GitHubPermanentError(message, 403);
+          const retryAt = notBefore(reply.headers);
+          const rateLimited = result.errors.some((error) => error.type === "RATE_LIMITED");
+          const serviceFault = result.errors.some((error) => ["INTERNAL", "SERVICE_UNAVAILABLE", "TIMEOUT"].includes(error.type ?? "")
+            || (!error.type && /^(Something went wrong while executing your query|We couldn't respond to your request in time)/.test(error.message)));
+          if (rateLimited || serviceFault || (retryAt !== null && result.errors.every((error) => !error.type))) {
+            throw new GitHubTransientError(message, retryAt ?? (rateLimited ? clock() + 60_000 : null), true);
+          }
+          throw new GitHubPermanentError(message, 422);
         }
         parsed(z.object({ [mutation]: z.object({ pullRequest: z.object({ id: z.literal(pull.node_id), isDraft: z.boolean() }) }) }), result.data, "draft mutation result");
       } catch (error) {
         if (!(error instanceof GitHubTransientError)) throw error;
-        const observed = classify(await reviewSnapshot(input.expected.pr));
+        let snapshot: ReviewSnapshot | null;
+        try {
+          snapshot = await reviewSnapshot(input.expected.pr);
+        } catch (probeError) {
+          if (!(probeError instanceof GitHubTransientError)) throw probeError;
+          const cooldowns = [error.notBefore, probeError.notBefore].filter((time) => time !== null);
+          throw new GitHubTransientError(`${error.message}; draft observation failed: ${probeError.message}`,
+            cooldowns.length ? Math.max(...cooldowns) : null, true);
+        }
+        const observed = classify(snapshot);
         if (observed.kind !== "observed" || observed.snapshot.draft === input.draft) return observed;
         throw error;
       }

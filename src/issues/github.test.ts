@@ -501,14 +501,50 @@ test("snapshot paginates suites, runs, statuses and active rules and preserves n
   assert.ok(seen.some((request) => request.path.includes("filter=all")));
 });
 
-test("snapshots retain independent same-name suites and report pending suites without produced runs", async () => {
-  const { repo } = autonomySetup();
-  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 3,
-    check_suites: [suite(11), suite(12), { ...suite(13), status: "queued", conclusion: null }] } });
-  routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(10, 1, "failure")] } });
-  routes["GET /repos/acme/web/check-suites/12/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(20)] } });
-  routes["GET /repos/acme/web/check-suites/13/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
-  assert.deepEqual((await repo.reviewSnapshot(7))!.checks.map((check) => check.state), ["failure", "success", "pending"]);
+test("snapshots select newest App/name attempts across suites and retain pending suites and distinct Apps", async () => {
+  for (const pending of [false, true]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = (request) => request.path.includes("page=2")
+      ? { status: 200, json: { total_count: 4, check_suites: [suite(11), suite(14, 2)] } }
+      : { status: 200, json: { total_count: 4, check_suites: [suite(12), { ...suite(13), status: "queued", conclusion: null }] },
+        headers: { link: `<${base}/repos/acme/web/commits/${HEAD}/check-suites?page=2>; rel="next"` } };
+    routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(10, 1, "failure")] } });
+    routes["GET /repos/acme/web/check-suites/12/check-runs"] = () => ({ status: 200, json: { total_count: 1,
+      check_runs: [run(20, 1, "success", pending ? { status: "queued", conclusion: null } : {})] } });
+    routes["GET /repos/acme/web/check-suites/13/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
+    routes["GET /repos/acme/web/check-suites/14/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(30, 2, "failure")] } });
+    const snapshot = (await repo.reviewSnapshot(7))!;
+    assert.equal(snapshot.complete, true);
+    assert.deepEqual(snapshot.checks.filter((check) => check.id.startsWith("check-run:")).map((check) => [check.id, check.appId, check.state]),
+      [["check-run:20", 1, pending ? "pending" : "success"], ["check-run:30", 2, "failure"]]);
+    assert.deepEqual(snapshot.checks.filter((check) => check.id.startsWith("check-suite:")).map((check) => check.state), ["pending"]);
+  }
+});
+
+test("zero-run successful suites cannot supply required check evidence under the App name", async () => {
+  for (const conclusion of ["success", "neutral", "skipped"]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1,
+      check_suites: [{ ...suite(11), conclusion }] } });
+    routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
+    routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [{ type: "required_status_checks", parameters: {
+      required_status_checks: [{ context: "app-1", integration_id: 1 }], strict_required_status_checks_policy: false,
+    } }] });
+    const snapshot = (await repo.reviewSnapshot(7))!;
+    assert.deepEqual(snapshot.checks, []);
+    assert.deepEqual(snapshot.required.checks, [{ name: "app-1", source: "either", appId: 1, accepted: ["success", "neutral", "skipped"] }]);
+  }
+});
+
+test("zero-run failing and unknown suites retain conservative aggregate signals", async () => {
+  for (const conclusion of ["failure", "cancelled", "future_conclusion"]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1,
+      check_suites: [{ ...suite(11), conclusion }] } });
+    routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
+    assert.deepEqual((await repo.reviewSnapshot(7))!.checks.map((check) => [check.id, check.state]),
+      [["check-suite:11", conclusion === "future_conclusion" ? "unknown" : conclusion]]);
+  }
 });
 
 test("classic branch checks preserve App bindings while reviewer approvals do not block review readiness", async () => {
@@ -547,6 +583,60 @@ test("rate-limited or malformed policy reads fail truthfully instead of returnin
   await assert.rejects(repo.reviewSnapshot(7), (error) => error instanceof GitHubTransientError && error.notBefore === NOW + 30_000);
   routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: {} });
   await assert.rejects(repo.reviewSnapshot(7), GitHubTransientError);
+});
+
+test("unavailable rules preserve observed checks and blockers regardless of unsupported rule order", async () => {
+  for (const unsupportedFirst of [false, true]) {
+    const { repo, pull } = autonomySetup();
+    pull.mergeable_state = "behind";
+    const required = { type: "required_status_checks", parameters: {
+      required_status_checks: [{ context: "build", integration_id: 2 }], strict_required_status_checks_policy: true,
+    } };
+    const unsupported = { type: "workflows" };
+    routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200,
+      json: unsupportedFirst ? [unsupported, required] : [required, unsupported] });
+    const policy = (await repo.reviewSnapshot(7))!.required;
+    assert.equal(policy.kind, "unavailable");
+    assert.deepEqual(policy.checks, [{ name: "build", source: "either", appId: 2, accepted: ["success", "neutral", "skipped"] }]);
+    assert.deepEqual(policy.blockers, ["base branch must be incorporated into the head"]);
+  }
+});
+
+test("policy denial after an observed rules page or before classic protection retains known constraints", async () => {
+  for (const denyClassic of [false, true]) {
+    const { repo, pull } = autonomySetup();
+    pull.mergeable_state = "behind";
+    routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: denyClassic, commit: { sha: BASE } } });
+    routes["GET /repos/acme/web/rules/branches/main"] = (request) => request.path.includes("page=2")
+      ? { status: 403 }
+      : { status: 200, json: [{ type: "required_status_checks", parameters: {
+        required_status_checks: [{ context: "build", integration_id: 2 }], strict_required_status_checks_policy: true,
+      } }], ...(denyClassic ? {} : { headers: { link: `<${base}/repos/acme/web/rules/branches/main?page=2>; rel="next"` } }) };
+    routes["GET /repos/acme/web/branches/main/protection"] = () => ({ status: 404 });
+    const policy = (await repo.reviewSnapshot(7))!.required;
+    assert.equal(policy.kind, "unavailable");
+    assert.deepEqual(policy.checks, [{ name: "build", source: "either", appId: 2, accepted: ["success", "neutral", "skipped"] }]);
+    assert.deepEqual(policy.blockers, ["base branch must be incorporated into the head"]);
+  }
+});
+
+test("unavailable classic policy retains bound checks, unbound contexts and the strict base blocker", async () => {
+  for (const unsupported of [false, true]) {
+    const { repo, pull } = autonomySetup();
+    pull.mergeable_state = "behind";
+    routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: true, commit: { sha: BASE } } });
+    routes["GET /repos/acme/web/branches/main/protection"] = () => ({ status: 200, json: {
+      required_status_checks: { strict: true, contexts: ["build", "lint"], checks: [{ context: "build", app_id: 14 }] },
+      required_conversation_resolution: { enabled: unsupported },
+    } });
+    const policy = (await repo.reviewSnapshot(7))!.required;
+    assert.equal(policy.kind, "unavailable");
+    assert.deepEqual(policy.checks, [
+      { name: "build", source: "either", appId: 14, accepted: ["success", "neutral", "skipped"] },
+      { name: "lint", source: "either", appId: null, accepted: ["success", "neutral", "skipped"] },
+    ]);
+    assert.deepEqual(policy.blockers, ["base branch must be incorporated into the head"]);
+  }
 });
 
 test("a head or base race invalidates the snapshot and preserves the actual observed identity", async () => {
@@ -639,6 +729,60 @@ test("GraphQL authorization failures are permanent and a lost mutation response 
   assert.equal(result.kind, "observed");
   assert.ok(!result.snapshot.draft);
   assert.equal(seen.filter((request) => request.path === "/graphql").length, 2);
+});
+
+test("HTTP 200 GraphQL throttling and service errors remain uncertain with cooldowns", async () => {
+  const cases: { type?: string; message: string; headers?: Record<string, string>; retryAt: number | null }[] = [
+    { type: "RATE_LIMITED", message: "API rate limit exceeded", headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW / 1000 + 120) }, retryAt: NOW + 120_000 },
+    { type: "RATE_LIMITED", message: "API rate limit exceeded", headers: { "retry-after": "30" }, retryAt: NOW + 30_000 },
+    { type: "RATE_LIMITED", message: "API rate limit exceeded", retryAt: NOW + 60_000 },
+    { type: "INTERNAL", message: "Something went wrong while executing your query", retryAt: null },
+    { type: "SERVICE_UNAVAILABLE", message: "Service unavailable", headers: { "retry-after": "45" }, retryAt: NOW + 45_000 },
+    { message: "We couldn't respond to your request in time", retryAt: null },
+    { message: "You have exceeded a secondary rate limit", headers: { "retry-after": "90" }, retryAt: NOW + 90_000 },
+  ];
+  for (const { type, message, headers, retryAt } of cases) {
+    const { repo } = autonomySetup();
+    routes["POST /graphql"] = () => ({ status: 200, json: { data: null, errors: [{ type, message }] }, headers });
+    await assert.rejects(repo.setDraft({ expected: target(), draft: false }),
+      (error) => error instanceof GitHubTransientError && error.uncertain && error.notBefore === retryAt);
+    assert.equal(seen.filter((request) => request.path === "/graphql").length, 1);
+  }
+});
+
+test("GraphQL denial and invalid input remain permanent even with cooldown headers", async () => {
+  for (const type of ["FORBIDDEN", "INSUFFICIENT_SCOPES", "UNPROCESSABLE"]) {
+    const { repo } = autonomySetup();
+    routes["POST /graphql"] = () => ({ status: 200, json: { errors: [{ type, message: "Request rejected" }] }, headers: { "retry-after": "30" } });
+    await assert.rejects(repo.setDraft({ expected: target(), draft: false }),
+      (error) => error instanceof GitHubPermanentError && error.code === (type === "UNPROCESSABLE" ? "invalid" : "denied"));
+  }
+});
+
+test("a service fault after draft conversion probes the result without replaying the mutation", async () => {
+  const { repo, pull } = autonomySetup();
+  routes["POST /graphql"] = () => {
+    pull.draft = false;
+    return { status: 200, json: { data: null, errors: [{ type: "INTERNAL", message: "Service failure" }] } };
+  };
+  const result = await repo.setDraft({ expected: target(), draft: false });
+  assert.ok(result.kind === "observed" && !result.snapshot.draft);
+  assert.equal(seen.filter((request) => request.path === "/graphql").length, 1);
+});
+
+test("a failed mutation probe preserves uncertainty and the longest observed cooldown", async () => {
+  for (const probeDelay of [null, "180"]) {
+    const { repo, pull } = autonomySetup();
+    let pullReads = 0;
+    routes["GET /repos/acme/web/pulls/7"] = () => ++pullReads <= 3
+      ? { status: 200, json: pull }
+      : { status: 503, ...(probeDelay ? { headers: { "retry-after": probeDelay } } : {}) };
+    routes["POST /graphql"] = () => ({ status: 200, json: { errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] },
+      headers: { "retry-after": "120" } });
+    await assert.rejects(repo.setDraft({ expected: target(), draft: false }),
+      (error) => error instanceof GitHubTransientError && error.uncertain && error.notBefore === NOW + (probeDelay ? 180_000 : 120_000));
+    assert.equal(seen.filter((request) => request.path === "/graphql").length, 1);
+  }
 });
 
 function statusSetup(options: Partial<GitHubOptions> = {}) {
