@@ -130,30 +130,33 @@ Feedback that does not count is not stored.
 ```
 detected ─► working ─┬─► needs-info ──(answer)──► working
                      ├─► done (no-change)
-                     └─► review ──(feedback, CI failure, conflict)──► addressing ──► review
+                     ├─► review ──(feedback, CI failure, conflict)──► addressing ──► review
+                     └─(stalled: 4 hours, thread gone, silent after reminders)─┬─(commits)──► review, as a draft labeled agent:stuck
+                                                                               ├─(none, first time)──► working with a fresh worker
+                                                                               └─(none, again)──► stuck
 review, addressing ──(merged or closed)──► done
 any ──(@<app> stop, label removed)──► stopped
-any ──(feedback round limit, branch gone, unconfirmed write, gone worker thread)──► stuck
+any ──(feedback round limit, branch gone, unconfirmed write)──► stuck
 ```
 
 Step 2 builds feedback as the trigger for `addressing`, and `@<app> stop` comments. CI failures and conflicts come in step 4, and `needs-info` answers and the label removal in step 3.
 
-`working`, `needs-info`, `review`, and `stuck` map to the labels `agent:working`, `agent:needs-info`, `agent:review`, and `agent:stuck`. The issue has one status comment that the service edits. It states the current state and links the pull request, and nothing else.
+`working`, `needs-info`, and `review` map to the issue labels `agent:working`, `agent:needs-info`, and `agent:review`. `agent:stuck` is a pull request label: it marks a draft published before its worker finished, and a completed feedback round removes it. The issue has one status comment that the service edits. It states the current state and links the pull request, and nothing else.
 
 **The job row is the state machine, and transit states carry the outbox.** A job is either in a resting state (`queued`, `working`, `needs-info`, `review`, `addressing`, and the terminal `done`, `stopped`, `stuck`, `ignored`) or in a transit state (`starting`, `publishing`, `asking`, `closing`, `stopping`, `sticking`, `sending`, `respawning`, `republishing`, `replying`). A transit state carries the list of writes it still owes, in `effects_json` on the job row, and enters its resting state when the last one succeeds. So "writes are pending" and "the job is in transit" are one fact. A SQL `CHECK` enforces it, and a job can never reach `review` with its pull request unopened.
 
 | Transit state | Effects, in order | Then |
 |---|---|---|
-| `starting` | label the issue `agent:working`, spawn the worker | `working` |
-| `publishing` | push the reported commit, open the draft pull request, label it `agent`, relabel the issue `agent:review` | `review` |
+| `starting` | label the issue `agent:working`, spawn the worker; or, to restart a stalled first round, stop the first worker and spawn a fresh one from `origin/<base>` | `working` |
+| `publishing` | push the reported commit, open the draft pull request, label it `agent`, relabel the issue `agent:review`; for a salvaged commit, stop a worker whose thread still exists first, and label the pull request `agent:stuck` too | `review` |
 | `asking` | post the questions, relabel the issue `agent:needs-info` | `needs-info` |
 | `closing` | post the no-change reason, remove `agent:working`; or, for a merged or closed pull request, stop the worker and remove every status label | `done` |
 | `stopping` | stop the worker, remove `agent:working`, `agent:needs-info` and `agent:review` | `stopped` |
-| `sticking` | stop the worker, remove `agent:working`, `agent:needs-info` and `agent:review` | `stuck` |
+| `sticking` | post why on the issue when a restarted round still left nothing to publish, stop the worker, remove `agent:working`, `agent:needs-info` and `agent:review` | `stuck` |
 | `sending` | relabel the issue `agent:working`, send the round message to the worker | `addressing` |
 | `respawning` | relabel the issue `agent:working`, spawn a replacement worker from `origin/<branch>` with the round message, check that its worktree contains the round's base | `addressing` |
-| `republishing` | push the new commit on top of the pushed one, post each reply, edit the description if the report replaced it, re-request review, relabel the issue `agent:review` | `review` |
-| `replying` | post each reply, re-request review, relabel the issue `agent:review` | `review` |
+| `republishing` | push the new commit on top of the pushed one, post each reply, edit the description if the report replaced it, re-request review, remove `agent:stuck` from the pull request, relabel the issue `agent:review` | `review` |
+| `replying` | post each reply, re-request review, remove `agent:stuck` from the pull request, relabel the issue `agent:review` | `review` |
 
 The relabel comes first in `sending` and `respawning`, so the worker never gets the round before the job waits for its report. A report that arrives while the round is still being handed over exits with `unavailable`. Both states read the pull request's state, and a merged or closed pull request ends the job before the message or the spawn. When the replacement's worktree does not contain the round's base, the worker is sent a note, steered into its running turn, to fetch and merge `origin/<branch>` before it commits.
 
@@ -190,7 +193,7 @@ A round ends when the job leaves it: back in review, waiting in `needs-info`, or
 - A reply is longer than GitHub's 65,536 characters as it would be posted, quoted and with its marker.
 - The body is empty, longer than 10,000 characters, or describes the process instead of the change. The check matches whole phrases such as `poteto-mode`, `pstack`, `playbook`, `the checklist`, `gate pr`, `this round`, and `the agent`, not bare words, so "thread pool", "user agent", and "round the timestamp" pass. The title, the text posted on the issue, and every reply get the same check.
 
-Before posting, the service neutralizes `@mentions` into code spans in everything it posts. In the pull request body it also removes `Closes`, `Fixes`, and `Resolves` keywords and appends `Closes #<n>`. A rejected report goes back to the worker with every reason, however many times. It never ends the job.
+Before posting, the service neutralizes `@mentions` into code spans in everything it posts. In the pull request body it also removes `Closes`, `Fixes`, and `Resolves` keywords and appends `Closes #<n>`. A rejected report goes back to the worker with every reason. It never ends the job: a report with no new commit is rejected however many times, and a first-round commit rejected a second time only for problems a reviewer can judge in the pull request (uncommitted files, a failing `gate pr`, the title, the body) is published as a draft labeled `agent:stuck`, with those reasons in its body. That report exits 0 and lists them.
 
 **What the pull request shows.** The body describes the change for a reviewer who never saw the issue thread. It has no link to bb, no round history, and no status. The `agent` label marks the pull request as agent work. Replies to comments describe the code change and the commit, for example `Moved the check into parseInput in 9f3c2e1.` If the repository has `.github/pull_request_template.md`, the worker fills that template. Otherwise it follows the descriptions section of Opening a PR.
 
@@ -210,12 +213,14 @@ Before the start, the service resolves the worker and checks its `provider/model
 
 **No duplicate threads or GitHub writes.** Every effect, the spawn included, is claimed before it runs. The engine writes `tries + 1` and a lease to the row, then makes the call, then settles the outcome. After a crash the lease expires and the next claim probes for the effect's trace before running it again. A pushed commit is found as the remote branch at that commit, a pull request as any pull request from the head branch, and a comment as an App comment that carries the effect's key in an HTML marker. A probe that finds nothing lets a push, a pull request, or a comment run again. A spawn never runs twice, because no SDK error proves the thread was not created. Its probe looks for a thread in the job's project whose plugin metadata names the job, created since the job was and not bound to another job. It reads each page's metadata in one `threads.experimental_listPluginMetadata` call, and stops paging at the first unpinned thread older than the job, because bb lists pinned threads first and then newest first. If none appears within 5 minutes of the first claim, the job moves to `stuck`. A thread that names a job not waiting for it is stopped. Metadata only points at a job. The store's thread binding, not metadata, decides who may report.
 
-**A job ends only for safety or by a person.** The goal is a pull request, so nothing that may pass ends a job and throws its work away. A worker that runs long keeps working: `deadline` is recorded but no longer enforced. A worker thread in an error state, such as one whose provider ran out of quota, leaves the job waiting with the reason as its error, because bb retries the turn and the thread may come back and report. A role or host problem keeps the job queued with its error until it is fixed. The job moves to `stuck` only when its worker thread is archived or deleted, its branch is gone from GitHub, a write cannot be confirmed, or its feedback rounds run out.
+**A first round ends with a pull request whenever it has commits.** The goal is a pull request, so nothing that may pass ends a job and throws its work away. A worker thread in an error state, such as one whose provider ran out of quota, leaves the job waiting with the reason as its error, because bb retries the turn and the thread may come back and report. A role or host problem keeps the job queued with its error until it is fixed. A first round stalls when its 4 hours (`deadline`) run out, when its worker thread is archived or deleted, or when its worker stopped without reporting after every reminder. The service then reads the worker's worktree. Commits ahead of `origin/<base>` are pushed and opened as a draft pull request labeled `agent` and `agent:stuck`, with a body that says why the work stopped and what is unfinished; the job goes to `review` and takes feedback like any other. A worktree with no commits gets one fresh worker from `origin/<base>` with a new 4 hours; if that one also stalls with nothing to publish, the job posts the reason on the issue and moves to `stuck`. A worktree that cannot be read yet, such as on an offline host, leaves the job waiting with the reason as its error. Later rounds already have a pull request, so their deadline is recorded but not enforced. An effect that fails in a way that may pass, such as a 5xx or an offline host, is retried with a backoff that stops growing at 15 minutes and never runs out of tries. The job moves to `stuck` only when a restarted first round still has nothing to publish, its branch is gone from GitHub, a write cannot be confirmed or is refused, or its feedback rounds run out.
 
 **Limits.** These are constants:
 
 - No cap on concurrent jobs in pstack. A queued job starts as soon as its worker resolves, and bb's per-machine and global concurrency limits decide when worker threads run.
-- Two reminders to an idle worker that has not reported. After them the job keeps waiting, with the reason as its error.
+- 4 hours for a first round (`ROUND_MS`), after which its commits are published as a draft.
+- Two reminders to an idle worker that has not reported. In a first round, a worker idle again after them stalls the round; in a feedback round the job keeps waiting, with the reason as its error.
+- One fresh worker per job when a stalled first round has no commits.
 - 5 feedback rounds per pull request (`MAX_FEEDBACK_ROUNDS`). New feedback after the fifth sticks the job with the reason.
 - 2 minutes of quiet after the newest pending feedback (`FEEDBACK_QUIET_MS`) before a round starts.
 
@@ -229,7 +234,7 @@ Past the feedback round limit the job moves to `stuck`, which stops the worker a
 
 - `issue_repos`: repository, the label poll cursor (`since` and the ETag), the last poll time, and the last poll error. Its `feedback_json` column is no longer read.
 - `issue_job_polls`: one row per polled job: its cursor, its pull request's last state, when it was last polled, and the last error.
-- `issue_jobs`: one row per label event, unique on the event id. It holds the trigger, the issue snapshot, project, host, branch, generation, state, the outbox and its claim bookkeeping (`effects_json`, `effect_tries`, `effect_first_at`, `effect_lease_until`, `effect_next_at`), thread, deadline, rejections, reminders, the accepted report, the pushed commit, the pull request, the current round and its base, the worker's settings, the last error, and a version for compare-and-set writes. Its `CHECK` state lists repeat `job.ts`, and a test fails when they disagree. Step 2 rebuilt the table, because SQLite cannot alter a `CHECK`; existing jobs are in round 1.
+- `issue_jobs`: one row per label event, unique on the event id. It holds the trigger, the issue snapshot, project, host, branch, generation, state, the outbox and its claim bookkeeping (`effects_json`, `effect_tries`, `effect_first_at`, `effect_lease_until`, `effect_next_at`), thread, deadline, rejections, reminders, the accepted report, the pushed commit, the pull request, the current round and its base, the worker's settings, whether the first round was restarted, the last error, and a version for compare-and-set writes. Its `CHECK` state lists repeat `job.ts`, and a test fails when they disagree. Step 2 rebuilt the table, because SQLite cannot alter a `CHECK`; existing jobs are in round 1.
 - `issue_rounds`: one row per round, keyed by job and ordinal. It holds the kind (`initial` or `feedback`), when the round started, the branch head it started from, the accepted report, the commit it pushed, and when it ended.
 - `issue_feedback`: one row per counted review, inline comment, or conversation comment that mentions the App, keyed by repository, kind, and GitHub id, which dedupes repeated polls. It holds the job, the pull request, the author, the body, and the file, line, diff hunk and review of an inline comment. A follow-up also holds the thread comment it answers, with that comment's author and text. Each row records when it was made and when it became visible. `round` is null while the item waits, and is set to the round that sent it.
 
@@ -281,7 +286,7 @@ The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. 
 - Two jobs that touch the same files are not coordinated. Conflicts surface as conflict rounds.
 - Workers use the project's default permission mode. A project whose default is `accept-edits` may stall an unattended worker on approval prompts until the round's 4 hours run out.
 - Whether bb logs host RPC payloads, which carry the push token, is unverified.
-- The reminder to an idle worker compares the thread's `updatedAt` with the job's last write. If bb does not bump `updatedAt` when a turn ends, no reminder is sent and the job sticks at the round's deadline instead. When pstack cannot count the worker's active runs and children, it treats the worker as waiting, with the same fallback.
+- The reminder to an idle worker compares the thread's `updatedAt` with the job's last write. If bb does not bump `updatedAt` when a turn ends, no reminder is sent and a first round stalls at its deadline instead. When pstack cannot count the worker's active runs and children, it treats the worker as waiting, with the same fallback.
 - The spawn probe's early stop relies on bb listing pinned threads first and then newest first. That order is observed, not documented. If it changes, the probe can miss a late thread, and the job sticks after the spawn's grace period.
 - Whether bb fetches before creating a worktree from `origin/<base>` is unverified. A stale remote-tracking ref only makes the worker start from an older base; the new-commit check measures against the same ref.
 - The host RPC API is experimental. A breaking SDK change affects only `src/host.ts` and its contract.
