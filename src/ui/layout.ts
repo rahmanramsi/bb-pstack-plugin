@@ -105,7 +105,7 @@ export function formatDuration(milliseconds: number): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-type StatusTone = "queued" | "running" | "blocked" | "uncertain" | "succeeded" | "failed" | "skipped" | "cancelled";
+type StatusTone = "queued" | "running" | "blocked" | "uncertain" | "neutral" | "succeeded" | "failed" | "skipped" | "cancelled";
 
 export const issueStates: Record<JobState, { label: string; tone: StatusTone }> = {
   queued: { label: "Queued", tone: "queued" },
@@ -126,7 +126,8 @@ export const issueStates: Record<JobState, { label: string; tone: StatusTone }> 
   tracking: { label: "Tracking sub-issues", tone: "blocked" },
   updating: { label: "Updating status", tone: "running" },
   closing: { label: "Closing", tone: "running" },
-  done: { label: "Done", tone: "succeeded" },
+  // A finished job always has an outcome, except one upgraded from history that never recorded it.
+  done: { label: "Outcome unknown", tone: "neutral" },
   stopping: { label: "Stopping", tone: "cancelled" },
   stopped: { label: "Stopped", tone: "cancelled" },
   sticking: { label: "Getting stuck", tone: "failed" },

@@ -70,3 +70,14 @@ test("an unreadable branch policy is shown as a limitation of a ready result, no
   assert.equal(issueStatus(ready).label, issueStatus({ ...job, state: "review", outcome: "ready" }).label);
   assert.deepEqual(issueNotes(ready), [{ tone: "warning", text: limitation }]);
 });
+
+test("an upgraded job that ended without a recorded outcome is neutral, distinct from every known outcome", () => {
+  const unknown = issueStatus({ ...job, state: "done", outcome: null });
+  assert.equal(unknown.tone, "neutral");
+  for (const outcome of ["merged", "no-change", "closed-unmerged"] as const) {
+    const known = issueStatus({ ...job, state: "done", outcome });
+    assert.notEqual(known.label, unknown.label);
+    assert.notEqual(known.tone, unknown.tone);
+  }
+  assert.equal(matchesIssue({ issue, job: { ...job, state: "done", outcome: null } }, { repo: "", state: "all", query: "", worker: "attention" }), false);
+});

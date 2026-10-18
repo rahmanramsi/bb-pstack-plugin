@@ -259,7 +259,7 @@ bb pstack issues show <job>           # thread, pull request, outcome, limitatio
 bb pstack issues stop <job>
 ```
 
-The **Issues** panel in the bb app lists every catalog issue with its job. A job's badge shows its outcome once it has one and its current step before that. Notes under the badge show the failure reason first, then a branch-policy limitation, then delivery and polling state. **Needs attention** filters to failed and closed-unmerged jobs, delivery errors, poll errors, and issues that cannot start.
+The **Issues** panel in the bb app lists every catalog issue with its job. A job's badge shows its outcome once it has one and its current step before that. A job that ended before an upgrade and left no record of merge, closure, or a no-change report shows a neutral **Outcome unknown** badge, never Merged or a success. Notes under the badge show the failure reason first, then a branch-policy limitation, then delivery and polling state. **Needs attention** filters to failed and closed-unmerged jobs, delivery errors, poll errors, and issues that cannot start.
 
 ## Job states
 
