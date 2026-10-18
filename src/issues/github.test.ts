@@ -375,3 +375,449 @@ test("a job's activity reads its issue's comments from when the job started, the
   await repo.activity({ issue: 41, since: 0, pr: null }, first.next);
   assert.match(seen.at(-1)!.path, /since=2026-10-17T11%3A00%3A00Z/);
 });
+
+const HEAD = "a".repeat(40) as import("./job.ts").Sha;
+const BASE = "b".repeat(40) as import("./job.ts").Sha;
+const NEXT_HEAD = "c".repeat(40) as import("./job.ts").Sha;
+const NEXT_BASE = "d".repeat(40) as import("./job.ts").Sha;
+
+function autonomySetup(options: Partial<GitHubOptions> = {}) {
+  const result = setup(options);
+  const grants: Record<string, string> = { contents: "write", issues: "write", pull_requests: "write", checks: "read", statuses: "read" };
+  routes["GET /repos/acme/web/installation"] = () => ({ status: 200, json: { id: 77, permissions: grants, suspended_at: null } });
+  routes["GET /repos/acme/web"] = () => ({ status: 200, json: { id: 1234, default_branch: "main", archived: false } });
+  routes["GET /repos/acme/web/git/ref/heads/main"] = () => ({ status: 200, json: { object: { sha: BASE } } });
+  const pull = {
+    number: 7, node_id: "PR_7", html_url: "https://github.example/acme/web/pull/7", state: "open", draft: true,
+    merged_at: null as string | null, mergeable: true as boolean | null, mergeable_state: "clean",
+    head: { ref: "agent/issue-5-test", sha: HEAD, repo: { full_name: "acme/web" } },
+    base: { ref: "main", sha: BASE, repo: { full_name: "acme/web" } },
+  };
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 200, json: pull });
+  for (const sha of [HEAD, NEXT_HEAD]) {
+    routes[`GET /repos/acme/web/commits/${sha}/check-suites`] = () => ({ status: 200, json: { total_count: 0, check_suites: [] } });
+    routes[`GET /repos/acme/web/commits/${sha}/statuses`] = () => ({ status: 200, json: [] });
+  }
+  routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: false, commit: { sha: pull.base.sha } } });
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [] });
+  routes["POST /graphql"] = (request) => {
+    pull.draft = request.body.query.includes("convertPullRequestToDraft");
+    const mutation = pull.draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
+    return { status: 200, json: { data: { [mutation]: { pullRequest: { id: "PR_7", isDraft: pull.draft } } } } };
+  };
+  return { ...result, grants, pull };
+}
+
+const target = () => ({ pr: 7, head: HEAD, base: BASE });
+const suite = (id: number, app = 1, head = HEAD) => ({ id, head_sha: head, app: { id: app, slug: `app-${app}` }, status: "completed", conclusion: "success" });
+const run = (id: number, app = 1, conclusion = "success", extra = {}) => ({ id, app: { id: app }, name: "build", head_sha: HEAD, status: "completed", conclusion, html_url: null, ...extra });
+const status = (id: number, state: string, created_at = "2026-10-17T10:00:00Z") => ({ id, context: "build", state, target_url: null, created_at });
+
+test("capabilities read effective installation grants and refresh repository/default-head/grants without broad scopes", async () => {
+  const { repo, grants, clock } = autonomySetup();
+  const first = await repo.capabilities({ fresh: false });
+  assert.deepEqual(first, { repositoryId: 1234, archived: false, defaultBranch: "main", defaultHead: BASE, observedAt: NOW,
+    permissions: { contents: "write", issues: "write", pullRequests: "write", workflows: "none", checks: "read", statuses: "read" } });
+  grants.workflows = "write";
+  assert.equal((await repo.capabilities({ fresh: false })).permissions.workflows, "none");
+  routes["GET /repos/acme/web/git/ref/heads/main"] = () => ({ status: 200, json: { object: { sha: NEXT_BASE } } });
+  clock.now++;
+  const fresh = await repo.capabilities({ fresh: true });
+  assert.equal(fresh.permissions.workflows, "write");
+  assert.equal(fresh.defaultHead, NEXT_BASE);
+  assert.equal(fresh.observedAt, NOW + 1);
+  assert.equal(seen.filter((request) => request.path.endsWith("/installation")).length, 2);
+  assert.ok(!seen.some((request) => request.path.includes("/protection")));
+});
+
+test("fresh capability inspection distinguishes missing/rejected/suspended setup from transient faults", async () => {
+  const { repo } = autonomySetup();
+  for (const code of [401, 404]) {
+    routes["GET /repos/acme/web/installation"] = () => ({ status: code });
+    await assert.rejects(repo.capabilities({ fresh: true }), GitHubSetupError);
+  }
+  routes["GET /repos/acme/web/installation"] = () => ({ status: 503 });
+  await assert.rejects(repo.capabilities({ fresh: true }), GitHubTransientError);
+  routes["GET /repos/acme/web/installation"] = () => ({ status: 200, json: { id: 77, permissions: {}, suspended_at: new Date(NOW).toISOString() } });
+  await assert.rejects(repo.capabilities({ fresh: true }), GitHubSetupError);
+});
+
+test("workflow push tokens require existing grants and request only contents plus workflows for one repository", async () => {
+  const { repo, grants } = autonomySetup();
+  await repo.pushCredentials({ workflows: false });
+  await assert.rejects(repo.pushCredentials({ workflows: true }), (error) => error instanceof GitHubPermanentError && error.code === "missing-capability");
+  assert.equal(seen.filter((request) => request.body?.permissions?.workflows).length, 0);
+  grants.workflows = "write";
+  const credentials = await repo.pushCredentials({ workflows: true });
+  assert.equal(credentials.remoteUrl, "https://github.example/acme/web.git");
+  assert.deepEqual(seen.filter((request) => request.body?.permissions?.workflows).map((request) => request.body), [
+    { repositories: ["web"], permissions: { contents: "write", workflows: "write" } },
+  ]);
+  assert.ok(!seen.some((request) => request.method === "DELETE"), "the transport never revokes credentials owned by its caller");
+});
+
+test("permission denial invalidates capability cache and preserves a typed denial", async () => {
+  const { repo, grants } = autonomySetup();
+  await repo.capabilities({ fresh: false });
+  grants.issues = "read";
+  routes["POST /repos/acme/web/issues/5/comments"] = () => ({ status: 403, json: { message: "Resource not accessible by integration" } });
+  await assert.rejects(repo.comment(5, "test"), (error) => error instanceof GitHubPermanentError && error.code === "denied");
+  assert.equal((await repo.capabilities({ fresh: false })).permissions.issues, "read");
+});
+
+test("snapshot observes known empty policy without an administration request and reads fresh without ETags", async () => {
+  const { repo, pull } = autonomySetup();
+  const snapshot = await repo.reviewSnapshot(7);
+  assert.deepEqual(snapshot, { ...target(), url: pull.html_url, state: "open", draft: true, headRepository: REPO,
+    headBranch: pull.head.ref, baseBranch: "main", mergeability: "clean", observedAt: NOW, complete: true, checks: [],
+    required: { kind: "known", checks: [], blockers: [] } });
+  await repo.reviewSnapshot(7);
+  assert.equal(seen.filter((request) => request.path === "/repos/acme/web/pulls/7").length, 4);
+  assert.ok(!seen.some((request) => request.path.includes("/protection") || request.headers["if-none-match"]));
+});
+
+test("snapshot paginates suites, runs, statuses and active rules and preserves newest attempts and App identities", async () => {
+  const { repo } = autonomySetup();
+  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = (request) => request.path.includes("page=2")
+    ? { status: 200, json: { total_count: 2, check_suites: [suite(12, 2)] } }
+    : { status: 200, json: { total_count: 2, check_suites: [suite(11)] }, headers: { link: `<${base}/repos/acme/web/commits/${HEAD}/check-suites?page=2>; rel="next"` } };
+  routes["GET /repos/acme/web/check-suites/11/check-runs"] = (request) => request.path.includes("page=2")
+    ? { status: 200, json: { total_count: 2, check_runs: [run(20, 1, "success", { status: "queued", conclusion: null })] } }
+    : { status: 200, json: { total_count: 2, check_runs: [run(10)] }, headers: { link: `<${base}/repos/acme/web/check-suites/11/check-runs?page=2>; rel="next"` } };
+  routes["GET /repos/acme/web/check-suites/12/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(30, 2, "failure")] } });
+  routes[`GET /repos/acme/web/commits/${HEAD}/statuses`] = (request) => request.path.includes("page=2")
+    ? { status: 200, json: [status(99, "failure", "2026-10-17T09:00:00Z")] }
+    : { status: 200, json: [status(100, "success")], headers: { link: `<${base}/repos/acme/web/commits/${HEAD}/statuses?page=2>; rel="next"` } };
+  routes["GET /repos/acme/web/rules/branches/main"] = (request) => request.path.includes("page=2")
+    ? { status: 200, json: [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "build", integration_id: 2 }], strict_required_status_checks_policy: false } }] }
+    : { status: 200, json: [{ type: "pull_request", parameters: { required_review_thread_resolution: false, required_approving_review_count: 2 } }], headers: { link: `<${base}/repos/acme/web/rules/branches/main?page=2>; rel="next"` } };
+  const snapshot = (await repo.reviewSnapshot(7))!;
+  assert.equal(snapshot.complete, true);
+  assert.deepEqual(snapshot.checks.map((check) => [check.id, check.name, check.source, check.appId, check.state, check.head]), [
+    ["check-run:20", "build", "check-run", 1, "pending", HEAD], ["check-run:30", "build", "check-run", 2, "failure", HEAD],
+    ["status:100", "build", "status", null, "success", HEAD],
+  ]);
+  assert.deepEqual(snapshot.required, { kind: "known", checks: [{ name: "build", source: "either", appId: 2, accepted: ["success", "neutral", "skipped"] }], blockers: [] });
+  assert.ok(seen.some((request) => request.path.includes("filter=all")));
+});
+
+test("snapshots retain independent same-name suites and report pending suites without produced runs", async () => {
+  const { repo } = autonomySetup();
+  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 3,
+    check_suites: [suite(11), suite(12), { ...suite(13), status: "queued", conclusion: null }] } });
+  routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(10, 1, "failure")] } });
+  routes["GET /repos/acme/web/check-suites/12/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(20)] } });
+  routes["GET /repos/acme/web/check-suites/13/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
+  assert.deepEqual((await repo.reviewSnapshot(7))!.checks.map((check) => check.state), ["failure", "success", "pending"]);
+});
+
+test("classic branch checks preserve App bindings while reviewer approvals do not block review readiness", async () => {
+  const { repo } = autonomySetup();
+  routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: true, commit: { sha: BASE } } });
+  routes["GET /repos/acme/web/branches/main/protection"] = () => ({ status: 200, json: {
+    required_status_checks: { strict: true, contexts: ["build", "lint"], checks: [{ context: "build", app_id: 14 }, { context: "lint", app_id: -1 }] },
+    required_pull_request_reviews: { required_approving_review_count: 3, require_code_owner_reviews: true },
+  } });
+  const snapshot = (await repo.reviewSnapshot(7))!;
+  assert.deepEqual(snapshot.required, { kind: "known", checks: [
+    { name: "build", source: "either", appId: 14, accepted: ["success", "neutral", "skipped"] },
+    { name: "lint", source: "either", appId: null, accepted: ["success", "neutral", "skipped"] },
+  ], blockers: [] });
+});
+
+test("policy denial, masked classic 404 and unsupported rules never become known-empty", async () => {
+  const { repo } = autonomySetup();
+  for (const code of [403, 404]) {
+    routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: code });
+    assert.equal((await repo.reviewSnapshot(7))!.required.kind, "unavailable");
+  }
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [] });
+  routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: true, commit: { sha: BASE } } });
+  assert.equal((await repo.reviewSnapshot(7))!.required.kind, "unavailable");
+  routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: false, commit: { sha: BASE } } });
+  for (const type of ["workflows", "required_deployments", "future_rule"]) {
+    routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [{ type }] });
+    assert.equal((await repo.reviewSnapshot(7))!.required.kind, "unavailable");
+  }
+});
+
+test("rate-limited or malformed policy reads fail truthfully instead of returning empty policy", async () => {
+  const { repo } = autonomySetup();
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 403, headers: { "retry-after": "30" } });
+  await assert.rejects(repo.reviewSnapshot(7), (error) => error instanceof GitHubTransientError && error.notBefore === NOW + 30_000);
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: {} });
+  await assert.rejects(repo.reviewSnapshot(7), GitHubTransientError);
+});
+
+test("a head or base race invalidates the snapshot and preserves the actual observed identity", async () => {
+  for (const field of ["head", "base"] as const) {
+    const { repo, pull } = autonomySetup();
+    let reads = 0;
+    routes["GET /repos/acme/web/pulls/7"] = () => {
+      if (++reads === 2) pull[field].sha = field === "head" ? NEXT_HEAD : NEXT_BASE;
+      return { status: 200, json: pull };
+    };
+    const snapshot = (await repo.reviewSnapshot(7))!;
+    assert.equal(snapshot.complete, false);
+    assert.equal(snapshot[field], field === "head" ? NEXT_HEAD : NEXT_BASE);
+  }
+});
+
+test("truncated check pages and mismatched check heads cannot produce a complete snapshot", async () => {
+  const { repo } = autonomySetup();
+  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 2, check_suites: [suite(11)] } });
+  routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(10, 1, "success", { head_sha: NEXT_HEAD })] } });
+  assert.equal((await repo.reviewSnapshot(7))!.complete, false);
+});
+
+test("only confirmed missing PRs return null; permission masking and read faults remain errors", async () => {
+  const { repo, grants } = autonomySetup();
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 404 });
+  assert.equal(await repo.reviewSnapshot(7), null);
+  delete grants.pull_requests;
+  await assert.rejects(repo.reviewSnapshot(7), (error) => error instanceof GitHubPermanentError && error.code === "missing-capability");
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 502 });
+  await assert.rejects(repo.reviewSnapshot(7), GitHubTransientError);
+});
+
+test("guarded draft conversion uses GraphQL node IDs and observes the requested result", async () => {
+  const { repo } = autonomySetup();
+  const ready = await repo.setDraft({ expected: target(), draft: false });
+  assert.equal(ready.kind, "observed");
+  assert.ok(!ready.snapshot.draft);
+  const draft = await repo.setDraft({ expected: target(), draft: true });
+  assert.ok(draft.kind !== "missing" && draft.snapshot.draft);
+  const mutations = seen.filter((request) => request.path === "/graphql");
+  assert.equal(mutations.length, 2);
+  assert.deepEqual(mutations[0]!.body.variables, { input: { pullRequestId: "PR_7" } });
+  assert.match(mutations[0]!.body.query, /markPullRequestReadyForReview/);
+  assert.match(mutations[1]!.body.query, /convertPullRequestToDraft/);
+});
+
+test("draft conversion detects stale head/base before mutation, including the ID-resolution race", async () => {
+  for (const raceAt of [1, 3]) {
+    for (const field of ["head", "base"] as const) {
+      const { repo, pull } = autonomySetup();
+      let reads = 0;
+      routes["GET /repos/acme/web/pulls/7"] = () => {
+        if (++reads === raceAt) pull[field].sha = field === "head" ? NEXT_HEAD : NEXT_BASE;
+        return { status: 200, json: pull };
+      };
+      assert.equal((await repo.setDraft({ expected: target(), draft: false })).kind, "stale");
+      assert.ok(!seen.some((request) => request.path === "/graphql"));
+    }
+  }
+});
+
+test("post-mutation head/base races return stale and never claim current readiness", async () => {
+  for (const field of ["head", "base"] as const) {
+    const { repo, pull } = autonomySetup();
+    routes["POST /graphql"] = () => {
+      pull.draft = false;
+      pull[field].sha = field === "head" ? NEXT_HEAD : NEXT_BASE;
+      return { status: 200, json: { data: { markPullRequestReadyForReview: { pullRequest: { id: "PR_7", isDraft: false } } } } };
+    };
+    assert.equal((await repo.setDraft({ expected: target(), draft: false })).kind, "stale");
+  }
+});
+
+test("closed and missing PR conversion are observed without mutations", async () => {
+  const { repo, pull } = autonomySetup();
+  pull.state = "closed";
+  assert.equal((await repo.setDraft({ expected: target(), draft: false })).kind, "closed");
+  routes["GET /repos/acme/web/pulls/7"] = () => ({ status: 404 });
+  assert.equal((await repo.setDraft({ expected: target(), draft: false })).kind, "missing");
+  assert.ok(!seen.some((request) => request.path === "/graphql"));
+});
+
+test("GraphQL authorization failures are permanent and a lost mutation response is probed before retry", async () => {
+  const { repo, pull } = autonomySetup({ requestTimeoutMs: 40 });
+  routes["POST /graphql"] = () => ({ status: 200, json: { data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] } });
+  await assert.rejects(repo.setDraft({ expected: target(), draft: false }), (error) => error instanceof GitHubPermanentError && error.code === "denied");
+  routes["POST /graphql"] = () => { pull.draft = false; return null; };
+  const result = await repo.setDraft({ expected: target(), draft: false });
+  assert.equal(result.kind, "observed");
+  assert.ok(!result.snapshot.draft);
+  assert.equal(seen.filter((request) => request.path === "/graphql").length, 2);
+});
+
+function statusSetup(options: Partial<GitHubOptions> = {}) {
+  const result = autonomySetup(options);
+  routes["GET /app"] = () => ({ status: 200, json: { slug: "pstack-dev" } });
+  const comments = new Map<number, ReturnType<typeof markedComment>>();
+  let next = 10;
+  routes["GET /repos/acme/web/issues/5/comments"] = () => ({ status: 200, json: [...comments.values()] });
+  routes["POST /repos/acme/web/issues/5/comments"] = (request) => {
+    const comment = markedComment(next++, request.body.body);
+    comments.set(comment.id, comment);
+    return { status: 201, json: comment };
+  };
+  function route(id: number) {
+    routes[`GET /repos/acme/web/issues/comments/${id}`] = () => comments.has(id) ? { status: 200, json: comments.get(id) } : { status: 404 };
+    routes[`PATCH /repos/acme/web/issues/comments/${id}`] = (request) => {
+      const comment = comments.get(id);
+      if (!comment) return { status: 404 };
+      comment.body = request.body.body;
+      return { status: 200, json: comment };
+    };
+    routes[`DELETE /repos/acme/web/issues/comments/${id}`] = () => { comments.delete(id); return { status: 204 }; };
+  }
+  for (let id = 1; id < 30; id++) route(id);
+  return { ...result, comments };
+}
+const STATUS_MARKER = "<!-- pstack:issue-status:acme/web:5 -->";
+function markedComment(id: number, body = `Old status\n${STATUS_MARKER}`) {
+  return { id, created_at: new Date(NOW + id).toISOString(), body, user: { login: "pstack-dev[bot]", type: "Bot" }, performed_via_github_app: { id: 123 }, issue_url: `${base}/repos/acme/web/issues/5` };
+}
+const statusInput = (revision = 1) => ({ issue: 5, marker: STATUS_MARKER, revision, body: `Status revision ${revision}.` });
+
+test("status upsert creates once, updates the same App-owned comment repeatedly and recreates deleted comments", async () => {
+  const { repo, comments } = statusSetup();
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput()), { commentId: 10 });
+  await repo.upsertIssueStatus(statusInput());
+  assert.equal(seen.filter((request) => request.method === "POST" && request.path.endsWith("/comments")).length, 1);
+  assert.equal(seen.filter((request) => request.method === "PATCH").length, 0);
+  await repo.upsertIssueStatus(statusInput(2));
+  assert.match(comments.get(10)!.body, /Status revision 2\./);
+  assert.match(comments.get(10)!.body, /status-revision:2/);
+  comments.delete(10);
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput(3)), { commentId: 11 });
+});
+
+test("status reconciliation paginates without cutoff, keeps oldest owned comment and removes only rechecked duplicates", async () => {
+  const { repo, comments } = statusSetup();
+  comments.set(1, markedComment(1));
+  comments.set(2, markedComment(2));
+  comments.set(3, { ...markedComment(3), performed_via_github_app: { id: 456 } });
+  comments.set(4, { ...markedComment(4), body: `Quoted\n${STATUS_MARKER}\nAdditional text` });
+  comments.set(5, { ...markedComment(5), issue_url: `${base}/repos/acme/web/issues/6` });
+  routes["GET /repos/acme/web/issues/5/comments"] = (request) => request.path.includes("page=2")
+    ? { status: 200, json: [...comments.values()].filter((comment) => comment.id !== 1) }
+    : { status: 200, json: [comments.get(1)], headers: { link: `<${base}/repos/acme/web/issues/5/comments?page=2>; rel="next"` } };
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput()), { commentId: 1 });
+  assert.deepEqual([...comments.keys()], [1, 3, 4, 5]);
+  assert.ok(seen.filter((request) => request.path.includes("/issues/5/comments")).every((request) => !request.path.includes("since=")));
+});
+
+test("lost create response is probed and converges without a second create", async () => {
+  const { repo, comments } = statusSetup({ requestTimeoutMs: 40 });
+  routes["POST /repos/acme/web/issues/5/comments"] = (request) => { comments.set(10, markedComment(10, request.body.body)); return null; };
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput()), { commentId: 10 });
+  assert.equal(seen.filter((request) => request.method === "POST" && request.path.endsWith("/comments")).length, 1);
+  assert.equal(comments.size, 1);
+});
+
+test("unobserved create timeout stays uncertain and read denial cannot trigger duplicate creation", async () => {
+  const { repo } = statusSetup({ requestTimeoutMs: 40 });
+  routes["POST /repos/acme/web/issues/5/comments"] = () => null;
+  await assert.rejects(repo.upsertIssueStatus(statusInput()), (error) => error instanceof GitHubTransientError && error.uncertain);
+  routes["GET /repos/acme/web/issues/5/comments"] = () => ({ status: 403 });
+  await assert.rejects(repo.upsertIssueStatus(statusInput()), GitHubPermanentError);
+  assert.equal(seen.filter((request) => request.method === "POST" && request.path.endsWith("/comments")).length, 1);
+});
+
+test("a duplicate whose ownership changes is preserved and a missing keeper is recreated", async () => {
+  const { repo, comments } = statusSetup();
+  comments.set(1, markedComment(1));
+  comments.set(2, markedComment(2));
+  routes["GET /repos/acme/web/issues/comments/2"] = () => {
+    comments.get(2)!.performed_via_github_app.id = 456;
+    return { status: 200, json: comments.get(2) };
+  };
+  await repo.upsertIssueStatus(statusInput());
+  assert.equal(comments.has(2), true);
+  routes["GET /repos/acme/web/issues/comments/1"] = () => { comments.delete(1); return { status: 404 }; };
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput(2)), { commentId: 10 });
+});
+
+test("lost edit response is probed and lost duplicate deletion converges on the next upsert", async () => {
+  const { repo, comments } = statusSetup({ requestTimeoutMs: 40 });
+  comments.set(1, markedComment(1));
+  comments.set(2, markedComment(2));
+  routes["PATCH /repos/acme/web/issues/comments/1"] = (request) => { comments.get(1)!.body = request.body.body; return null; };
+  routes["DELETE /repos/acme/web/issues/comments/2"] = () => { comments.delete(2); return null; };
+  await assert.rejects(repo.upsertIssueStatus(statusInput()), GitHubTransientError);
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput()), { commentId: 1 });
+  assert.equal(comments.size, 1);
+});
+
+test("pagination cannot disclose installation credentials to a foreign origin", async () => {
+  const { repo } = autonomySetup();
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [], headers: { link: '<https://foreign.invalid/rules>; rel="next"' } });
+  await assert.rejects(repo.reviewSnapshot(7), GitHubPermanentError);
+});
+
+test("old-style classic contexts without App identity stay unavailable", async () => {
+  const { repo } = autonomySetup();
+  routes["GET /repos/acme/web/branches/main"] = () => ({ status: 200, json: { protected: true, commit: { sha: BASE } } });
+  routes["GET /repos/acme/web/branches/main/protection"] = () => ({ status: 200, json: { required_status_checks: { strict: false, contexts: ["build"] } } });
+  assert.equal((await repo.reviewSnapshot(7))!.required.kind, "unavailable");
+});
+
+test("unknown mergeability, conflict, failed statuses and unsupported conclusions remain explicit", async () => {
+  const { repo, pull } = autonomySetup();
+  pull.mergeable = null;
+  assert.equal((await repo.reviewSnapshot(7))!.mergeability, "unknown");
+  pull.mergeable = false;
+  routes[`GET /repos/acme/web/commits/${HEAD}/statuses`] = () => ({ status: 200, json: [status(100, "error")] });
+  const conflict = (await repo.reviewSnapshot(7))!;
+  assert.equal(conflict.mergeability, "conflicting");
+  assert.equal(conflict.checks[0]?.state, "failure");
+  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1, check_suites: [suite(11)] } });
+  routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(10, 1, "future_conclusion")] } });
+  assert.equal((await repo.reviewSnapshot(7))!.checks[0]?.state, "unknown");
+});
+
+test("strict up-to-date policy reports a concrete base blocker", async () => {
+  const { repo, pull } = autonomySetup();
+  pull.mergeable_state = "behind";
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [{ type: "required_status_checks", parameters: {
+    required_status_checks: [{ context: "build" }], strict_required_status_checks_policy: true,
+  } }] });
+  const required = (await repo.reviewSnapshot(7))!.required;
+  assert.ok(required.kind === "known");
+  assert.deepEqual(required.blockers, ["base branch must be incorporated into the head"]);
+});
+
+test("status reconciliation chooses creation time before comment ID and ignores user-owned lookalikes", async () => {
+  const { repo, comments } = statusSetup();
+  comments.set(1, { ...markedComment(1), created_at: new Date(NOW + 10_000).toISOString() });
+  comments.set(2, markedComment(2));
+  comments.set(3, { ...markedComment(3), user: { login: "pstack-dev[bot]", type: "User" } });
+  assert.deepEqual(await repo.upsertIssueStatus(statusInput()), { commentId: 2 });
+  assert.deepEqual([...comments.keys()], [2, 3]);
+});
+
+test("cancellation reaches fresh capability minting and every snapshot pagination request", async () => {
+  const controller = new AbortController();
+  const { github } = autonomySetup({ requestTimeoutMs: 5000 });
+  const repo = github.repo(REPO, controller.signal);
+  routes["POST /app/installations/77/access_tokens"] = () => { controller.abort(); return null; };
+  await assert.rejects(repo.capabilities({ fresh: true }), GitHubTransientError);
+  assert.ok(!seen.some((request) => request.path === "/repos/acme/web"));
+
+  const nextController = new AbortController();
+  const next = autonomySetup({ requestTimeoutMs: 5000 });
+  routes[`GET /repos/acme/web/commits/${HEAD}/statuses`] = (request) => request.path.includes("page=2")
+    ? (nextController.abort(), null)
+    : { status: 200, json: [status(100, "success")], headers: { link: `<${base}/repos/acme/web/commits/${HEAD}/statuses?page=2>; rel="next"` } };
+  await assert.rejects(next.github.repo(REPO, nextController.signal).reviewSnapshot(7), GitHubTransientError);
+  assert.ok(!seen.some((request) => request.path.includes("/rules/branches/")));
+});
+
+test("read and mutation timeouts distinguish uncertainty and honor HTTP-date retry delays", async () => {
+  const { repo } = autonomySetup({ requestTimeoutMs: 40 });
+  routes["POST /repos/acme/web/issues/5/comments"] = () => null;
+  await assert.rejects(repo.comment(5, "test"), (error) => error instanceof GitHubTransientError && error.uncertain);
+  routes["GET /repos/acme/web/pulls/7"] = () => null;
+  await assert.rejects(repo.reviewSnapshot(7), (error) => error instanceof GitHubTransientError && !error.uncertain);
+  routes["POST /repos/acme/web/issues/5/comments"] = () => ({ status: 503, headers: { "retry-after": new Date(NOW + 60_000).toUTCString() } });
+  await assert.rejects(repo.comment(5, "test"), (error) => error instanceof GitHubTransientError && error.uncertain && error.notBefore === NOW + 60_000);
+});
+
+test("an unobserved draft timeout is uncertain and is not replayed inside the call", async () => {
+  const { repo } = autonomySetup({ requestTimeoutMs: 40 });
+  routes["POST /graphql"] = () => null;
+  await assert.rejects(repo.setDraft({ expected: target(), draft: false }), (error) => error instanceof GitHubTransientError && error.uncertain);
+  assert.equal(seen.filter((request) => request.path === "/graphql").length, 1);
+});
