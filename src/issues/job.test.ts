@@ -12,6 +12,7 @@ import {
   branchFor,
   FEEDBACK_QUIET_MS,
   MAX_FEEDBACK_ROUNDS,
+  ROUND_MS,
   command,
   counts,
   enter,
@@ -107,7 +108,7 @@ test("a queued job starts only with resolved worker settings, labelling before i
   assert.equal(action?.type, "change");
   const started = apply(queued, (action as { change: Change }).change);
   assert.equal(started.phase.state, "starting");
-  assert.equal(started.deadline, NOW + 60 * MIN);
+  assert.equal(started.deadline, NOW + ROUND_MS);
   assert.ok("effects" in started.phase);
   assert.deepEqual(started.phase.effects.map((effect) => effect.op), ["labels", "spawn"]);
   const spawn = started.phase.effects[1];
@@ -423,7 +424,7 @@ test("a round starts only once the newest pending feedback has been quiet for tw
   assert.equal(action?.type, "change");
   const change = (action as { change: Change }).change;
   assert.deepEqual(change.startRound, { ordinal: 2, kind: "feedback", baseSha: PUSHED, feedback: [{ kind: "review-comment", id: 1 }, { kind: "review-comment", id: 2 }] });
-  assert.equal(change.deadline, NOW + 60 * MIN);
+  assert.equal(change.deadline, NOW + ROUND_MS);
   const sending = apply(review, change);
   assert.equal(sending.round, 2);
   assert.ok("effects" in sending.phase);
