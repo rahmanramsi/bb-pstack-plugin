@@ -346,3 +346,43 @@ test("historical merged-head Retry-After survives restart without early reads or
   assert.equal(h.store.get(child.id)!.control.mergedHead, "3".repeat(40));
   assert.equal(h.store.get((await h.byIssue(50)).id)!.control.prerequisites[0]!.sha, "3".repeat(40));
 });
+
+test("a merged adopted child head survives activity-poll lag and restart in its parent's exact pin", async () => {
+  let delayed = false;
+  const h = withParent([51], { configureDeps(deps) {
+    const repo = deps.github.repo;
+    deps.github = { repo: (name, signal) => {
+      const client = repo(name, signal);
+      return { ...client, activity: async (target, cursor) => {
+        if (delayed && target.issue === 51) throw new GitHubTransientError("activity temporarily unavailable", null);
+        return client.activity(target, cursor);
+      } };
+    } };
+  } });
+  await h.settle();
+  const child = await h.byIssue(51);
+  await h.report(child.threadId!, GOOD); await h.settle(); await h.advance(MIN);
+  h.gh().refs.set(child.branch, "3".repeat(40));
+  await h.advance(2 * MIN);
+  const repair = await h.byIssue(51);
+  assert.equal((await h.report(child.threadId!, { outcome: "no-change", round: repair.round - 1, replies: [], summary: "The collaborator implementation is verified.", verification: ["integration checks passed"] }, { headSha: "3".repeat(40), ancestors: ["2".repeat(40)], ahead: 2 })).exitCode, 0);
+  await h.advance(2 * MIN);
+  delayed = true;
+  Object.assign(h.gh().pulls.get((await h.byIssue(51)).pr!.number)!, { state: "closed", merged: true });
+  await h.advance(2 * MIN);
+  const merged = h.store.get(child.id)!;
+  assert.equal(merged.phase.state, "done");
+  assert.equal(merged.control.disposition, "merged");
+  assert.equal(merged.pushedSha, "2".repeat(40));
+  assert.equal(merged.control.mergedHead, "3".repeat(40));
+  assert.equal(h.store.jobPoll(child.id).prState, "open");
+  for (const restarted of [false, true]) {
+    if (restarted) { h.restart(); await h.advance(2 * MIN); }
+    const parent = await h.byIssue(50);
+    assert.notEqual(parent.outcome, "failure");
+    assert.deepEqual(h.store.get(parent.id)!.control.prerequisites, [{ issue: 51, branch: child.branch, sha: "3".repeat(40) }]);
+    assert.equal(h.store.get(child.id)!.control.mergedHead, "3".repeat(40));
+  }
+  delayed = false; await h.advance(3 * MIN);
+  assert.notEqual((await h.byIssue(50)).outcome, "failure");
+});

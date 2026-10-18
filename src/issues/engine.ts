@@ -681,7 +681,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     return Promise.all(polled.map(async (child) => {
       const candidate = store.open(parent.repo, child.number) ?? created.find((row) => row.issue === child.number);
       const job = candidate ? await observeMergedHead(candidate, facts) : null;
-      return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged", ready: job.control.readiness !== null, disposition: job.control.disposition, branch: job.branch, sha: verifiedDeliveredHead(job) } : null };
+      return { ...child, job: job ? { state: job.phase.state, merged: job.control.disposition === "merged" || job.control.mergedHead !== null || store.jobPoll(job.id).prState === "merged", ready: job.control.readiness !== null, disposition: job.control.disposition, branch: job.branch, sha: verifiedDeliveredHead(job) } : null };
     }));
   }
 
