@@ -571,6 +571,7 @@ export function createIssues(deps: IssuesDeps): Issues {
 
   async function gather(job: Job, observations?: { review: boolean }): Promise<Facts> {
     const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
+    const unobserved = new Set<number>();
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
@@ -580,6 +581,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (first.includes("children")) facts.children = await childFacts(job, facts);
     if (facts.children?.length) {
       facts.prerequisites = integrationPrerequisites(facts.children);
+      for (const child of facts.children) if ((child.job?.merged || child.job?.disposition === "merged") && !child.job.sha) unobserved.add(child.number);
       const failed = facts.children.find((child) => child.state === "open" && child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
       if (failed && job.phase.state !== "tracking") facts.prerequisiteProblem = `prerequisites failed: #${failed.number}`;
       const unpinned = facts.children.find((child) => (child.job?.ready || child.job?.merged || child.job?.disposition === "merged") && (!child.job.branch || !child.job.sha));
@@ -604,7 +606,11 @@ export function createIssues(deps: IssuesDeps): Issues {
       for (const ref of blockers) {
         const number = localNumber(ref);
         const candidate = store.open(job.repo, number) ?? store.children(job.parentId).find((row) => row.issue === number);
-        if (candidate) siblings.set(number, await observeMergedHead(candidate, facts));
+        if (candidate) {
+          const observed = await observeMergedHead(candidate, facts);
+          siblings.set(number, observed);
+          if (!observed.control.mergedHead && (observed.control.disposition === "merged" || store.jobPoll(observed.id).prState === "merged")) unobserved.add(number);
+        }
       }
       facts.blockers = blockers.filter((ref) => {
         const number = localNumber(ref);
@@ -618,6 +624,10 @@ export function createIssues(deps: IssuesDeps): Issues {
         return child.state !== "closed" && !prerequisite?.control.readiness && !prerequisite?.control.mergedHead && prerequisite?.control.disposition !== "no-change" && prerequisite?.control.disposition !== "merged";
       });
       facts.prerequisites = [...facts.prerequisites].sort((a, b) => a.issue - b.issue);
+    }
+    if (facts.prerequisiteWait && facts.prerequisites) {
+      const observed = facts.prerequisites;
+      facts.prerequisites = [...observed, ...job.control.prerequisites.filter((pin) => unobserved.has(pin.issue) && !observed.some((current) => current.issue === pin.issue))].sort((a, b) => a.issue - b.issue);
     }
     const wanted = [...first, ...moreFacts(job, facts)];
     if (wanted.includes("rounds")) facts.rounds = store.roundSummaries(job.id);

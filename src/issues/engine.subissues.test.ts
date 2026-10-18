@@ -386,3 +386,124 @@ test("a merged adopted child head survives activity-poll lag and restart in its 
   delayed = false; await h.advance(3 * MIN);
   assert.notEqual((await h.byIssue(50)).outcome, "failure");
 });
+
+for (const wait of ["shared-claim", "transport"] as const) {
+  for (const changed of [false, true]) {
+    test(`historical merged-head ${wait} preserves dependent evidence until an observed ${changed ? "changed" : "unchanged"} pin`, async () => {
+      let target = 0;
+      let unavailable = false;
+      const h = withParent([51, 52], { configureDeps(deps) {
+        const repo = deps.github.repo;
+        deps.github = { repo: (name, signal) => {
+          const client = repo(name, signal);
+          return { ...client, reviewSnapshot: async (pr) => {
+            if (unavailable && pr === target) throw new GitHubTransientError("historical observation temporarily unavailable", null);
+            return client.reviewSnapshot(pr);
+          } };
+        } };
+      } });
+      h.gh().issues.get(52)!.blockedBy = [51];
+      await h.settle();
+      const child = await h.byIssue(51);
+      await h.report(child.threadId!, GOOD); await h.settle(); await h.advance(MIN);
+      const dependent = await h.byIssue(52);
+      await h.report(dependent.threadId!, GOOD, { headSha: "4".repeat(40), ancestors: ["2".repeat(40)], ahead: 2 });
+      await h.advance(2 * MIN);
+      const before = h.store.get(dependent.id)!;
+      assert.ok(before.control.readiness);
+      assert.ok(before.control.localEvidence);
+      const original = h.store.get(child.id)!;
+      target = original.pr!.number;
+      h.store.write(original.id, original.version, { phase: { state: "done" }, control: { ...original.control, disposition: "merged", readiness: null, mergedHead: null } }, h.clock.now);
+      h.db.prepare("UPDATE issue_job_polls SET pr_state = 'merged' WHERE job_id = ?").run(child.id);
+      Object.assign(h.gh().pulls.get(target)!, { state: "closed", merged: true });
+      if (changed) h.gh().refs.set(child.branch, "3".repeat(40));
+      h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now, child.id);
+      if (wait === "shared-claim") assert.equal(h.store.claimReview(h.store.get(child.id)!, h.clock.now), true);
+      else unavailable = true;
+      const messages = h.sent.length;
+      const drafts = h.gh().draftConversions.length;
+      await h.settle();
+      h.restart(); await h.advance(15_000);
+      const waiting = h.store.get(dependent.id)!;
+      assert.equal(waiting.phase.state, "review");
+      assert.deepEqual(waiting.control.readiness, before.control.readiness);
+      assert.deepEqual(waiting.control.localEvidence, before.control.localEvidence);
+      assert.deepEqual(waiting.control.prerequisites, before.control.prerequisites);
+      assert.equal(h.sent.length, messages);
+      assert.equal(h.gh().draftConversions.length, drafts);
+      unavailable = false;
+      await h.advance(2 * MIN);
+      const observed = h.store.get(dependent.id)!;
+      assert.equal(h.store.get(child.id)!.control.mergedHead, (changed ? "3" : "2").repeat(40));
+      if (changed) {
+        assert.equal(observed.control.readiness, null);
+        assert.equal(observed.control.localEvidence, null);
+        assert.equal(observed.control.prerequisites[0]!.sha, "3".repeat(40));
+        assert.ok(h.gh().draftConversions.length > drafts);
+      } else {
+        assert.equal(observed.phase.state, "review");
+        assert.deepEqual(observed.control.localEvidence, before.control.localEvidence);
+        assert.equal(observed.control.repair, before.control.repair);
+        assert.equal(h.sent.length, messages);
+      }
+    });
+  }
+}
+
+test("a contended prerequisite cannot mask another child's observed changed head", async () => {
+  const h = withParent([51, 52, 53]);
+  h.gh().issues.get(53)!.blockedBy = [51, 52];
+  await h.settle();
+  for (const issue of [51, 52]) await h.report((await h.byIssue(issue)).threadId!, GOOD);
+  await h.advance(2 * MIN);
+  const dependent = await h.byIssue(53);
+  await h.report(dependent.threadId!, GOOD, { headSha: "4".repeat(40), ancestors: ["2".repeat(40)], ahead: 2 });
+  await h.advance(2 * MIN);
+  assert.ok(h.store.get(dependent.id)!.control.readiness);
+  const originalPins = h.store.get(dependent.id)!.control.prerequisites;
+  for (const issue of [51, 52]) {
+    const child = h.store.get((await h.byIssue(issue)).id)!;
+    h.store.write(child.id, child.version, { phase: { state: "done" }, control: { ...child.control, disposition: "merged", readiness: null, mergedHead: issue === 51 ? null : "3".repeat(40) as typeof child.pushedSha } }, h.clock.now);
+    h.db.prepare("UPDATE issue_job_polls SET pr_state = 'merged' WHERE job_id = ?").run(child.id);
+    if (issue === 51) h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now + 10 * MIN, child.id);
+  }
+  await h.settle();
+  const changed = h.store.get(dependent.id)!;
+  assert.equal(changed.control.readiness, null);
+  assert.equal(changed.control.localEvidence, null);
+  assert.deepEqual(changed.control.prerequisites.find((pin) => pin.issue === 51), originalPins.find((pin) => pin.issue === 51));
+  assert.equal(changed.control.prerequisites.find((pin) => pin.issue === 52)!.sha, "3".repeat(40));
+  assert.equal(h.gh().issues.get(changed.pr!.number)!.pr!.draft, true);
+});
+
+test("checking retains local evidence but cannot promote ready during historical prerequisite contention", async () => {
+  const h = withParent([51, 52]);
+  h.gh().issues.get(52)!.blockedBy = [51];
+  await h.settle();
+  const child = await h.byIssue(51);
+  await h.report(child.threadId!, GOOD); await h.advance(2 * MIN);
+  const dependent = await h.byIssue(52);
+  await h.report(dependent.threadId!, GOOD, { headSha: "4".repeat(40), ancestors: ["2".repeat(40)], ahead: 2 });
+  await h.advance(2 * MIN);
+  const ready = h.store.get(dependent.id)!;
+  assert.ok(ready.control.localEvidence);
+  h.store.write(ready.id, ready.version, { phase: { state: "checking" }, control: { ...ready.control, readiness: null } }, h.clock.now);
+  h.gh().issues.get(ready.pr!.number)!.pr!.draft = true;
+  const original = h.store.get(child.id)!;
+  h.store.write(original.id, original.version, { phase: { state: "done" }, control: { ...original.control, disposition: "merged", mergedHead: null, readiness: null } }, h.clock.now);
+  Object.assign(h.gh().pulls.get(original.pr!.number)!, { state: "closed", merged: true });
+  h.db.prepare("UPDATE issue_job_polls SET pr_state = 'merged' WHERE job_id = ?").run(child.id);
+  h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now + 2 * MIN, child.id);
+  const drafts = h.gh().draftConversions.length;
+  h.restart(); await h.advance(MIN);
+  const waiting = h.store.get(dependent.id)!;
+  assert.equal(waiting.phase.state, "checking");
+  assert.equal(waiting.control.readiness, null);
+  assert.deepEqual(waiting.control.localEvidence, ready.control.localEvidence);
+  assert.deepEqual(waiting.control.prerequisites, ready.control.prerequisites);
+  assert.equal(h.gh().draftConversions.length, drafts);
+  await h.advance(3 * MIN);
+  assert.equal((await h.byIssue(52)).outcome, "ready");
+  assert.equal(h.store.get(dependent.id)!.control.repair, null);
+});

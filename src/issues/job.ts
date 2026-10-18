@@ -514,11 +514,6 @@ function next(job: Job, facts: Facts): Action | null {
   }
 
   if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem, { kind: "prerequisite", issues: job.control.prerequisites.map(({ issue }) => issue) }) };
-  if (facts.prerequisiteWait) {
-    const target = job.control.readiness ?? job.control.reviewIntent;
-    if (phase.state === "review" && target) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `prerequisite-observation:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null, localEvidence: null } } };
-    return job.control.readiness || job.control.localEvidence ? { type: "change", change: { control: { ...job.control, readiness: null, localEvidence: null } } } : null;
-  }
 
   if (facts.prerequisites && JSON.stringify(facts.prerequisites) !== JSON.stringify(job.control.prerequisites)) {
     const control = { ...job.control, prerequisites: facts.prerequisites, localEvidence: null, readiness: null };
@@ -526,7 +521,7 @@ function next(job: Job, facts: Facts): Action | null {
     if (phase.state === "review" && target) return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `prerequisites-draft:${job.id}:${job.version}`, target, draft: true }]) } };
     return { type: "change", change: { control } };
   }
-
+  if (facts.prerequisiteWait) return null;
 
   switch (phase.state) {
     case "queued": {
