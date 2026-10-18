@@ -297,8 +297,6 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     db.prepare(`INSERT INTO issue_status (repo, issue, job_id, generation, revision, body) VALUES (?, ?, ?, ?, 1, ?)
       ON CONFLICT(repo,issue) DO UPDATE SET job_id = excluded.job_id, generation = excluded.generation,
         revision = issue_status.revision + 1, body = excluded.body, next_at = 0,
-        lease_until = CASE WHEN excluded.generation > issue_status.generation THEN NULL ELSE issue_status.lease_until END,
-        lease_owner = CASE WHEN excluded.generation > issue_status.generation THEN NULL ELSE issue_status.lease_owner END,
         decorations_json = CASE WHEN excluded.generation > issue_status.generation THEN '[]' ELSE issue_status.decorations_json END,
         desired_labels_key = CASE WHEN excluded.generation > issue_status.generation THEN NULL ELSE issue_status.desired_labels_key END
       WHERE excluded.generation > issue_status.generation OR
@@ -544,12 +542,14 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       return claimed;
     },
     settleStatus(status, input) {
-      if (input.notBefore) db.prepare("UPDATE issue_status SET retry_not_before = max(retry_not_before,?) WHERE repo = ? AND issue = ? AND job_id = ? AND lease_owner = ? AND lease_until > ?")
-        .run(input.notBefore, status.repo, status.issue, status.jobId, status.leaseOwner, input.now);
+      if (input.notBefore) db.prepare("UPDATE issue_status SET retry_not_before = max(retry_not_before,?) WHERE repo = ? AND issue = ? AND lease_owner = ? AND lease_until > ?")
+        .run(input.notBefore, status.repo, status.issue, status.leaseOwner, input.now);
       db.prepare(`UPDATE issue_status SET delivered_revision = CASE WHEN ? IS NULL THEN max(delivered_revision,?) ELSE delivered_revision END,
         lease_until = CASE WHEN ? THEN NULL ELSE lease_until END, lease_owner = CASE WHEN ? THEN NULL ELSE lease_owner END,
         next_at = ?, retry_not_before = ?, error = ? WHERE repo = ? AND issue = ? AND job_id = ? AND revision = ? AND lease_owner = ? AND lease_until > ?`)
         .run(input.error, status.revision, input.release === false ? 0 : 1, input.release === false ? 0 : 1, input.nextAt, input.notBefore ?? 0, input.error, status.repo, status.issue, status.jobId, status.revision, status.leaseOwner, input.now);
+      if (input.release !== false) db.prepare("UPDATE issue_status SET lease_until = NULL, lease_owner = NULL WHERE repo = ? AND issue = ? AND lease_owner = ? AND lease_until > ?")
+        .run(status.repo, status.issue, status.leaseOwner, input.now);
     },
     releaseStatus(status, now) {
       db.prepare("UPDATE issue_status SET lease_until = NULL, lease_owner = NULL WHERE repo = ? AND issue = ? AND lease_owner = ? AND lease_until > ?").run(status.repo, status.issue, status.leaseOwner, now);

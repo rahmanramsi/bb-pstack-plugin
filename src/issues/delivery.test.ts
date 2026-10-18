@@ -69,7 +69,8 @@ async function fixture(t: TestContext) {
   base = `http://127.0.0.1:${address.port}`;
   t.after(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); db.close(); });
   const github = () => createGitHub({ credentials: () => ({ appId: "1", privateKey }), apiUrl: base, clock: () => clock.now });
-  const insert = (issue = 41) => store.insert({ id: `job-${issue}` as JobId, repo: REPO, issue, trigger: { eventId: issue, actor: "maya", at: clock.now }, snapshot: { title: "Fix footer", body: "Footer overlaps", url: `https://github.test/issues/${issue}`, author: "maya" }, projectId: "project", hostId: "host", baseBranch: "main", state: "queued", error: null }, clock.now)!;
+  let nextJob = 1;
+  const insert = (issue = 41) => store.insert({ id: `job-${issue}-${nextJob++}` as JobId, repo: REPO, issue, trigger: { eventId: nextJob, actor: "maya", at: clock.now }, snapshot: { title: "Fix footer", body: "Footer overlaps", url: `https://github.test/issues/${issue}`, author: "maya" }, projectId: "project", hostId: "host", baseBranch: "main", state: "queued", error: null }, clock.now)!;
   const build = (run?: () => Promise<void>) => {
     const transport = github();
     const currentStore = store;
@@ -253,4 +254,31 @@ test("an in-flight cooldown survives an unrelated status revision without acknow
   await h.build()();
   assert.equal(h.labelPosts().length, 1);
   assert.ok([...h.comments.values()].some((comment) => comment.body.includes("Checked footer dimensions.")));
+});
+
+
+test("new generations retain the live issue lease and old responses cannot acknowledge or erase their work", async (t) => {
+  const h = await fixture(t);
+  let oldJob = h.insert();
+  oldJob = h.store.write(oldJob.id, oldJob.version, { phase: { state: "done" }, control: { ...oldJob.control, disposition: "no-change" } }, h.clock.now)!;
+  const claimed = h.store.statuses(h.clock.now)[0]!;
+  assert.equal(h.store.claimStatus(claimed, h.clock.now), true);
+  const oldKey = claimed.decorations[0]!.effect.key;
+  assert.equal(h.store.claimDecoration(claimed, oldKey, h.clock.now), 0);
+  const latest = h.insert();
+  assert.equal(latest.generation, 2);
+  await h.build()();
+  assert.equal(h.requests.length, 0);
+  h.store.settleDecoration(claimed, oldKey, null, 0, h.clock.now);
+  h.store.settleStatus(claimed, { error: "cooldown", nextAt: h.clock.now + 600_000, notBefore: h.clock.now + 600_000, now: h.clock.now });
+  await h.build()();
+  assert.equal(h.statusReads().length, 0);
+  assert.equal(h.labelPosts().length, 1);
+  assert.deepEqual(h.labelPosts()[0]!.body, { labels: [LABEL.working] });
+  assert.equal(h.store.delivery(REPO, 41).pending, true);
+  h.clock.now += 600_000;
+  await h.build()();
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
+  assert.equal([...h.comments.values()].filter((comment) => comment.body.includes("pstack:issue-status")).length, 1);
+  assert.deepEqual(h.db.prepare("SELECT count(*) AS n FROM issue_status WHERE issue = 41").get(), { n: 1 });
 });
