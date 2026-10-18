@@ -825,7 +825,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!store.bindSubmission(submission.id, tree.headSha)) return reject("pending", "The report snapshot is being reconciled.");
         submission.intendedSha = tree.headSha;
       }
-    } catch { /* The classified facts below retain a report during host outages. */ }
+    } catch {}
     const facts = await reportFacts(job);
     if ("unavailable" in facts) {
       if (facts.disposition === "fail") {

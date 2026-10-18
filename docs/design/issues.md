@@ -118,7 +118,9 @@ A feedback round's report also answers the round's comments:
 
 `round` is the round the message named. `replies` has exactly one entry for each item the round listed, named by `kind` (`review`, `review-comment`, or `pr-comment`) and `commentId`. `pr.body` is optional and replaces the pull request description. A feedback report has no `pr.title`. A repair round for CI or a conflict lists no comments, so its `replies` is empty.
 
-**Submissions are saved before they are judged.** pstack stores every submission in `issue_submissions` before it evaluates it, keyed by job, worker epoch, round, thread, and content hash, so a repeated submission is one row. When pstack cannot evaluate yet, for example because the host or GitHub is unreachable, the command exits 0 with "Report saved", and the service evaluates the saved submission when the dependency recovers. A submission from a retired worker or an earlier round is kept and answered with `stale_report`. It cannot move the job.
+**Submissions are saved before they are judged.** pstack stores every submission in `issue_submissions` before it evaluates it. Identical submissions by the same worker at the same job version share a row. When the host or GitHub is temporarily unreachable, the command exits 0 with "Report saved", and evaluation resumes when the dependency recovers. A submission from a retired worker or an earlier round is kept and answered with `stale_report`. It cannot move the job.
+
+A pending report binds to the first commit pstack can inspect. If the worktree changes later, the worker must verify and report the current commit. Missing local Git objects trigger a fetch request to the authorized worker. A permanent prerequisite failure ends the job with the report and observed commit preserved.
 
 **Validation.** pstack rejects a `changes` or `no-change` report and tells the worker every reason when any check fails:
 
@@ -136,7 +138,7 @@ A feedback round's report also answers the round's comments:
 
 A rejected report goes back to the worker with every reason. After 3 rejections in a row without progress, pstack recovers the worker (see [Recovery](#recovery)). Progress means the newest rejection has fewer reasons than the best one so far, and all of them were in it. When the branch on GitHub moved since the round started, the report is refused without counting as a rejection, and the round's base moves to the new head.
 
-pstack binds an accepted report to the commit it inspected. That commit, not a later HEAD, is what gets pushed, and the local verification counts only for that commit and the base it was checked against. The report proves what the worker claims it ran. It does not prove the tests are right. Reviewers and the repository's CI check the behavior.
+pstack binds an accepted report to the commit it inspected. That commit, not a later HEAD, is what gets pushed, and the local verification counts only for that commit and the base it was checked against. The report records what the worker claims it ran. Reviewers and the repository's CI check the behavior.
 
 Before posting, the service turns `@mentions` into code spans in everything it posts. In the pull request body it also removes `Closes`, `Fixes`, and `Resolves` keywords and appends `Closes #<n>`.
 
@@ -200,7 +202,7 @@ A repository with no CI can become ready on local verification alone.
 
 **Readying is checked twice.** The transit state `readifying` converts the draft only if the head and base still match what was checked, then reads the pull request again. A change in between sends the job back to `checking`.
 
-**Repair rounds.** When checks fail, mergeability is conflicting, or local verification is stale, the job returns the pull request to draft and starts a repair round in `repairing`. The round message lists the failures and the exact head and base, and tells the worker to fetch, merge as needed, and run checks itself. Each distinct cause, identified by its failure text with commit ids removed, gets 5 repair rounds. After that the job fails with the work kept. A new commit alone does not reset the count. While checks are still pending, the job waits. When GitHub cannot be read, the job waits without spending a repair round.
+**Repair rounds.** When checks fail, mergeability is conflicting, or local verification is stale, the job returns the pull request to draft and starts a repair round in `repairing`. The round message lists the failures and the exact head and base, and tells the worker to fetch, merge as needed, and run checks itself. Each distinct cause, identified by its failure text with commit ids removed, gets 5 repair rounds. After that the job fails with the work kept. A new commit alone does not reset the count. While checks are still pending, the job waits. Temporary GitHub faults wait without spending a repair round. A permanent denial of the essential pull request snapshot fails the job.
 
 **Branch policy that cannot be read.** Classic branch protection needs the Administration read grant, and some rules are not visible through the API. When pstack cannot read the whole policy, the job can still become ready on complete observed checks and local verification. The result carries a limitation such as "Branch policy could not be inspected… merge prerequisites are not established". Ready for review never claims that unread required checks passed.
 
