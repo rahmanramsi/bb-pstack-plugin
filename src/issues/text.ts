@@ -156,6 +156,14 @@ export function progressBody(children: readonly ChildFact[]): string {
   return [`**Sub-issues: ${closed} of ${children.length} closed**`, "", ...children.map(line)].join("\n");
 }
 
+const AUTONOMOUS_WORK = [
+  "This is an unattended GitHub job. The human reviews the pull request; do not ask for decisions or confirmation in the worker thread, use an interactive question tool, or stop after presenting a plan.",
+  "Choose reasonable defaults from the issue, repository conventions, and existing behavior. Make reversible implementation, design, and scope decisions yourself, including when a playbook would normally ask the human. Pass these instructions to any delegates.",
+  "Deliver the smallest useful baseline as a draft pull request, even when some requirements remain uncertain. Put material assumptions, remaining limitations, and unresolved product choices in the pull request description so the reviewer can decide there. Continue with the parts you can implement.",
+  "Run the relevant checks and report their actual results. Do not claim unperformed checks passed or bypass report validation. This authorizes work in the assigned branch and submission through the report command, not merging, deployment, or destructive external actions.",
+  "Use `needs-info` only when a missing prerequisite prevents any useful baseline, such as inaccessible source code or a required external interface with no usable contract. Report the concrete blocker and what is needed in `questions` on GitHub, never as a question in this thread. Uncertain preferences, several valid approaches, or incomplete acceptance criteria are not blockers.",
+].join("\n");
+
 /** The first message. It stands alone, so a replacement thread or a compacted context can act on it. */
 export function workerPrompt(job: Job): string {
   return [
@@ -167,6 +175,8 @@ export function workerPrompt(job: Job): string {
     "",
     ...parentSection(job),
     "## Rules",
+    "",
+    AUTONOMOUS_WORK,
     "",
     `- This worktree's commits become the pull request. pstack pushes them to \`${job.branch}\` and opens a draft pull request against \`${job.baseBranch}\` after it accepts your report.`,
     "- `bb pstack issues report` is this run's built-in PR tool. Use it in place of a forge CLI wherever Opening a PR says to create or update a pull request.",
@@ -244,7 +254,8 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     "## Rules",
     "",
     "- Decide the effort for each item. Apply mechanical feedback, such as a rename, a typo or a removed log line, directly. Take anything that changes behavior or design through `/poteto-mode`.",
-    "- Answer every item above in `replies`: describe the change and its commit, or give your reason when you disagree. A question for the reviewer goes in a reply.",
+    "- Continue as an unattended GitHub job: make reasonable decisions and do not ask for confirmation in the worker thread. If feedback leaves a product choice unresolved, implement the useful parts and explain your assumption or limitation in `replies` for review on the pull request.",
+    "- Answer every item above in `replies`: describe the change and its commit, or give your reason when you disagree. A question for the reviewer goes in a reply and must not stop work on the other items.",
     `- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it: run \`bb pstack gh fetch\` (plain \`git fetch\` has no GitHub credentials), then merge \`origin/${job.baseBranch}\`.`,
     "- Never run `git push`, never use `gh` or another GitHub client, and never switch or create branches.",
     "- Commit every change before you report. Untracked or uncommitted files reject the report.",
@@ -273,6 +284,8 @@ export function mergeNote(job: Job, head: Sha, base: Sha): string {
 export function workerInstructions(job: Job): string {
   return [
     `This thread works on GitHub issue #${job.issue} in ${job.repo} for pstack.`,
+    AUTONOMOUS_WORK,
+    ...(job.round > 1 ? ["In a feedback round, `needs-info` is not available. Put any remaining blocker or decision in `replies` on the pull request and complete the other feedback."] : []),
     "`bb pstack issues report --file <path>` is this run's built-in PR tool: pstack validates the report, pushes the reported commit, opens or updates the pull request, and posts your replies to review comments.",
     "Never run `git push`, never use `gh`, and never switch or create branches. Commit everything before reporting. After the first push, add commits and never rewrite pushed history.",
     ...(job.snapshot.parent ? [`This issue is a sub-issue of #${job.snapshot.parent.number}. Resolve only #${job.issue}; never close the parent.`] : []),
@@ -284,6 +297,8 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
   return [
     "You stopped without reporting. Write your report JSON to a file and run:",
     "`bb pstack issues report --file <path>`",
+    AUTONOMOUS_WORK,
+    ...(job.round > 1 ? ["For this feedback round, report `changes` or `no-change` with `replies`; put any unresolved decision in a reply on the pull request."] : []),
     ...(gate && !gate.pass && job.pushedSha === null ? [`A \`changes\` report needs \`bb pstack gate pr\` to pass, and it fails: ${gate.reason}`] : []),
     `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}.`,
   ].join("\n");

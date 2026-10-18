@@ -66,6 +66,10 @@ bb pstack issues report --file "$BB_THREAD_STORAGE/report.json"
 }
 ```
 
+Workers run unattended. The first prompt, standing instructions, and idle reminders direct workers to choose reasonable defaults and deliver a useful baseline for review. Workers record material assumptions, limitations, and unresolved product choices in the draft pull request. They do not wait for decisions in the worker thread. Feedback rounds put remaining decisions in replies on the pull request and continue with the other items.
+
+The instructions reserve `needs-info` for missing prerequisites that prevent any useful baseline, such as inaccessible source code or an unavailable external contract. Uncertain preferences and incomplete acceptance criteria do not qualify. This policy guides the worker; the report validator does not judge whether a question is a genuine blocker. Project permission settings still apply, and workers must report actual verification results and pass report validation.
+
 In the first round, `outcome` is `changes` (with `pr.title` and `pr.body`), `needs-info` (with `questions`), or `no-change` (with `summary` as the reason posted on the issue). A feedback round's report answers the round's comments:
 
 ```json
