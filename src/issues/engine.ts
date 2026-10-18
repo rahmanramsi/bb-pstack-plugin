@@ -123,15 +123,15 @@ const isMissing = (error: unknown) => {
   const candidate = error as { status?: unknown; code?: unknown } | null;
   return candidate?.status === 404 || candidate?.code === "thread_not_found";
 };
-const ObservationError = z.object({ status: z.number().optional(), statusCode: z.number().optional(), code: z.string().optional(), cause: z.unknown().optional() });
+/** The bb SDK replaces a refused connection with a plain Error carrying only this message. */
+const SDK_UNREACHABLE = "Cannot connect to BB server. Ensure it is running and BB_SERVER_URL is correct.";
 function isTransientObservation(error: unknown): boolean {
-  for (let depth = 0; depth < 4; depth++) {
-    const parsed = ObservationError.safeParse(error);
-    if (!parsed.success) return false;
-    const { status, statusCode, code, cause } = parsed.data;
-    const http = status ?? statusCode;
+  for (let depth = 0; depth < 4 && typeof error === "object" && error !== null; depth++) {
+    const { status, statusCode, code, name, message, cause } = error as { status?: unknown; statusCode?: unknown; code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
+    const http = typeof status === "number" ? status : typeof statusCode === "number" ? statusCode : undefined;
     if (http !== undefined) return [408, 429, 500, 502, 503, 504].includes(http);
-    if (code && ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET"].includes(code)) return true;
+    if (name === "BbRequestTimeoutError" || message === SDK_UNREACHABLE) return true;
+    if (typeof code === "string" && ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET"].includes(code)) return true;
     error = cause;
   }
   return false;

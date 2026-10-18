@@ -68,7 +68,7 @@ for (const status of ["error", "destroyed", "missing", "unknown-exception"] as c
       const get = deps.bb.sdk.environments.get;
       deps.bb.sdk.environments.get = async (args) => {
         if (recovering) {
-          if (status === "missing") throw Object.assign(new Error("environment not found"), { status: 404 });
+          if (status === "missing") throw new BbHttpError({ status: 404, code: null, body: null, message: "Not Found" });
           if (status === "unknown-exception") throw new Error("unexpected workspace observation failure");
           return { ...await get(args), status };
         }
@@ -121,9 +121,36 @@ test("pre-spawn transient observations grow backoff across restart and exhaust a
   assert.equal(h.store.get(original.id)!.control.recoveries, 1);
 });
 
-for (const boundary of ["get", "status", "writers"] as const) {
+class BbHttpError extends Error {
+  readonly body: unknown;
+  readonly code: string | null;
+  readonly status: number;
+  constructor(args: { body: unknown; code: string | null; message: string; status: number }) {
+    super(`HTTP ${args.status}: ${args.message}`);
+    this.name = "BbHttpError";
+    this.body = args.body;
+    this.code = args.code;
+    this.status = args.status;
+  }
+}
+class BbRequestTimeoutError extends Error {
+  constructor() {
+    super("BB request timed out after 75 seconds.");
+    this.name = "BbRequestTimeoutError";
+  }
+}
+const transportFailures = [
+  { boundary: "get", label: "status 503", error: () => Object.assign(new Error("SDK temporarily unavailable"), { status: 503 }) },
+  { boundary: "status", label: "statusCode 503", error: () => Object.assign(new Error("SDK temporarily unavailable"), { statusCode: 503 }) },
+  { boundary: "writers", label: "status 429", error: () => Object.assign(new Error("SDK temporarily unavailable"), { status: 429 }) },
+  { boundary: "get", label: "BbHttpError 503 without a code", error: () => new BbHttpError({ status: 503, code: null, body: null, message: "Service Unavailable" }) },
+  { boundary: "status", label: "BbRequestTimeoutError", error: () => new BbRequestTimeoutError() },
+  { boundary: "writers", label: "connection refused", error: () => new Error("Cannot connect to BB server. Ensure it is running and BB_SERVER_URL is correct.") },
+] as const;
+
+for (const { boundary, label, error } of transportFailures) {
   for (const persistent of [false, true]) {
-    test(`${boundary} SDK transport failures ${persistent ? "exhaust a bounded observation budget" : "recover after restart without an uncertain spawn"}`, async () => {
+    test(`${boundary} SDK ${label} ${persistent ? "exhausts a bounded observation budget" : "recovers after restart without an uncertain spawn"}`, async () => {
       let recovering = false;
       let attempts = 0;
       let wrapped = false;
@@ -138,7 +165,7 @@ for (const boundary of ["get", "status", "writers"] as const) {
           if (!phase || !("effects" in phase) || phase.effects[0]?.op !== "recover-worker") return;
           observations.push(deps.clock!());
           attempts++;
-          throw boundary === "status" ? Object.assign(new Error("SDK temporarily unavailable"), { statusCode: 503 }) : Object.assign(new Error("SDK temporarily unavailable"), { status: boundary === "get" ? 503 : 429 });
+          throw error();
         };
         if (boundary === "get") {
           const get = deps.bb.sdk.environments.get;
@@ -184,13 +211,18 @@ for (const boundary of ["get", "status", "writers"] as const) {
   }
 }
 
-for (const status of [401, 403]) {
-  test(`SDK observation permission status ${status} remains terminal`, async () => {
+const permissionFailures = [
+  ...[401, 403].map((status) => ({ label: `status ${status} over a nested reset`, error: () => Object.assign(new Error("SDK access denied"), { status, cause: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }) }) })),
+  ...[401, 403].map((status) => ({ label: `BbHttpError ${status} without a code`, error: () => new BbHttpError({ status, code: null, body: null, message: "Forbidden" }) })),
+  { label: "BbHttpError 403 over a transport code and refused cause", error: () => Object.assign(new BbHttpError({ status: 403, code: "ECONNRESET", body: null, message: "Forbidden" }), { cause: new Error("Cannot connect to BB server. Ensure it is running and BB_SERVER_URL is correct.") }) },
+];
+for (const { label, error } of permissionFailures) {
+  test(`SDK observation permission ${label} remains terminal`, async () => {
     let recovering = false;
     const h = harness({ configureDeps(deps) {
       const get = deps.bb.sdk.environments.get;
       deps.bb.sdk.environments.get = async (args) => {
-        if (recovering) throw Object.assign(new Error("SDK access denied"), { status, cause: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }) });
+        if (recovering) throw error();
         return get(args);
       };
     } });
