@@ -77,7 +77,15 @@ function environment(home: Home | Away, id: HostId): CreateThreadEnvironmentArgs
   };
 }
 
-export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: number): { target: Target; board: Board } {
+/** One host's row before ranking. `ineligible` is the blocker without capacity, which only ranks a host for pickHost. */
+type Row = HostRow & { ineligible: string | null; headroom: number };
+
+/**
+ * The per-host rows choose() and pickHost() share. With `home` null no host is exempt from the checkout and model checks.
+ * `headroom` is limit − running − held without the floor at 0, so a full fleet keeps spreading instead of piling onto
+ * the first host by name.
+ */
+function hostRows(facts: Facts, holds: readonly Hold[], need: Pick<Need, "away" | "model">, home: HostId | null, now: number) {
   const running = new Map(facts.occupancy.threads.map((thread) => [thread.id, thread.hostId]));
   const bound = new Set(running.keys());
   const extra = holds.filter((hold) => {
@@ -91,15 +99,15 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
   const globalLimit = facts.limits?.global ?? null;
   const globalFree = globalLimit === null ? Infinity : Math.max(0, globalLimit - globalRunning);
   const hosts = [...facts.hosts];
-  if (!hosts.some((host) => host.id === need.home.hostId)) {
-    hosts.push({ id: need.home.hostId, name: need.home.hostId, connected: false, phase: "unknown" });
+  if (home !== null && !hosts.some((host) => host.id === home)) {
+    hosts.push({ id: home, name: home, connected: false, phase: "unknown" });
   }
-  const rows = hosts.map((host): HostRow => {
+  const rows = hosts.map((host): Row => {
     const used = [...running.values()].filter((id) => id === host.id).length;
     const held = extra.filter((hold) => hold.hostId === host.id).length;
     const limit = facts.limits?.perHost.get(host.id) ?? null;
     const free = limit === null ? 0 : Math.max(0, limit - used - held);
-    const isHome = host.id === need.home.hostId;
+    const isHome = host.id === home;
     const reach = !host.connected ? "disconnected"
       : host.phase !== "active" ? `phase ${host.phase}`
       : limit === null ? "unknown concurrency limit"
@@ -117,13 +125,20 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
         }
       }
     }
-    const capacity = (!isHome && need.model !== null ? facts.models.has(host.id) ? facts.models.get(host.id)! : "model catalog unknown" : null)
+    const model = !isHome && need.model !== null ? facts.models.has(host.id) ? facts.models.get(host.id)! : "model catalog unknown" : null;
+    const capacity = model
       ?? (globalFree === 0 ? "global limit reached" : null)
       ?? (free === 0 ? `full (${used + held}/${limit})` : null);
     const blocker = reach ?? checkout ?? capacity;
     const onlyNeedsCheckout = reach === null && checkout === NO_CHECKOUT && capacity === null;
-    return { id: host.id, name: host.name, running: used, held, limit, free, blocker, onlyNeedsCheckout };
+    const headroom = limit === null ? -Infinity : limit - used - held;
+    return { id: host.id, name: host.name, running: used, held, limit, free, blocker, onlyNeedsCheckout, ineligible: reach ?? checkout ?? model, headroom };
   });
+  return { rows, global: { running: globalRunning, limit: globalLimit }, globalFree };
+}
+
+export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: number): { target: Target; board: Board } {
+  const { rows, global, globalFree } = hostRows(facts, holds, need, need.home.hostId, now);
   const home = rows.find((row) => row.id === need.home.hostId)!;
   const away = rows.filter((row) => row.id !== home.id && row.blocker === null)
     .sort((a, b) => b.free - a.free || b.free / b.limit! - a.free / a.limit! || a.name.localeCompare(b.name) || a.id.localeCompare(b.id))[0];
@@ -138,8 +153,30 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
     : `${home.name}; no eligible free slot, bb will queue the thread`;
   return {
     target: { hostId: picked.id, hostName: picked.name, where, environment: environment(where === "away" && need.away ? need.away : need.home, picked.id), why },
-    board: { hosts: rows, global: { running: globalRunning, limit: globalLimit }, next: picked.blocker === null ? picked.id : null },
+    board: { hosts: rows.map(({ ineligible: _, headroom: __, ...row }) => row), global, next: picked.blocker === null ? picked.id : null },
   };
+}
+
+/** A fresh worktree of the project's default checkout, on any host that has one. */
+const ANY_WORKTREE: Away = { kind: "worktree", baseBranch: null, pin: null };
+
+export type HostPick = { hostId: HostId } | { hostId: null; why: string };
+
+/**
+ * The host for a worker that may run anywhere: connected, active, with a known limit, a ready worktree of the project
+ * and the model in its catalog, and not in `exclude`. A full host stays eligible, since bb queues the thread; capacity
+ * only ranks: most headroom, then free ratio, then name and id. With no eligible host, `why` names each host's first
+ * problem.
+ */
+export function pickHost(facts: Facts, holds: readonly Hold[], need: { model: string }, exclude: ReadonlyMap<HostId, string>, now: number): HostPick {
+  const { rows } = hostRows(facts, holds, { away: ANY_WORKTREE, model: need.model }, null, now);
+  const problem = (row: Row) => exclude.get(row.id) ?? row.ineligible;
+  const ratio = (row: Row) => (row.limit ? row.headroom / row.limit : -Infinity);
+  const [best] = rows.filter((row) => problem(row) === null)
+    .sort((a, b) => b.headroom - a.headroom || ratio(b) - ratio(a) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  if (best) return { hostId: best.id };
+  if (rows.length === 0) return { hostId: null, why: "bb lists no machine" };
+  return { hostId: null, why: `no machine is eligible: ${rows.map((row) => `${row.name}: ${problem(row)}`).join("; ")}` };
 }
 
 export type ExecLimits = (file: string, args: readonly string[]) => Promise<string>;
@@ -151,12 +188,17 @@ const LimitsStatus = z.object({
   hosts: z.array(z.object({ id: hostId, effectiveLimit: limit.nullable() })),
 });
 
+/** What factsFor reads from a Need. `level`, when set, must also be in the host's catalog for `model`. */
+type FactQuery = Pick<Need, "projectId" | "away" | "model"> & { level?: string };
+
 export interface Placement {
   place(need: Need, issue: (target: Target) => Promise<string | null>): Promise<{ target: Target; threadId: string | null; board: Board }>;
   board(need: Need): Promise<Board>;
   wouldMove(need: Need, occupancy: Occupancy): Target | null;
   /** Reloads facts for every need wouldMove was asked about in the last ten minutes. */
   refresh(): Promise<void>;
+  /** Fresh facts for a worker on any host with a worktree of `projectId` and `provider/model` at `level`, for pickHost. */
+  facts(query: { projectId: string; model: string; level: string }): Promise<Facts>;
 }
 
 export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; clock?: () => number } = {}): Placement {
@@ -169,7 +211,7 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
   let limitsPending: Promise<Facts["limits"]> | null = null;
   let occupancyPending: Promise<Occupancy> | null = null;
   const watched = new Map<string, { need: Need; at: number }>();
-  const key = (need: Need) => JSON.stringify([need.projectId, need.away && { kind: need.away.kind, pin: need.away.pin }, need.model]);
+  const key = (need: FactQuery) => JSON.stringify([need.projectId, need.away && { kind: need.away.kind, pin: need.away.pin }, need.model, need.level ?? null]);
 
   async function limits(force = false): Promise<Facts["limits"]> {
     if (!force && limitsCache && clock() - limitsCache.at < FACT_TTL_MS) return limitsCache.value;
@@ -196,7 +238,7 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     return occupancyPending;
   }
 
-  async function sources(need: Need): Promise<Set<HostId> | null> {
+  async function sources(need: FactQuery): Promise<Set<HostId> | null> {
     if (!need.projectId || need.away === null) return null;
     try { return new Set((await bb.sdk.projects.get({ projectId: need.projectId })).sources.map((source) => hostId.parse(source.hostId))); }
     catch (error) {
@@ -205,7 +247,7 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     }
   }
 
-  async function factsFor(need: Need, force = false): Promise<Facts> {
+  async function factsFor(need: FactQuery, force = false): Promise<Facts> {
     const id = key(need);
     const cached = cache.get(id);
     if (!force && cached && clock() - cached.at < FACT_TTL_MS) return cached.facts;
@@ -239,7 +281,8 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
           const model = need.model.slice(slash + 1);
           try {
             const entry = (await loadCatalog(bb, { hostId: host.id }, [provider])).get(provider);
-            models.set(host.id, entry?.state === "ok" && entry.models.some((item) => item.model === model) ? null : `${need.model} unavailable`);
+            const listed = entry?.state === "ok" && entry.models.some((item) => item.model === model && (need.level === undefined || item.levels.includes(need.level)));
+            models.set(host.id, listed ? null : `${need.level === undefined ? need.model : `${need.model}/${need.level}`} unavailable`);
           } catch (error) { models.set(host.id, `model catalog unavailable: ${error instanceof Error ? error.message : String(error)}`); }
         }
       }));
@@ -254,7 +297,7 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
     return promise;
   }
 
-  async function fresh(need: Need): Promise<Facts> {
+  async function fresh(need: FactQuery): Promise<Facts> {
     const facts = await factsFor(need);
     try { return { ...facts, occupancy: await occupancy() }; }
     catch { return { ...facts, limits: null }; }
@@ -296,5 +339,6 @@ export function createPlacement(bb: BbPluginApi, deps: { exec?: ExecLimits; cloc
       for (const [id, { at }] of watched) if (clock() - at >= WATCH_MS) watched.delete(id);
       await Promise.all([...watched.values()].map(({ need }) => factsFor(need, true)));
     },
+    facts(query) { return fresh({ ...query, away: ANY_WORKTREE }); },
   };
 }
