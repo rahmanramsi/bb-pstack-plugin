@@ -32,7 +32,7 @@ export function matchesIssue({ issue, job }: IssueEntry, filter: IssueFilter): b
   const active = job !== null && !TERMINAL.has(job.state);
   if (filter.worker === "active" && !active) return false;
   if (filter.worker === "ready" && (active || issue.state !== "open" || issue.startError)) return false;
-  if (filter.worker === "attention" && !(job?.error || job?.poll.error || issue.startError || job?.delivery.error)) return false;
+  if (filter.worker === "attention" && !(job?.error || job?.poll.error || issue.startError || job?.delivery.error || job?.outcome === "failure" || job?.outcome === "closed-unmerged")) return false;
   const text = `${issue.title} #${issue.issue} ${issue.repo} ${issue.labels.join(" ")} ${issue.assignees.join(" ")}`.toLowerCase();
   return filter.query.toLowerCase().trim().split(/\s+/).every((term) => text.includes(term));
 }

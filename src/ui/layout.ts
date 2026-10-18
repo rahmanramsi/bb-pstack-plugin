@@ -1,7 +1,7 @@
 import type { z } from "zod";
 import { RUN_ID, type ChecklistView, type RunView, type ThreadView } from "../contract.ts";
 import type { IssueBoardSchema } from "../issues/board.ts";
-import type { JobState } from "../issues/job.ts";
+import { TERMINAL, type JobState } from "../issues/job.ts";
 
 export type Job = RunView["jobs"][number];
 export type Checklist = z.infer<typeof ChecklistView>;
@@ -133,6 +133,36 @@ export const issueStates: Record<JobState, { label: string; tone: StatusTone }> 
   stuck: { label: "Stuck", tone: "failed" },
   ignored: { label: "Ignored", tone: "skipped" },
 };
+
+export type IssueOutcome = NonNullable<IssueJob["outcome"]>;
+
+/** What the job achieved. A pull request ready for review is not merged, and one closed without merging is not a success. */
+export const issueOutcomes: Record<IssueOutcome, { label: string; tone: StatusTone }> = {
+  ready: { label: "Ready for review", tone: "blocked" },
+  merged: { label: "Merged", tone: "succeeded" },
+  "no-change": { label: "No change needed", tone: "skipped" },
+  failure: { label: "Failed", tone: "failed" },
+  "closed-unmerged": { label: "Closed without merging", tone: "failed" },
+  cancelled: { label: "Stopped", tone: "cancelled" },
+};
+
+/** The outcome once there is one, otherwise the current step. GitHub delivery never changes it. */
+export function issueStatus(job: Pick<IssueJob, "state" | "outcome">) {
+  return job.outcome === null ? issueStates[job.state] : issueOutcomes[job.outcome];
+}
+
+export type IssueNote = { tone: "error" | "warning" | "muted"; text: string };
+
+/** Notes under a job's status, execution problems first. Delivery and polling notes sit beside the outcome and never replace it. */
+export function issueNotes(job: Pick<IssueJob, "state" | "error" | "limitation" | "delivery" | "poll">): IssueNote[] {
+  const notes: IssueNote[] = [];
+  if (job.error !== null) notes.push({ tone: "error", text: job.error });
+  if (job.limitation !== null) notes.push({ tone: "warning", text: job.limitation });
+  if (job.delivery.error !== null) notes.push({ tone: "error", text: `The GitHub issue status is not up to date. ${job.delivery.error} It is retried automatically.` });
+  else if (job.delivery.pending) notes.push({ tone: "muted", text: "Updating the issue status on GitHub." });
+  if (!TERMINAL.has(job.state) && job.poll.error !== null) notes.push({ tone: "error", text: `Poll error. ${job.poll.error}` });
+  return notes;
+}
 
 export function issueNext(job: Pick<IssueJob, "next">): string | null {
   if (job.next === null) return null;
