@@ -200,7 +200,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!matching.some((check) => required.accepted.some((accepted) => accepted === check.state)) && !matching.some((check) => check.state === "pending")) reasons.push(`required check missing or unsatisfied: ${required.source}/${required.appId}/${required.name}`);
       }
     }
-    return { kind: "observed", target: { pr: snapshot.pr, head: snapshot.head, base: snapshot.base }, state: snapshot.state, draft: snapshot.draft, complete: snapshot.complete, ready: snapshot.complete && reasons.length === 0 && !pending, limitation: snapshot.required.kind === "unavailable" ? `Branch policy could not be inspected: ${snapshot.required.reason}. Observed CI and local evidence passed; merge prerequisites are not established.` : null, pending, reasons, fingerprint: reasons.map((reason) => reason.replace(/[0-9a-f]{40}/g, "<sha>")).sort().join("|") || "healthy" };
+    return { kind: "observed", target: { pr: snapshot.pr, head: snapshot.head, base: snapshot.base }, state: snapshot.state, draft: snapshot.draft, complete: snapshot.complete, observedAt: snapshot.observedAt, mergeability: snapshot.mergeability, ready: snapshot.complete && reasons.length === 0 && !pending, limitation: snapshot.required.kind === "unavailable" ? `Branch policy could not be inspected: ${snapshot.required.reason}. Observed CI and local evidence passed; merge prerequisites are not established.` : null, pending, reasons, fingerprint: reasons.map((reason) => reason.replace(/[0-9a-f]{40}/g, "<sha>")).sort().join("|") || "healthy" };
   }
 
   const deliverStatuses = createStatusDelivery({ store, github, clock, runEffect });
@@ -613,7 +613,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (wanted.includes("review") && job.pr && store.claimReview(job, clock())) {
       try {
         const snapshot = await github.repo(job.repo).reviewSnapshot(job.pr.number);
-        facts.review = snapshot ? reviewObservation(job, snapshot) : { kind: "observed", target: { pr: job.pr.number, head: job.pushedSha!, base: job.pushedSha! }, state: "closed", draft: true, complete: true, ready: false, pending: false, reasons: ["pull request missing"], fingerprint: "missing" };
+        facts.review = snapshot ? reviewObservation(job, snapshot) : { kind: "observed", target: { pr: job.pr.number, head: job.pushedSha!, base: job.pushedSha! }, state: "closed", draft: true, complete: true, observedAt: clock(), mergeability: "unknown", ready: false, pending: false, reasons: ["pull request missing"], fingerprint: "missing" };
       } catch (error) {
         store.deferReview(job, Math.max(clock() + POLL_MS, error instanceof GitHubTransientError ? error.notBefore ?? 0 : 0));
         facts.review = { kind: "unavailable", reason: message(error), permanent: error instanceof GitHubPermanentError || error instanceof GitHubSetupError };

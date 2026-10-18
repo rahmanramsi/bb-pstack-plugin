@@ -446,10 +446,11 @@ test("a round starts only once the newest pending feedback has been quiet for tw
 });
 
 test("the round message stands alone: the pull request, the issue, every item with its id and diff, earlier rounds, and the rules", () => {
-  const text = roundPrompt(inReview(), 3, [reviewBody, inline(1, NOW)], [{ ordinal: 1, summary: "Footer overlap fixed." }, { ordinal: 2, summary: "Renamed the parser." }], PUSHED);
+  const current = inReview();
+  const text = roundPrompt({ ...current, control: { ...current.control, feedbackRounds: 1 } }, 3, [reviewBody, inline(1, NOW)], [{ ordinal: 1, summary: "Footer overlap fixed." }, { ordinal: 2, summary: "Renamed the parser." }], PUSHED);
   assert.match(text, /^Feedback round 2 of 5 on pull request https:\/\/github\.com\/acme\/web\/pull\/7 \(branch `agent\/issue-41-/);
   assert.match(text, /```text\nSubmit button hides behind the footer\n\nOn 375px/);
-  assert.match(text, /- The first round: Footer overlap fixed\.\n- Feedback round 1: Renamed the parser\./);
+  assert.match(text, /- The first round: Footer overlap fixed\.\n- Work round 1: Renamed the parser\./);
   assert.match(text, /### Review by @lee: `\{ "kind": "review", "commentId": 500 \}`\n\n```text\nA few things\.\nSee inline\.\n```/);
   assert.match(text, /### Inline comment by @maya: `\{ "kind": "review-comment", "commentId": 1 \}`\n\nOn `src\/login\.ts` line 12:\n\n```diff\n@@ -10,3/);
   assert.match(text, /data from a GitHub user/);
@@ -624,4 +625,18 @@ test("pre-spawn retry clears an unissued claim and retains the transport cooldow
   const probe = plan(uncertain, facts({ now: cooldown }));
   assert.ok(probe?.type === "effect");
   assert.equal(probe.mode, "probe");
+});
+
+test("unknown mergeability needs a fresh observation and can diagnose on that observation", () => {
+  const target = { pr: 7, head: HEAD, base: PUSHED };
+  const current = job({ phase: { state: "checking" }, pr: { number: 7, url: "https://github.com/acme/web/pull/7" }, pushedSha: HEAD, control: { ...initialControl(), localEvidence: { head: HEAD, base: PUSHED } } });
+  const review = { kind: "observed", target, state: "open", draft: true, complete: true, ready: false, pending: false, observedAt: NOW, mergeability: "unknown", reasons: ["mergeability is unknown"], fingerprint: "mergeability is unknown" } as const;
+  const first = plan(current, facts({ review }));
+  assert.ok(first?.type === "change");
+  const waiting = apply(current, first.change);
+  assert.equal(plan(waiting, facts({ now: NOW + MIN, review })), null);
+  const fresh = plan(waiting, facts({ now: NOW + MIN, review: { ...review, observedAt: NOW + MIN } }));
+  assert.ok(fresh?.type === "change");
+  assert.equal(fresh.change.phase?.state, "repairing");
+  assert.equal(fresh.change.control?.mergeabilityGrace?.observations, 2);
 });

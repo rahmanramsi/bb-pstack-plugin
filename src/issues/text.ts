@@ -231,9 +231,11 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     fenced(item.body.trim() || "(no text)"),
     "",
   ]);
-  const earlier = rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Feedback round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
+  const earlier = rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Work round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
+  const feedbackRound = job.control.feedbackRounds + (ordinal > job.round ? 1 : 0);
+  const label = pending.length && feedbackRound > 0 ? `Feedback round ${feedbackRound} of ${MAX_FEEDBACK_ROUNDS}` : `Work round ${round}`;
   return [
-    `Feedback round ${round} of ${MAX_FEEDBACK_ROUNDS} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
+    `${label} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
     "",
     "## The issue",
     "",
@@ -261,7 +263,7 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     `- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it: run \`bb pstack gh fetch\` (plain \`git fetch\` has no GitHub credentials), then merge \`origin/${job.baseBranch}\`.`,
     "- Never run `git push`, never use `gh` or another GitHub client, and never switch or create branches.",
     "- Commit every change before you report. Untracked or uncommitted files reject the report.",
-    `- If you already reported feedback round ${round}, this message is a repeated copy: stop without changing anything.`,
+    `- If you already reported work round ${round}, this message is a repeated copy: stop without changing anything.`,
     "",
     "## Report",
     "",

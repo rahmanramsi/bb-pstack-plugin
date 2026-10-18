@@ -276,6 +276,7 @@ export type Control = {
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
   objectRepair: { sha: Sha } | null;
   idleObservation: { since: number; remindedAt: number } | null;
+  mergeabilityGrace: { target: ReviewTarget; firstAt: number; lastObservedAt: number; observations: number } | null;
   publicationRepair: { acceptedSha: Sha; remoteSha: Sha; remaining: readonly Effect[]; attempts: number } | null;
   workerContext: { round: number; text: string; recoveryReason: string | null } | null;
   prerequisites: readonly { issue: number; branch: BranchName; sha: Sha }[];
@@ -284,7 +285,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -594,7 +595,7 @@ export function recover(job: Job, reason: string): Change {
 
 export type ReviewFact =
   | { kind: "unavailable"; reason: string; permanent?: boolean }
-  | { kind: "observed"; target: ReviewTarget; state: PullState; draft: boolean; complete: boolean; ready: boolean; pending: boolean; reasons: readonly string[]; fingerprint: string; limitation?: string | null };
+  | { kind: "observed"; target: ReviewTarget; state: PullState; draft: boolean; complete: boolean; ready: boolean; pending: boolean; observedAt: number; mergeability: "clean" | "conflicting" | "unknown"; reasons: readonly string[]; fingerprint: string; limitation?: string | null };
 
 function checkReview(job: Job, facts: Facts): Action | null {
   const review = facts.review;
@@ -631,6 +632,14 @@ function checkReview(job: Job, facts: Facts): Action | null {
   if (facts.feedback?.pending.length && !review.draft) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `feedback-observed:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
   if (awaitingCI) return null;
   if (!review.draft && (!review.ready || !local)) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `checking-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+  const grace = job.control.mergeabilityGrace;
+  if (review.mergeability === "unknown") {
+    const same = grace?.target.pr === target.pr && grace.target.head === target.head && grace.target.base === target.base;
+    if (!same) return { type: "change", change: { control: { ...job.control, mergeabilityGrace: { target, firstAt: review.observedAt, lastObservedAt: review.observedAt, observations: 1 } } } };
+    const observation = review.observedAt > grace.lastObservedAt ? { ...grace, lastObservedAt: review.observedAt, observations: grace.observations + 1 } : grace;
+    if (observation.observations < 2 || observation.lastObservedAt < observation.firstAt + 60_000) return observation === grace ? null : { type: "change", change: { control: { ...job.control, mergeabilityGrace: observation } } };
+    job = { ...job, control: { ...job.control, mergeabilityGrace: observation } };
+  } else if (grace) return { type: "change", change: { control: { ...job.control, mergeabilityGrace: null } } };
   if (review.pending) return null;
   if (review.ready && local) {
     const control = { ...job.control, policyLimitation: review.limitation ?? null };

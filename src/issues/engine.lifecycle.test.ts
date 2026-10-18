@@ -232,3 +232,133 @@ test("an unreachable owned worker remains unconfirmed across restart and elapsed
   await h.settle();
   assert.equal(h.spawned.length, 2);
 });
+
+test("unknown mergeability waits for fresh observations across restart before bounded diagnosis", async () => {
+  const h = harness();
+  h.gh().mergeable = null;
+  h.label(41); await h.settle();
+  const working = await h.only();
+  await h.report(working.threadId!, GOOD); await h.settle();
+  const first = await h.only();
+  assert.equal(first.state, "checking");
+  assert.equal(first.round, 1);
+  assert.equal(h.sent.length, 0);
+  assert.notEqual(first.outcome, "ready");
+  await h.settle();
+  assert.equal(h.store.get(first.id)!.control.mergeabilityGrace?.observations, 1);
+  h.restart(); h.clock.now += 30_000;
+  await h.settle();
+  assert.equal((await h.only()).state, "checking");
+  assert.equal(h.sent.length, 0);
+  h.clock.now += 31_000;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+  assert.match(h.sent.at(-1)!.input[0].text, /mergeability is unknown/);
+  assert.notEqual((await h.only()).outcome, "ready");
+});
+
+test("clean mergeability within its grace reaches review without a diagnostic worker turn", async () => {
+  const h = harness();
+  h.gh().mergeable = null;
+  h.label(41); await h.settle();
+  await h.report((await h.only()).threadId!, GOOD); await h.settle();
+  assert.equal((await h.only()).state, "checking");
+  h.gh().mergeable = true; h.clock.now += 30_000;
+  await h.settle();
+  assert.equal((await h.only()).outcome, "ready");
+  assert.equal(h.sent.length, 0);
+});
+
+test("a replacement repair worker uses work-round labels beyond the feedback budget", async () => {
+  const h = harness();
+  const { job } = await h.toReview();
+  const current = h.store.get(job.id)!;
+  assert.ok(current.pushedSha);
+  h.store.write(job.id, current.version, { startRound: { ordinal: 9, kind: "feedback", cause: "ci", baseSha: current.pushedSha, feedback: [] }, roundBase: current.pushedSha, phase: { state: "addressing" }, control: { ...current.control, feedbackRounds: 1, workerContext: { round: 9, text: "Repair the failing build and retain the accepted commits.", recoveryReason: null } } }, h.clock.now);
+  h.threads.get(job.threadId!)!.status = "error";
+  await h.settle();
+  assert.equal(h.spawned.length, 2);
+  const prompt = h.spawned[1]!.prompt;
+  assert.match(prompt, /Work round 8 on pull request/);
+  assert.doesNotMatch(prompt, /Feedback round 8 of 5/);
+  assert.match(prompt, /"round": 8/);
+  assert.match(prompt, /Repair the failing build/);
+});
+
+test("feedback after repair work uses its feedback count while retaining the report ordinal", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const current = h.store.get(job.id)!;
+  assert.ok(current.pushedSha);
+  h.store.write(job.id, current.version, { startRound: { ordinal: 9, kind: "feedback", cause: "ci", baseSha: current.pushedSha, feedback: [] }, control: { ...current.control, feedbackRounds: 1 } }, h.clock.now);
+  h.review(pr, { body: "Correct the footer spacing." });
+  h.clock.now += 3 * MIN;
+  await h.settle();
+  const prompt = h.sent.at(-1)!.input[0].text;
+  assert.match(prompt, /^Feedback round 2 of 5 on pull request/);
+  assert.match(prompt, /"round": 9/);
+  assert.equal((await h.only()).round, 10);
+});
+
+test("unknown mergeability grace resets when the exact PR target changes", async () => {
+  const h = harness();
+  h.gh().mergeable = null;
+  h.label(41); await h.settle();
+  await h.report((await h.only()).threadId!, GOOD); await h.settle();
+  h.clock.now += 45_000;
+  h.gh().refs.set("main", "3".repeat(40));
+  await h.settle();
+  h.clock.now += 16_000;
+  h.restart(); await h.settle();
+  assert.equal((await h.only()).state, "checking");
+  assert.equal(h.sent.length, 0);
+  h.clock.now += 45_000;
+  await h.settle();
+  assert.equal((await h.only()).state, "addressing");
+});
+
+test("persistent unknown mergeability exhausts its bounded diagnostic repairs", async () => {
+  const h = harness();
+  h.gh().mergeable = null;
+  h.label(41); await h.settle();
+  await h.report((await h.only()).threadId!, GOOD); await h.settle();
+  h.clock.now += MIN;
+  await h.settle();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const job = await h.only();
+    assert.equal(job.state, "addressing");
+    const result = await h.report(job.threadId!, { outcome: "no-change", round: job.round - 1, replies: [], summary: "The footer implementation is verified. GitHub still has no mergeability result.", verification: ["npm test passed"] });
+    assert.equal(result.exitCode, 0, result.stderr);
+    await h.settle();
+  }
+  assert.equal((await h.only()).state, "stuck");
+  assert.match((await h.only()).error!, /repair exhausted.*mergeability is unknown/);
+  assert.equal(h.sent.length, 5);
+});
+
+test("a durable reminder respects scheduled provider retry before resending", async () => {
+  let fail = true;
+  const h = harness({ configureDeps(deps) {
+    const send = deps.bb.sdk.threads.send;
+    deps.bb.sdk.threads.send = async (args) => { if (fail) throw new Error("send unavailable"); return send(args); };
+  } });
+  h.label(41); await h.settle();
+  const job = await h.only();
+  const worker = h.threads.get(job.threadId!)!;
+  worker.status = "idle";
+  await h.settle();
+  fail = false; worker.status = "error";
+  h.failures.scheduledRetryAt = h.clock.now + 5 * MIN;
+  h.clock.now += MIN;
+  await h.settle();
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.spawned.length, 1);
+  h.restart(); h.clock.now += 3 * MIN;
+  await h.settle();
+  assert.equal(h.sent.length, 0);
+  worker.status = "idle"; h.failures.scheduledRetryAt = null;
+  h.clock.now += MIN;
+  await h.settle();
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.spawned.length, 1);
+});
