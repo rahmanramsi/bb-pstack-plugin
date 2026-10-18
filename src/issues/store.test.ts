@@ -96,8 +96,7 @@ test("repository poll state is stored per repository", () => {
 });
 
 test("the migration's state lists match job.ts", () => {
-  const latest = (pattern: RegExp) => MIGRATIONS.filter((statement) => pattern.test(statement)).at(-1)!;
-  const sql = [latest(/^CREATE TABLE issue_jobs(_next)? \(/), latest(/^CREATE UNIQUE INDEX issue_jobs_open /)].join("\n");
+  const sql = MIGRATIONS.at(-1)!;
   const list = (pattern: RegExp) => new Set([...pattern.exec(sql)![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]));
   assert.deepEqual(list(/state IN \(\s*([^)]*)\)\),/), new Set([...RESTING_STATES, ...Object.keys(TRANSIT)]));
   assert.deepEqual(list(/CHECK \(\(state IN \(([^)]*)\)\) = \(effects_json/), new Set(Object.keys(TRANSIT)));
@@ -107,7 +106,7 @@ test("the migration's state lists match job.ts", () => {
 test("due lists only jobs that can act now: not a job waiting for an answer, nor an effect under a lease or a backoff", () => {
   const { store } = setup();
   const [queued, asking, leased, backoff, ready] = [41, 42, 43, 44, 45].map((issue, index) => store.insert(newJob({ issue }), 10 + index)!);
-  store.write(asking!.id, 0, { phase: { state: "needs-info" }, threadId: "thr_r" }, 20);
+  store.write(asking!.id, 0, { phase: { state: "done" }, threadId: "thr_r" }, 20);
   store.write(leased!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, leaseUntil: 200 } } as Change, 20);
   store.write(backoff!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 200 } } as Change, 20);
   store.write(ready!.id, 0, { phase: { ...enter("starting", [spawn]), tries: 1, nextAt: 100 } } as Change, 20);
@@ -204,7 +203,7 @@ test("a step 1 database migrates its jobs to round 1 with their history", () => 
   const store = openIssueStore(db, () => {});
   const job = store.get("psi_old" as JobId)!;
   assert.equal(job.round, 1);
-  assert.equal(job.phase.state, "review");
+  assert.equal(job.phase.state, "checking");
   assert.deepEqual(store.roundSummaries(job.id), [{ ordinal: 1, summary: "Fixed." }]);
   assert.throws(() => db.prepare("UPDATE issue_jobs SET state = 'addressing', thread_id = NULL WHERE id = 'psi_old'").run(), /CHECK/);
 });
@@ -278,4 +277,69 @@ test("each write that changes something signals once, and a write that changes n
   assert.equal(signals(() => store.addFeedback(REPO, [item])), 0, "addFeedback with nothing new");
 
   assert.equal(signals(() => [store.get(job.id), store.list({ all: true }), store.repoPoll(REPO), store.jobPoll(job.id), store.due(20)]), 0, "reads");
+});
+
+test("unattended upgrade archives legacy waits byte for byte and preserves leased publication and manual starts", () => {
+  const db = new Database(":memory:");
+  for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+  const raw = '{"outcome":"needs-info", "questions":["Which API?"],"verification":["source unavailable"]}';
+  const pending = JSON.stringify([{ op: "comment", key: "legacy:questions", body: "Which API?" }]);
+  const insert = db.prepare(`INSERT INTO issue_jobs (id,repo,issue,generation,trigger_event_id,triggered_by,triggered_at,issue_json,project_id,host_id,base_branch,branch,state,effects_json,effect_tries,effect_first_at,effect_lease_until,effect_next_at,thread_id,report_json,pushed_sha,created_at,updated_at)
+    VALUES (?, 'acme/web', ?, ?, NULL, 'the bb app', 1, ?, 'p','h','main', ?, ?, ?, ?, 4, 99999, 100001, ?, ?, ?, 1, 2)`);
+  const snapshot = '{"title":"Old work","body":"Keep all bytes","url":"https://github.com/acme/web/issues/41","author":"maya"}';
+  insert.run("old-wait", 41, 1, snapshot, "agent/issue-41-old", "needs-info", null, 0, "thr_old", raw, SHA);
+  insert.run("old-asking", 42, 1, snapshot, "agent/issue-42-old", "asking", pending, 2, "thr_asking", raw, null);
+  const push = JSON.stringify([{ op: "push", key: "push:old", sha: SHA, expectedRemoteSha: null }]);
+  insert.run("old-push", 43, 1, snapshot, "agent/issue-43-old", "publishing", push, 3, "thr_push", raw, SHA);
+  insert.run("terminal-old", 44, 1, snapshot, "agent/issue-44-old", "stuck", null, 0, "thr_terminal", raw, SHA);
+  insert.run("terminal-new", 44, 2, snapshot, "agent/issue-44-new", "done", null, 0, "thr_new", raw, SHA);
+  db.prepare("INSERT INTO issue_rounds(job_id,ordinal,kind,started_at,report_json) VALUES('old-wait',1,'initial',1,?)").run(raw);
+  const before = db.prepare("SELECT * FROM issue_jobs ORDER BY id").all();
+  let applied = MIGRATIONS.length - 1;
+  const upgrade = db.transaction(() => { for (const statement of MIGRATIONS.slice(applied)) db.exec(statement); applied = MIGRATIONS.length; });
+  upgrade(); upgrade();
+  assert.deepEqual(db.prepare("SELECT * FROM issue_legacy_archive ORDER BY id").all(), before);
+  const store = openIssueStore(db, () => {});
+  for (const id of ["old-wait", "old-asking"]) {
+    const job = store.get(id as JobId)!;
+    assert.equal(job.phase.state, "recovering");
+    assert.equal(job.report && JSON.stringify(job.report), JSON.stringify(JSON.parse(raw)));
+    assert.equal(job.trigger.eventId, null);
+    assert.equal(job.parentId, null);
+    assert.equal(job.threadId, id === "old-wait" ? "thr_old" : "thr_asking");
+    assert.ok("effects" in job.phase);
+    assert.ok(job.phase.effects.every((effect) => effect.op !== "comment"));
+  }
+  const publication = store.get("old-push" as JobId)!;
+  assert.ok("effects" in publication.phase);
+  assert.equal(JSON.stringify(publication.phase.effects), push);
+  assert.equal(publication.phase.leaseUntil, 99999);
+  assert.equal(publication.phase.tries, 3);
+  assert.equal(store.get("terminal-old" as JobId)!.phase.state, "stuck");
+  assert.equal(store.statuses(200000).find((status) => status.issue === 44)!.jobId, "terminal-new");
+  assert.equal((db.prepare("SELECT report_json FROM issue_rounds WHERE job_id = 'old-wait'").get() as { report_json: string }).report_json, raw);
+  assert.throws(() => db.prepare("UPDATE issue_jobs SET version = version + 1 WHERE id = 'old-push'").run(), /incompatible issue runtime/);
+  db.close();
+});
+
+test("submission evaluations and status revisions survive lost writers and newer generations", () => {
+  const { db, store } = setup();
+  const first = store.insert(newJob(), 1)!;
+  const raw = '{ invalid JSON';
+  const submitted = store.submit(first, "thr_first", raw, 2);
+  assert.equal(store.submit(first, "thr_first", raw, 3).id, submitted.id);
+  assert.equal(store.pendingSubmissions(first.id)[0]!.raw, raw);
+  const finished = store.write(first.id, first.version, { phase: { state: "stuck" }, error: "original failure", evaluation: { submissionId: submitted.id, result: "invalid" } }, 4)!;
+  assert.equal(store.pendingSubmissions(first.id).length, 0);
+  const oldStatus = store.statuses(5)[0]!;
+  assert.equal(store.claimStatus(oldStatus, 5), true);
+  const second = store.insert(newJob({ issue: first.issue }), 6)!;
+  store.settleStatus(oldStatus, { error: null, nextAt: 50000 });
+  const newest = store.statuses(7)[0]!;
+  assert.equal(newest.jobId, second.id);
+  assert.ok(newest.revision > oldStatus.revision);
+  store.write(finished.id, finished.version, { error: "late historical write" }, 8);
+  assert.equal(store.statuses(9)[0]!.jobId, second.id);
+  assert.ok(!store.statuses(9)[0]!.body.includes("historical"));
+  db.close();
 });

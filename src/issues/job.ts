@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -26,26 +26,27 @@ export const LABEL = {
   review: "agent:review",
 } as const;
 export type Label = (typeof LABEL)[keyof typeof LABEL];
-/** The labels that show a job's progress. An ending job removes all of them, whichever one it was showing. */
-const STATUS_LABELS = [LABEL.working, LABEL.needsInfo, LABEL.review] as const;
 
 /** Each transit state and the resting state it enters once its effects are done. The SQL CHECK repeats this list. */
 export const TRANSIT = {
   starting: "working",
-  publishing: "review",
-  asking: "needs-info",
+  publishing: "checking",
+  recovering: "working",
+  repairing: "addressing",
+  readifying: "review",
+  drafting: "checking",
   closing: "done",
   stopping: "stopped",
   sticking: "stuck",
   sending: "addressing",
   respawning: "addressing",
-  republishing: "review",
-  replying: "review",
+  republishing: "checking",
+  replying: "checking",
   updating: "tracking",
 } as const;
 
 export type TransitState = keyof typeof TRANSIT;
-export const RESTING_STATES = ["ignored", "queued", "working", "needs-info", "review", "addressing", "tracking", "done", "stopped", "stuck"] as const;
+export const RESTING_STATES = ["ignored", "queued", "working", "checking", "review", "addressing", "tracking", "done", "stopped", "stuck"] as const;
 export type RestingState = (typeof RESTING_STATES)[number];
 export type JobState = TransitState | RestingState;
 
@@ -105,7 +106,9 @@ export type Effect =
   | { op: "check-worktree"; key: string; base: Sha }
   /** A parent's one progress comment: edited when the App's comment with the key's marker exists, else created. */
   | { op: "status"; key: string; body: string }
-  | { op: "close-issue"; key: string };
+  | { op: "close-issue"; key: string }
+  | { op: "recover-worker"; key: string; epoch: number }
+  | { op: "set-draft"; key: string; target: ReviewTarget; draft: boolean };
 
 export type EffectOp = Effect["op"];
 
@@ -136,13 +139,18 @@ export const EFFECT_POLICY = {
   // A repeated note to merge the branch is harmless.
   "check-worktree": { recovery: { kind: "replay" }, leaseMs: 60_000 },
   status: { recovery: { kind: "replay" }, leaseMs: 60_000 },
+  "recover-worker": { recovery: { kind: "once", graceMs: 5 * 60_000 }, leaseMs: 2 * 60_000 },
+  "set-draft": { recovery: { kind: "replay" }, leaseMs: 60_000 },
   "close-issue": { recovery: { kind: "replay" }, leaseMs: 60_000 },
 } as const satisfies { readonly [Op in EffectOp]: { recovery: Recovery; leaseMs: number } };
 
-export const MAX_EFFECT_TRIES = 8;
+export const MAX_RECOVERIES = 2;
+export const MAX_INVALID_REPORTS = 3;
+export const MAX_REPAIRS = 5;
 const BACKOFF_MS = [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
 
 export type EffectOutcome =
+  | { kind: "changed-target"; target: ReviewTarget }
   /** It happened, now or earlier (the probe found it). */
   | { kind: "done"; patch: EffectPatch }
   /** The probe found no trace of it. */
@@ -154,7 +162,7 @@ export type EffectOutcome =
   /** It did not happen and will not (permission denied, the remote branch moved, invalid input). */
   | { kind: "fail"; error: string };
 
-export type EffectPatch = { threadId?: string; pushedSha?: Sha; pr?: { number: number; url: string } };
+export type EffectPatch = { worker?: WorkerSettings; control?: Control; threadId?: string; pushedSha?: Sha; pr?: { number: number; url: string } };
 
 /** `parent` is set on a sub-issue's job: the parent issue as it was when the job was created. */
 export type IssueSnapshot = { title: string; body: string; url: string; author: string; parent?: { number: number; title: string; body: string; url: string } };
@@ -162,7 +170,7 @@ export type IssueSnapshot = { title: string; body: string; url: string; author: 
 /** A parent issue's sub-issue as last polled. `blockedBy` lists its open blockers as `#n` or `owner/repo#n`. */
 export type SubIssue = { number: number; title: string; url: string; state: "open" | "closed"; blockedBy: string[] };
 /** A sub-issue with its latest job: its open job, else the parent's child job. */
-export type ChildFact = SubIssue & { job: { state: JobState; merged: boolean } | null };
+export type ChildFact = SubIssue & { job: { state: JobState; merged: boolean; ready?: boolean; disposition?: Control["disposition"]; branch?: BranchName; sha?: Sha | null } | null };
 
 export type FeedbackKind = "review" | "review-comment" | "pr-comment";
 /** What a reply answers. GitHub numbers reviews, inline comments and conversation comments separately. */
@@ -239,7 +247,27 @@ export type Phase =
       nextAt: number | null;
     };
 
+export type ReviewTarget = { pr: number; head: Sha; base: Sha };
+export type Workspace = { environmentId: string; hostId: string; path: string; branch: string };
+export type Control = {
+  epoch: number;
+  feedbackRounds: number;
+  workspace: Workspace | null;
+  recoveries: number;
+  invalid: number;
+  bestReasons: readonly string[] | null;
+  milestones: readonly string[];
+  readiness: ReviewTarget | null;
+  localEvidence: { head: Sha; base: Sha } | null;
+  repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
+  prerequisites: readonly { issue: number; branch: BranchName; sha: Sha }[];
+  policyLimitation: string | null;
+  disposition: "merged" | "closed" | "no-change" | "failure" | "stopped" | null;
+  preservation: string | null;
+};
+export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, prerequisites: [], policyLimitation: null, disposition: null, preservation: null });
 export type Job = {
+  control: Control;
   id: JobId;
   /** Every write is guarded by it and bumps it. */
   version: number;
@@ -283,10 +311,12 @@ export type Job = {
  * A round's start, written with the job in one transaction: the round's history row, and every listed feedback item
  * marked as sent in it. Items that arrive later stay pending for the next round.
  */
-export type RoundStart = { ordinal: number; kind: "initial" | "feedback"; baseSha: Sha | null; feedback: readonly FeedbackRef[] };
+export type RoundStart = { ordinal: number; kind: "initial" | "feedback"; cause?: "initial" | "feedback" | "ci" | "conflict"; target?: ReviewTarget; baseSha: Sha | null; feedback: readonly FeedbackRef[] };
 
 /** The write vocabulary for an existing job. `phase` replaces state, outbox and bookkeeping together. */
 export type Change = {
+  control?: Control;
+  evaluation?: { submissionId: number; result: string; snapshot?: Pick<ReportFacts, "worktree" | "gate" | "inspected" | "baseSha"> | { unavailable: string } };
   phase?: Phase;
   threadId?: string;
   deadline?: number | null;
@@ -308,7 +338,7 @@ export type ThreadFact =
   | { kind: "active" }
   /** `since` is the thread's last update, compared with the job's to see whether the worker went idle again. */
   | { kind: "idle"; since: number }
-  | { kind: "failed"; error: string }
+  | { kind: "failed"; error: string; retryAt?: number | null }
   | { kind: "gone" };
 
 /**
@@ -350,6 +380,9 @@ export type Facts = {
   children: readonly ChildFact[] | null;
   /** For a sub-issue's queued job: its open blockers as its parent last polled them. */
   blockers: readonly string[] | null;
+  review?: ReviewFact | null;
+  prerequisiteProblem?: string | null;
+  prerequisites?: Control["prerequisites"];
 };
 
 export type FactName = Exclude<keyof Facts, "now">;
@@ -360,9 +393,12 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   starting: [],
   working: ["thread", "waiting", "gate"],
   publishing: [],
-  asking: [],
-  "needs-info": [],
-  review: ["feedback", "pr"],
+  recovering: [],
+  repairing: [],
+  readifying: [],
+  drafting: [],
+  checking: ["review", "children", "feedback", "pr"],
+  review: ["feedback", "pr", "review", "children"],
   addressing: ["thread", "waiting", "pr"],
   closing: [],
   done: [],
@@ -386,7 +422,7 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
-  if (job.phase.state !== "review" || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.round > MAX_FEEDBACK_ROUNDS) return [];
+  if (!["review", "checking"].includes(job.phase.state) || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
 }
 
@@ -416,12 +452,9 @@ export type Action =
   | { type: "sleep"; until: number };
 
 export const MAX_NUDGES = 2;
-const THREAD_FAILED = "the worker thread failed, waiting for it to recover: ";
-const IDLE_WORKER = "the worker stopped without reporting after every reminder; message its thread or stop the job";
-export const ROUND_MS = 4 * 60 * 60_000;
 
-/** States a round runs through, from its start until the job rests in review or needs-info, or heads to an end. */
-const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "asking", "sending", "respawning", "addressing", "republishing", "replying"]);
+/** States a round runs through, from its start until the job enters checking, or heads to an end. */
+const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "recovering", "repairing", "sending", "respawning", "addressing", "republishing", "replying"]);
 
 /** Marks a change that takes the job out of its round as the round's end. */
 function rounded(job: Job, change: Change): Change {
@@ -437,72 +470,63 @@ function next(job: Job, facts: Facts): Action | null {
   const { phase } = job;
   const { now } = facts;
   // A round handed to the worker for a pull request that has since closed would be a wasted turn or spawn.
-  if ((phase.state === "sending" || phase.state === "respawning") && facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job) };
+  if ((phase.state === "sending" || phase.state === "respawning") && facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job, facts.pr.state) };
   if (isTransit(phase.state) && "effects" in phase) {
     const head = phase.effects[0];
     const policy = EFFECT_POLICY[head.op];
     if (phase.leaseUntil !== null && phase.leaseUntil > now) return { type: "sleep", until: phase.leaseUntil };
     if (phase.nextAt !== null && phase.nextAt > now) return { type: "sleep", until: phase.nextAt };
-    if (phase.tries >= MAX_EFFECT_TRIES) {
-      return { type: "change", change: stick(job, `${head.op} failed ${phase.tries} times: ${job.error ?? "no error recorded"}`) };
-    }
     const mode: EffectMode = phase.tries === 0 ? "perform" : RECOVERY_MODE[policy.recovery.kind];
     return { type: "effect", effect: head, mode, leaseUntil: now + policy.leaseMs };
   }
 
   switch (phase.state) {
     case "queued": {
+      if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem) };
       if (facts.blockers?.length) {
         const error = `waiting for ${facts.blockers.join(", ")}`;
         return job.error === error ? null : { type: "change", change: { error } };
       }
       // An unblocked child drops its waiting reason before it starts.
       if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
+      if (facts.prerequisites && JSON.stringify(facts.prerequisites) !== JSON.stringify(job.control.prerequisites)) return { type: "change", change: { control: { ...job.control, prerequisites: facts.prerequisites } } };
       if (!facts.worker) return null;
       if ("error" in facts.worker) {
-        // Even a problem only an operator can fix waits: the job starts once the role or the host is fixed.
+        if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
         return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
       }
       return { type: "change", change: start(job, facts.worker, now) };
     }
+    case "checking":
+      if (facts.feedback?.pending.length && facts.review?.kind === "observed" && facts.review.draft && facts.review.state === "open") return feedbackAction(job, facts);
+      return checkReview(job, facts);
     case "review": {
-      const { pr, feedback } = facts;
-      if (!pr || !feedback) return null;
-      if (pr.state !== "open") return { type: "change", change: close(job) };
-      if (feedback.pending.length === 0) return null;
-      if (job.round > MAX_FEEDBACK_ROUNDS) {
-        return { type: "change", change: stick(job, `new feedback after ${MAX_FEEDBACK_ROUNDS} feedback rounds; the pull request needs a person now`) };
-      }
-      const quiet = quietAt(feedback.pending);
-      if (quiet > now) return { type: "sleep", until: quiet };
-      if (!facts.thread || !facts.rounds || !facts.remote) return null;
-      if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
-      // A failed thread cannot take the round's message; it is replaced like a gone one.
-      const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
-      return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
+      const regression = checkReview(job, facts);
+      if (regression) return regression;
+      return feedbackAction(job, facts);
     }
     case "addressing":
     case "working": {
-      if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job) };
+      if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job, facts.pr.state) };
       const thread = facts.thread;
       if (!thread) return null;
       switch (thread.kind) {
         case "gone":
-          return { type: "change", change: stick(job, "the worker thread was archived or deleted before it reported") };
+          return { type: "change", change: recover(job, "the worker thread is unavailable") };
         case "failed": {
-          // bb retries provider errors such as an exhausted quota, so a failed thread may come back and report.
-          const error = `${THREAD_FAILED}${thread.error}`;
-          return job.error === error ? null : { type: "change", change: { error } };
+          if (thread.retryAt && thread.retryAt > now) return { type: "sleep", until: thread.retryAt };
+          return { type: "change", change: recover(job, thread.error) };
         }
         case "idle":
-          if (job.error?.startsWith(THREAD_FAILED)) return { type: "change", change: { error: null } };
-          if (thread.since <= job.updatedAt || facts.waiting) return null;
+          if (facts.waiting) return null;
           if (job.nudges >= MAX_NUDGES) {
-            return job.error === IDLE_WORKER ? null : { type: "change", change: { error: IDLE_WORKER } };
+            if (now < job.updatedAt + 60_000) return { type: "sleep", until: job.updatedAt + 60_000 };
+            return { type: "change", change: recover(job, "the worker stopped without reporting after two reminders") };
           }
+          if (thread.since <= job.updatedAt) return null;
           return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
         case "active":
-          return job.error?.startsWith(THREAD_FAILED) || job.error === IDLE_WORKER ? { type: "change", change: { error: null } } : null;
+          return null;
       }
     }
     case "tracking":
@@ -512,19 +536,91 @@ function next(job: Job, facts: Facts): Action | null {
   }
 }
 
+function feedbackAction(job: Job, facts: Facts): Action | null {
+  const { pr, feedback } = facts;
+  const now = facts.now;
+  if (!pr || !feedback) return null;
+  if (pr.state !== "open") return { type: "change", change: close(job, pr.state) };
+  if (feedback.pending.length === 0) return null;
+  if (job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) {
+    return { type: "change", change: stick(job, `unresolved feedback after ${MAX_FEEDBACK_ROUNDS} feedback rounds`) };
+  }
+  const quiet = quietAt(feedback.pending);
+  if (quiet > now) return { type: "sleep", until: quiet };
+  if (!facts.thread || !facts.rounds || !facts.remote) return null;
+  if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
+  // A failed thread cannot take the round's message; it is replaced like a gone one.
+  const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
+  return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
+}
+
+export function rejectReport(job: Job, reasons: readonly string[]): Change {
+  const best = job.control.bestReasons;
+  const improved = best !== null && reasons.length < best.length && reasons.every((reason) => best.includes(reason));
+  const control = { ...job.control, invalid: improved ? 1 : job.control.invalid + 1, bestReasons: best === null || improved ? reasons : best };
+  const current = { ...job, control };
+  return control.invalid >= MAX_INVALID_REPORTS ? { ...recover(current, `report validation made no progress: ${reasons.join("; ")}`), rejections: job.rejections + 1 } : { control, rejections: job.rejections + 1, error: `report rejected: ${reasons.join("; ")}` };
+}
+
+export function recover(job: Job, reason: string): Change {
+  if (job.control.recoveries >= MAX_RECOVERIES) return stick(job, `automatic recovery exhausted: ${reason}; work is preserved in ${job.control.workspace?.path ?? "the original worker environment"}`);
+  const epoch = job.control.epoch + 1;
+  return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null }, nudges: 0, deadline: null, error: reason };
+}
+
+export type ReviewFact =
+  | { kind: "unavailable"; reason: string }
+  | { kind: "observed"; target: ReviewTarget; state: PullState; draft: boolean; complete: boolean; ready: boolean; pending: boolean; reasons: readonly string[]; fingerprint: string; limitation?: string | null };
+
+function checkReview(job: Job, facts: Facts): Action | null {
+  const review = facts.review;
+  if (!review || review.kind === "unavailable") return null;
+  if (review.state !== "open") return { type: "change", change: close(job, review.state) };
+  const target = review.target;
+  const previous = job.control.readiness;
+  const changed = previous && (previous.head !== target.head || previous.base !== target.base);
+  if (job.phase.state === "review" && (changed || !review.ready || review.draft || Boolean(facts.feedback?.pending.length))) {
+    return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+  }
+  if (facts.children?.length) {
+    const failed = facts.children.filter((child) => child.state === "open" && child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
+    if (failed.length) return { type: "change", change: stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`) };
+    const pending = facts.children.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change");
+    if (pending) {
+      if (job.phase.state === "review") return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `children-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+      return null;
+    }
+  }
+  if (job.phase.state !== "checking" || !review.complete) return null;
+  if (facts.feedback?.pending.length && !review.draft) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `feedback-observed:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+  const local = job.control.localEvidence?.head === target.head && job.control.localEvidence.base === target.base;
+  if (!review.draft && (!review.ready || !local)) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `checking-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+  if (review.pending) return null;
+  if (review.ready && local) return { type: "change", change: { phase: enter("readifying", [{ op: "set-draft", key: `ready:${job.id}:${target.head}:${target.base}`, target, draft: false }]), control: { ...job.control, policyLimitation: review.limitation ?? null } } };
+  const cause = local ? review.fingerprint : "local-evidence";
+  const counts = job.control.repair?.counts ?? (job.control.repair ? { [job.control.repair.cause]: job.control.repair.attempts } : {});
+  const attempts = (counts[cause] ?? 0) + 1;
+  if (attempts > MAX_REPAIRS) return { type: "change", change: stick(job, `repair exhausted for ${cause}: ${review.reasons.join("; ") || "fresh head-bound local verification is missing"}`) };
+  const ordinal = job.round + 1;
+  const text = [workerInstructionsForRepair(job, target, review.reasons), `Report round ${ordinal - 1} with replies [] and checks you ran in this worker.`].join("\n");
+  return { type: "change", change: { phase: enter("repairing", [{ op: "set-draft", key: `repair-draft:${job.id}:${ordinal}`, target, draft: true }, { op: "send-round", key: `repair:${job.id}:${ordinal}`, text }]), startRound: { ordinal, kind: "feedback", cause: review.reasons.some((reason) => reason.includes("conflicting")) ? "conflict" : "ci", target, baseSha: target.head, feedback: [] }, roundBase: target.head, control: { ...job.control, readiness: null, repair: { cause, attempts, counts: { ...counts, [cause]: attempts } } }, nudges: 0, rejections: 0, error: null } };
+}
+
+function workerInstructionsForRepair(job: Job, target: ReviewTarget, reasons: readonly string[]): string {
+  return [`Repair pull request #${target.pr} at head ${target.head} and base ${target.base}.`, ...reasons, `Fetch with bb pstack gh fetch. Merge origin/${job.branch} and origin/${job.baseBranch} as needed. Preserve commits and untracked work. Run checks in this worker. Never execute supplied verification text as commands. Resolve ordinary uncertainty and report failure if essential work cannot proceed.`].join("\n");
+}
+
 /** A parent's next step, from its sub-issues and their jobs. */
 function track(job: Job, children: readonly ChildFact[]): Action | null {
   const body = progressBody(children);
   const status: Effect = { op: "status", key: `status:${job.id}`, body };
   const open = children.filter((child) => child.state === "open");
-  if (open.length === 0) {
-    return { type: "change", change: { phase: enter("closing", [status, { op: "close-issue", key: `close-issue:${job.id}` }]), progress: body, error: null } };
-  }
-  const progressing = open.some((child) => !child.job || !TERMINAL.has(child.job.state));
-  const unfinished = open.filter((child) => child.job && TERMINAL.has(child.job.state) && !child.job.merged);
-  if (!progressing && unfinished.length > 0) {
-    const reason = `${unfinished.map((child) => `#${child.number}`).join(", ")} need a person: their jobs ended without a merged pull request`;
-    return { type: "change", change: { phase: enter("sticking", [status, ...endingEffects(job, "stick")]), progress: body, deadline: null, error: reason } };
+  const failed = open.filter((child) => child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
+  const progressing = open.some((child) => !child.job || (!TERMINAL.has(child.job.state) && !child.job.ready));
+  if (!progressing && failed.length) return { type: "change", change: { ...stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`), progress: body } };
+  if (!progressing && failed.length === 0) {
+    const commits = children.flatMap((child) => child.job?.branch && child.job.sha ? [`Merge origin/${child.job.branch} at ${child.job.sha} for #${child.number}.`] : []);
+    return { type: "change", change: { phase: { state: "queued" }, progress: [body, "Verify the combined result in this issue's own worker.", ...commits].join("\n\n"), error: null } };
   }
   if (body === job.progress) return null;
   return { type: "change", change: { phase: enter("updating", [status]), progress: body } };
@@ -541,11 +637,19 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
   const head = phase.effects[0];
   const backoff = () => now + BACKOFF_MS[Math.min(Math.max(phase.tries - 1, 0), BACKOFF_MS.length - 1)]!;
   switch (outcome.kind) {
+    case "changed-target": {
+      if (phase.state === "sending" || phase.state === "repairing") {
+        const remaining = phase.effects.slice(1).map((effect): Effect => effect.op === "send-round" ? { ...effect, text: `The current remote head is ${outcome.target.head} and base is ${outcome.target.base}. Fetch and merge the current branches before reporting.\n${effect.text}` } : effect);
+        return { phase: enter(phase.state, [{ op: "set-draft", key: `${head.key}:refresh:${outcome.target.head}:${outcome.target.base}`, target: outcome.target, draft: true }, ...remaining]), roundBase: outcome.target.head, control: { ...job.control, readiness: null } };
+      }
+      return { phase: { state: "checking" }, control: { ...job.control, readiness: null } };
+    }
     case "done": {
       const [, ...rest] = phase.effects;
       // On the way to stuck or stopped the error is the reason, so it outlives the effects.
       const ending = phase.state === "sticking" || phase.state === "stopping";
-      return { phase: enter(phase.state, rest), ...outcome.patch, ...(ending ? {} : { error: null }) };
+      if (phase.state === "readifying" && outcome.patch.control?.readiness === null) return { phase: { state: "checking" }, ...outcome.patch };
+      return { phase: phase.state === "recovering" && rest.length === 0 && job.round > 1 ? { state: "addressing" } : enter(phase.state, rest), ...outcome.patch, ...(ending ? {} : { error: null }) };
     }
     case "absent": {
       const { recovery } = EFFECT_POLICY[head.op];
@@ -559,17 +663,16 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
     case "retry":
       return { phase: { ...phase, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
     case "fail":
-      return stick(job, outcome.error);
+      return head.op === "send-round" ? recover(job, outcome.error) : stick(job, outcome.error);
   }
 }
 
 /** queued → starting: label the issue, then spawn the worker. Starts the round's clock. */
 export function start(job: Job, worker: WorkerSettings, now: number): Change {
   const effects: Effect[] = [
-    { op: "labels", key: `labels:${job.id}:working`, on: "issue", add: [LABEL.working], remove: [] },
     { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
-  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } };
+  return { phase: enter("starting", effects), deadline: null, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } };
 }
 
 /**
@@ -583,26 +686,27 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
   const round = {
     startRound: { ordinal, kind: "feedback", baseSha: head, feedback: pending.map(({ kind, id }) => ({ kind, id })) },
     roundBase: head,
-    deadline: now + ROUND_MS,
+    deadline: null,
     rejections: 0,
     nudges: 0,
     error: null,
   } as const;
-  if (!respawn) return { phase: enter("sending", [relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round };
+  const draft: Effect[] = job.control.readiness ? [{ op: "set-draft", key: `feedback-draft:${job.id}:${ordinal}`, target: job.control.readiness, draft: true }] : [];
+  const control = { ...job.control, readiness: null, feedbackRounds: job.control.feedbackRounds + 1 };
+  if (!respawn) return { phase: enter("sending", [...draft, relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round, control };
   if (!job.worker) return stick(job, "the worker thread is gone and the job has no worker settings to start another");
-  const spec: SpawnSpec = { ...job.worker, title: workerTitle(job), prompt: text, baseRef: `origin/${job.branch}` };
-  const check: Effect = { op: "check-worktree", key: `check-worktree:${job.id}:${ordinal}`, base: head };
-  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }, check]), ...round };
+  return { ...recover({ ...job, control }, "the feedback worker is unavailable"), ...round };
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */
-function close(job: Job): Change {
-  return { phase: enter("closing", endingEffects(job, "close")), deadline: null, error: null };
+function close(job: Job, disposition: PullState = "merged"): Change {
+  if (disposition === "closed") return { ...stick(job, "the pull request closed without merging"), control: { ...job.control, readiness: null, disposition: "closed" } };
+  return { phase: enter("closing", endingEffects(job, "close")), deadline: null, error: null, control: { ...job.control, disposition: "merged", readiness: null } };
 }
 
 /** Waiting for its spawn to create the worker, which may report before the spawn is confirmed. */
 export function awaitingThread(job: Job): boolean {
-  return "effects" in job.phase && job.phase.effects[0].op === "spawn";
+  return "effects" in job.phase && (job.phase.effects[0].op === "spawn" || job.phase.effects[0].op === "recover-worker");
 }
 
 /**
@@ -612,13 +716,12 @@ export function awaitingThread(job: Job): boolean {
 function workerMayExist(job: Job): boolean {
   const { phase } = job;
   if (job.threadId !== null) return true;
-  return "effects" in phase && phase.effects[0].op === "spawn" && phase.tries > 0;
+  return "effects" in phase && (phase.effects[0].op === "spawn" || phase.effects[0].op === "recover-worker") && phase.tries > 0;
 }
 
 function endingEffects(job: Job, kind: "stop" | "stick" | "close"): Effect[] {
   const effects: Effect[] = [];
   if (workerMayExist(job)) effects.push({ op: "stop-thread", key: `stop-thread:${job.id}:${kind}` });
-  if (job.phase.state !== "queued") effects.push({ op: "labels", key: `labels:${job.id}:${kind}`, on: "issue", add: [], remove: STATUS_LABELS });
   return effects;
 }
 
@@ -628,9 +731,9 @@ function endingEffects(job: Job, kind: "stop" | "stick" | "close"): Effect[] {
  */
 export function stick(job: Job, reason: string): Change {
   const state = job.phase.state;
-  if (state === "stopping" || state === "stopped") return { phase: { state: "stopped" }, error: reason };
-  if (state === "sticking" || TERMINAL.has(state)) return { phase: { state: "stuck" }, error: reason };
-  return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason };
+  if (state === "stopping" || state === "stopped") return { phase: { state: "stopped" } };
+  if (state === "sticking" || TERMINAL.has(state)) return { phase: { state: "stuck" } };
+  return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason, control: { ...job.control, readiness: null, disposition: "failure" } };
 }
 
 export function canStop(state: JobState): boolean {
@@ -640,7 +743,7 @@ export function canStop(state: JobState): boolean {
 /** Any non-terminal state → stopping. Replaces a pending outbox. Null when the job already ended or is ending. */
 export function stop(job: Job, by: string): Change | null {
   if (!canStop(job.phase.state)) return null;
-  return rounded(job, { phase: enter("stopping", endingEffects(job, "stop")), deadline: null, error: `stopped by ${by}` });
+  return rounded(job, { phase: enter("stopping", endingEffects(job, "stop")), deadline: null, error: `stopped by ${by}`, control: { ...job.control, readiness: null, disposition: "stopped" } });
 }
 
 /** A transit phase with fresh bookkeeping, or the target resting state when there is nothing to do. */
@@ -658,7 +761,7 @@ const Reply = z.strictObject({ kind: z.enum(["review", "review-comment", "pr-com
 export const InitialReport = z.discriminatedUnion("outcome", [
   z.strictObject({ outcome: z.literal("changes"), pr: z.strictObject({ title: z.string(), body: z.string() }), verification: Verification, summary: Line }),
   z.strictObject({ outcome: z.literal("no-change"), verification: Verification, summary: Line }),
-  z.strictObject({ outcome: z.literal("needs-info"), questions: z.array(Line).min(1).max(10), verification: Verification, summary: Line.optional() }),
+  z.strictObject({ outcome: z.literal("failure"), verification: Verification, summary: Line, reason: Line }),
 ]);
 export type InitialReport = z.infer<typeof InitialReport>;
 
@@ -670,6 +773,7 @@ const Round = z.number().int().positive();
 export const RoundReport = z.discriminatedUnion("outcome", [
   z.strictObject({ outcome: z.literal("changes"), round: Round, pr: z.strictObject({ body: z.string() }).optional(), replies: z.array(Reply), verification: Verification, summary: Line }),
   z.strictObject({ outcome: z.literal("no-change"), round: Round, replies: z.array(Reply), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("failure"), round: Round, replies: z.array(Reply), verification: Verification, summary: Line, reason: Line }),
 ]);
 export type RoundReport = z.infer<typeof RoundReport>;
 
@@ -697,7 +801,7 @@ export function parseReport(job: Job, value: unknown): { ok: true; parsed: Parse
 }
 
 /** A report that passed every check, with the commit it was made at. That commit, not HEAD, is what gets pushed. */
-export type AcceptedReport = Report & { headSha: Sha; acceptedAt: number };
+export type AcceptedReport = (Exclude<Report, { outcome: "failure" }> & { headSha: Sha; acceptedAt: number; comparisonSha?: Sha }) | (Extract<Report, { outcome: "failure" }> & { headSha: Sha | null; acceptedAt: number; comparisonSha?: Sha });
 
 export type ReportFacts = {
   now: number;
@@ -708,6 +812,8 @@ export type ReportFacts = {
   /** `gate pr` on the worker thread's checklist. Only the first round checks it. */
   gate: GateFact;
   titleConvention: "conventional" | "free";
+  baseSha?: Sha;
+  inspected?: { sha: Sha; comparisonSha: Sha; nonemptyDiff: boolean; workflows: boolean };
   /** The feedback the round sent. The replies answer each item exactly once. */
   listed: readonly Feedback[];
 };
@@ -733,7 +839,11 @@ export function containsSha(worktree: { headSha: Sha; commits: readonly Sha[] },
 
 function commitProblems(job: Job, outcome: Report["outcome"], worktree: ReportFacts["worktree"], base: string): string[] {
   const problems: string[] = [];
+  if (outcome === "failure") return [];
   if (worktree.dirty) problems.push("the worktree has uncommitted or untracked changes: commit or remove every change before reporting");
+  if (outcome === "changes") for (const prerequisite of job.control.prerequisites) {
+    if (!containsSha(worktree, prerequisite.sha)) problems.push(`include prerequisite #${prerequisite.issue} by merging origin/${prerequisite.branch} at ${prerequisite.sha}`);
+  }
   const added = newCommit(job, worktree);
   if (outcome === "changes" && !added) problems.push(`outcome \`changes\` needs a new commit on top of ${base}`);
   if (outcome !== "changes" && added) problems.push(`outcome \`${outcome}\` must not add commits; report \`changes\` instead`);
@@ -748,39 +858,42 @@ function phraseProblems(texts: readonly string[], where: string): string[] {
 }
 
 function verdict(job: Job, reasons: readonly string[], accepted: () => Change): Verdict {
-  if (reasons.length === 0) return { ok: true, change: { ...accepted(), rejections: 0, nudges: 0, deadline: null, error: null } };
-  // A rejected report goes back to the worker to fix, however many times: ending the job would throw its work away.
-  return { ok: false, reasons, change: { rejections: job.rejections + 1, error: `report rejected: ${reasons.join("; ")}` } };
+  if (reasons.length === 0) return { ok: true, change: { ...accepted(), rejections: 0, nudges: 0, deadline: null } };
+  return { ok: false, reasons, change: rejectReport(job, reasons) };
 }
 
 export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts): Verdict {
   const verdict = parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
+  if (verdict.ok && (parsed.report.outcome === "changes" || (parsed.report.outcome === "no-change" && job.round > 1 && facts.gate.pass)) && facts.baseSha) {
+    const milestone = !job.control.milestones.includes("verified-change");
+    verdict.change.control = { ...(verdict.change.control ?? job.control), localEvidence: { head: facts.worktree.headSha, base: facts.baseSha }, invalid: 0, bestReasons: null, ...(milestone ? { milestones: [...job.control.milestones, "verified-change"], recoveries: 0 } : {}) };
+  }
   return { ...verdict, change: rounded(job, verdict.change) };
 }
 
 function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts): Verdict {
   const reasons = commitProblems(job, report.outcome, facts.worktree, "the base branch");
+  if (report.outcome === "changes" && facts.inspected && !facts.inspected.nonemptyDiff) reasons.push("the inspected commit has no changes against the pinned comparison commit");
   switch (report.outcome) {
     case "changes":
       if (!facts.gate.pass) reasons.push(`\`bb pstack gate pr\` fails: ${facts.gate.reason}`);
       reasons.push(...titleProblems(report.pr.title, facts.titleConvention), ...bodyProblems(report.pr.body));
       break;
-    case "needs-info":
-      reasons.push(...phraseProblems(report.questions, "text posted on the issue"));
+    case "failure":
       break;
     case "no-change":
       reasons.push(...phraseProblems([report.summary], "text posted on the issue"));
       break;
   }
-  const accepted: AcceptedReport = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted }));
+  const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
+  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted, ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, readiness: null, disposition: "failure" as const } } : report.outcome === "no-change" ? { control: { ...job.control, disposition: "no-change" as const } } : {}) }));
 }
 
 function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
   const base = roundBase(job)!;
   if (facts.remoteHead !== null && facts.remoteHead !== base) return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead } };
   const reasons = commitProblems(job, report.outcome, facts.worktree, `${base.slice(0, 7)}, the head of \`${job.branch}\``);
-  if (!containsSha(facts.worktree, base)) {
+  if (report.outcome !== "failure" && !containsSha(facts.worktree, base)) {
     reasons.push(`HEAD does not contain ${base.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`bb pstack gh fetch\`, merge \`origin/${job.branch}\`, and report again`);
   }
   const listed = new Set(facts.listed.map(refKey));
@@ -791,6 +904,8 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
   if (missing.length > 0) reasons.push(`reply to every listed comment; missing: ${missing.join(", ")}`);
   if (extra.length > 0) reasons.push(`these comments were not listed, remove their replies: ${extra.join(", ")}`);
   if (repeated.length > 0) reasons.push(`reply to each comment once; repeated: ${[...new Set(repeated)].join(", ")}`);
+  if (report.outcome === "changes" && !facts.gate.pass) reasons.push(`local gate failed: ${facts.gate.reason}`);
+  if (report.outcome === "changes" && facts.inspected && !facts.inspected.nonemptyDiff) reasons.push("the inspected commit has no changes against the pinned comparison commit");
   if (report.outcome === "changes" && report.pr) reasons.push(...bodyProblems(report.pr.body));
   for (const reply of report.replies) {
     const where = `the reply to ${refKey({ kind: reply.kind, id: reply.commentId })}`;
@@ -800,8 +915,8 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
     const length = effect ? commentBody(effect.body, effect.key).length : 0;
     if (length > COMMENT_MAX) reasons.push(`${where} is ${length} characters as posted; GitHub's limit is ${COMMENT_MAX}`);
   }
-  const accepted = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted }));
+  const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
+  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted, ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, disposition: "failure" as const } } : {}) }));
 }
 
 /**
@@ -809,6 +924,7 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
  * when the report replaced it, ask the reviewers to look again, and show the issue as in review.
  */
 function republication(job: Job, report: RoundReport & AcceptedReport, listed: readonly Feedback[]): [TransitState, Effect[]] {
+  if (report.outcome === "failure") return ["sticking", endingEffects(job, "stick")];
   const replies: Effect[] = report.replies.map((reply) => replyEffect(job, reply, listed.find((item) => refKey(item) === refKey({ kind: reply.kind, id: reply.commentId }))!));
   const reviewers = [...new Set(listed.map((item) => item.author))];
   const after: Effect[] = [
@@ -837,7 +953,7 @@ export function acceptSync(job: Job, facts: { worktree: { headSha: Sha; dirty: b
   }
   if (reasons.length > 0) return { ok: false, reasons };
   const sha = facts.worktree.headSha;
-  return { ok: true, change: { phase: enter("republishing", [{ op: "push", key: `push:${job.id}:${sha}`, sha, expectedRemoteSha: facts.remoteHead }]), error: null } };
+  return { ok: true, change: { phase: enter("republishing", [{ op: "push", key: `push:${job.id}:${sha}`, sha, expectedRemoteSha: facts.remoteHead }]), control: { ...job.control, readiness: null }, error: null } };
 }
 
 function replyEffect(job: Job, reply: RoundReport["replies"][number], answers: Feedback): Extract<Effect, { op: "reply" }> {
@@ -857,20 +973,13 @@ function publication(job: Job, report: InitialReport & AcceptedReport): [Transit
           { op: "labels", key: `labels:${job.id}:review`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
         ],
       ];
-    case "needs-info":
-      return [
-        "asking",
-        [
-          { op: "comment", key: `comment:${job.id}:questions`, body: issueText(report.questions.map((question) => `- ${question}`).join("\n")) },
-          { op: "labels", key: `labels:${job.id}:needs-info`, on: "issue", add: [LABEL.needsInfo], remove: [LABEL.working] },
-        ],
-      ];
+    case "failure":
+      return ["sticking", endingEffects(job, "stick")];
     case "no-change":
       return [
         "closing",
         [
-          { op: "comment", key: `comment:${job.id}:no-change`, body: issueText(report.summary) },
-          { op: "labels", key: `labels:${job.id}:done`, on: "issue", add: [], remove: [LABEL.working] },
+          ...endingEffects(job, "close"),
         ],
       ];
   }
@@ -886,6 +995,8 @@ export function branchFor(issue: number, title: string, generation: number): Bra
 }
 
 export type JobView = {
+  outcome: "ready" | "no-change" | "failure" | "cancelled" | "merged" | "closed-unmerged" | null;
+  limitation: string | null;
   id: JobId;
   parentId: JobId | null;
   repo: RepoName;
@@ -911,6 +1022,8 @@ export type JobView = {
 export function toView(job: Job): JobView {
   const { phase } = job;
   return {
+    outcome: job.control.disposition === "stopped" ? "cancelled" : job.control.disposition === "closed" ? "closed-unmerged" : job.control.disposition ?? (job.control.readiness ? "ready" : null),
+    limitation: job.control.policyLimitation,
     id: job.id,
     parentId: job.parentId,
     repo: job.repo,

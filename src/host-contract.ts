@@ -28,9 +28,9 @@ export const PushInput = z.strictObject({
   sha: Sha,
   /** The remote branch must be at this commit, or absent when null, and `sha` must descend from it. */
   expectedRemoteSha: Sha.nullable(),
-  comparisonSha: Sha.optional(),
-  workflows: z.boolean().optional(),
-  /** A one-repository, contents-only installation token. It lives only in the git child's environment. */
+  comparisonSha: Sha,
+  workflows: z.boolean(),
+  /** A one-repository token with contents write and already-granted workflows write when required. It lives only in the git child's environment. */
   token: z.string().min(1),
 });
 
@@ -99,7 +99,7 @@ export type HostPush = (hostId: string, input: PushInput, signal?: AbortSignal) 
 
 /** The ports `bb pstack gh` uses. server.ts builds them from bb.hosts.experimental_client. */
 export type HostGit = {
-  inspectCommit?: HostInspectCommit;
+  inspectCommit: HostInspectCommit;
   pushBranch(hostId: string, input: PushBranchInput): Promise<PushResult>;
   inspect(hostId: string, worktreePath: string): Promise<string | null>;
   fetch(hostId: string, input: FetchInput): Promise<FetchResult>;

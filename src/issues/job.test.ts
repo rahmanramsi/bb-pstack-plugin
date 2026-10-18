@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { AGENT_BRANCH } from "../host-contract.ts";
 import {
   EFFECT_POLICY,
-  MAX_EFFECT_TRIES,
+  initialControl,
   InitialReport,
   RoundReport,
   parseReport,
@@ -12,7 +12,6 @@ import {
   branchFor,
   FEEDBACK_QUIET_MS,
   MAX_FEEDBACK_ROUNDS,
-  ROUND_MS,
   command,
   counts,
   enter,
@@ -43,6 +42,7 @@ const WORKER: WorkerSettings = { providerId: "codex", model: "gpt-6.1-sol", reas
 
 function job(overrides: Partial<Job> = {}): Job {
   return {
+    control: initialControl(),
     id: "psi_00000000-0000-0000-0000-000000000001" as JobId,
     version: 3,
     repo: "acme/web" as RepoName,
@@ -100,17 +100,17 @@ test("a queued job starts only with resolved worker settings, labelling before i
   assert.deepEqual(plan(queued, facts({ worker: offline })), { type: "change", change: { error: "the host is offline" } });
   assert.equal(plan(job({ error: "the host is offline" }), facts({ worker: offline })), null);
   const unconfigured = { error: "no model for issue worker", permanent: true };
-  assert.deepEqual(plan(queued, facts({ worker: unconfigured })), { type: "change", change: { error: "no model for issue worker" } }, "a problem only an operator can fix waits too");
-  assert.equal(plan(job({ error: "no model for issue worker" }), facts({ worker: unconfigured })), null);
+  assert.equal((plan(queued, facts({ worker: unconfigured })) as { change: Change }).change.phase?.state, "stuck");
+  assert.equal((plan(job({ error: "no model for issue worker" }), facts({ worker: unconfigured })) as { change: Change }).change.control?.disposition, "failure");
 
   const action = plan(queued, facts({ worker: WORKER }));
   assert.equal(action?.type, "change");
   const started = apply(queued, (action as { change: Change }).change);
   assert.equal(started.phase.state, "starting");
-  assert.equal(started.deadline, NOW + ROUND_MS);
+  assert.equal(started.deadline, null);
   assert.ok("effects" in started.phase);
-  assert.deepEqual(started.phase.effects.map((effect) => effect.op), ["labels", "spawn"]);
-  const spawn = started.phase.effects[1];
+  assert.deepEqual(started.phase.effects.map((effect) => effect.op), ["spawn"]);
+  const spawn = started.phase.effects[0];
   assert.equal(spawn.op === "spawn" && spawn.spec.model, "gpt-6.1-sol");
 });
 
@@ -134,16 +134,11 @@ test("the head effect is performed first, probed after a claim, and never touche
   assert.equal((plan(labelsClaimed, facts()) as { mode: string }).mode, "perform");
 });
 
-test("an effect that keeps failing sticks the job after the try limit, and a failing unlabel cannot loop", () => {
-  const exhausted = job({ threadId: "thr_w", phase: transit("publishing", [pushEffect], { tries: MAX_EFFECT_TRIES }), error: "GitHub 502" });
+test("infrastructure retries retain the exact effect beyond eight claims", () => {
+  const exhausted = job({ threadId: "thr_w", phase: transit("publishing", [pushEffect], { tries: 80 }), error: "GitHub 502" });
   const action = plan(exhausted, facts());
-  assert.equal(action?.type, "change");
-  const stuck = apply(exhausted, (action as { change: Change }).change);
-  assert.equal(stuck.phase.state, "sticking");
-  assert.match(stuck.error!, /push failed 8 times: GitHub 502/);
-
-  const unlabelling = job({ threadId: "thr_w", phase: transit("sticking", [labelEffect], { tries: MAX_EFFECT_TRIES }) });
-  assert.deepEqual((plan(unlabelling, facts()) as { change: Change }).change.phase, { state: "stuck" });
+  assert.equal(action?.type, "effect");
+  if (action?.type === "effect") assert.deepEqual(action.effect, pushEffect);
 });
 
 test("settle pops a done effect, merges what it learned, and enters the resting state after the last one", () => {
@@ -183,7 +178,7 @@ test("a spawn whose outcome is unknown is probed, never re-run, and sticks once 
   const late = settle(probed, { kind: "absent" }, NOW + 5 * MIN);
   assert.equal(late.phase?.state, "sticking");
   assert.ok(late.phase && "effects" in late.phase);
-  assert.deepEqual(late.phase.effects.map((effect) => effect.op), ["stop-thread", "labels"]);
+  assert.deepEqual(late.phase.effects.map((effect) => effect.op), ["stop-thread"]);
   assert.match(late.error!, /spawn may not have happened/);
 });
 
@@ -203,45 +198,31 @@ test("retry backs off and honours the server's notBefore; fail sticks the job", 
   assert.equal(failed.error, "the remote branch moved");
 });
 
-test("a working job waits through a failed or idle worker, nudges an idle one twice, and sticks only when its thread is gone", () => {
-  const working = job({ phase: { state: "working" }, threadId: "thr_w", deadline: NOW + 30 * MIN, updatedAt: NOW - MIN });
-  assert.equal(plan(working, facts({ thread: { kind: "active" } })), null);
-  assert.equal(plan({ ...working, deadline: NOW }, facts({ thread: { kind: "active" } })), null, "a worker past its deadline keeps working");
-  assert.equal((plan(working, facts({ thread: { kind: "gone" } })) as { change: Change }).change.phase?.state, "sticking");
-
-  const failed = plan(working, facts({ thread: { kind: "failed", error: "provider crashed" } })) as { change: Change };
-  assert.equal(failed.change.phase, undefined, "a failed thread may recover, so the job waits");
-  assert.match(failed.change.error!, /waiting for it to recover: provider crashed/);
-  const waiting = apply(working, failed.change);
-  assert.equal(plan(waiting, facts({ thread: { kind: "failed", error: "provider crashed" } })), null);
-  assert.deepEqual((plan(waiting, facts({ thread: { kind: "active" } })) as { change: Change }).change, { error: null }, "the thread came back");
-
+test("active workers have no deadline and confirmed idle workers recover after two reminders", () => {
+  const working = job({ phase: { state: "working" }, threadId: "thr_w", updatedAt: NOW - MIN });
+  assert.equal(plan(working, facts({ now: NOW + 1000 * MIN, thread: { kind: "active" } })), null);
+  const scheduled = plan(working, facts({ thread: { kind: "failed", error: "quota", retryAt: NOW + MIN } }));
+  assert.deepEqual(scheduled, { type: "sleep", until: NOW + MIN });
+  const failed = plan(working, facts({ thread: { kind: "failed", error: "provider crashed" } }));
+  assert.equal(failed?.type, "change");
+  if (failed?.type === "change") assert.equal(failed.change.phase?.state, "recovering");
   const nudge = plan(working, facts({ thread: { kind: "idle", since: NOW - 10 } }));
   assert.equal(nudge?.type, "nudge");
-  assert.deepEqual((nudge as { change: Change }).change, { nudges: 1 });
-  assert.match((nudge as { text: string }).text, /bb pstack issues report --file/);
-
-  const nudged = apply(working, (nudge as { change: Change }).change);
-  assert.equal(plan(nudged, facts({ thread: { kind: "idle", since: NOW - 10 } })), null, "no second nudge until the worker idles again");
-  const silent = plan({ ...nudged, nudges: 2 }, facts({ thread: { kind: "idle", since: NOW + 10 } })) as { change: Change };
-  assert.equal(silent.change.phase, undefined, "a worker silent after every reminder waits for a person");
-  assert.match(silent.change.error!, /stopped without reporting after every reminder/);
+  const silent = plan({ ...working, nudges: 2 }, facts({ now: NOW + MIN, thread: { kind: "idle", since: NOW + 10 } }));
+  assert.equal(silent?.type, "change");
+  if (silent?.type === "change") assert.equal(silent.change.phase?.state, "recovering");
 });
 
-test("stop replaces a pending outbox, stops a worker that may exist, and is null once the job has ended", () => {
-  assert.deepEqual(stop(job(), "maya"), { phase: { state: "stopped" }, deadline: null, error: "stopped by maya" });
-
-  const spawning = job({ phase: transit("starting", [spawnEffect], { tries: 1, firstAt: NOW }) });
-  const stopping = stop(spawning, "maya")!;
+test("stop replaces pending publication and records cancellation before stopping the worker", () => {
+  const queued = stop(job(), "maya")!;
+  assert.equal(queued.phase?.state, "stopped");
+  assert.equal(queued.control?.disposition, "stopped");
+  const publishing = job({ phase: transit("publishing", [pushEffect]), threadId: "thr_w" });
+  const stopping = stop(publishing, "maya")!;
   assert.ok(stopping.phase && "effects" in stopping.phase);
-  assert.deepEqual(stopping.phase.effects.map((effect) => effect.op), ["stop-thread", "labels"]);
-
-  const beforeSpawn = job({ phase: transit("starting", [labelEffect, spawnEffect], { tries: 1, firstAt: NOW }) });
-  const unlabelOnly = stop(beforeSpawn, "maya")!;
-  assert.ok(unlabelOnly.phase && "effects" in unlabelOnly.phase);
-  assert.deepEqual(unlabelOnly.phase.effects.map((effect) => effect.op), ["labels"]);
-
-  for (const state of ["done", "stopped", "stuck", "ignored"] as const) assert.equal(stop(job({ phase: { state } }), "maya"), null);
+  assert.deepEqual(stopping.phase.effects.map((effect) => effect.op), ["stop-thread"]);
+  assert.equal(stopping.error, "stopped by maya");
+  assert.equal(stop(job({ phase: { state: "done" } }), "maya"), null);
 });
 
 const first = (value: unknown) => ({ round: "initial", report: InitialReport.parse(value) }) as const;
@@ -277,14 +258,9 @@ test("an accepted changes report publishes the reported commit: push, draft PR, 
   assert.deepEqual(issueLabel, { op: "labels", key: `labels:${working.id}:review`, on: "issue", add: ["agent:review"], remove: ["agent:working"] });
 });
 
-test("needs-info and no-change reports post on the issue and must not add commits", () => {
+test("needs-info is rejected and no-change cannot conceal committed work", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
-  const asking = acceptReport(working, first({ outcome: "needs-info", questions: ["Should @design approve the new spacing?"], verification: ["read the layout code"] }), reportFacts({ worktree: { headSha: HEAD, dirty: false, ahead: 0, commits: [] } }));
-  assert.ok(asking.ok);
-  assert.ok(asking.change.phase && "effects" in asking.change.phase);
-  assert.equal(asking.change.phase.state, "asking");
-  assert.deepEqual(asking.change.phase.effects[0], { op: "comment", key: `comment:${working.id}:questions`, body: "- Should `@design` approve the new spacing?" });
-
+  assert.equal(parseReport(working, { outcome: "needs-info", questions: ["What now?"], verification: ["read source"] }).ok, false);
   const closing = acceptReport(working, first({ outcome: "no-change", summary: "Already fixed in 1.4.", verification: ["checked main"] }), reportFacts());
   assert.equal(closing.ok, false);
   assert.match(reasonsOf(closing)[0]!, /must not add commits/);
@@ -304,7 +280,9 @@ test("a report is rejected with every reason, however many times, without ending
   for (const expected of [/uncommitted/, /needs a new commit/, /gate pr` fails: 2 open steps/, /10 to 72/, /Conventional Commits/, /describes the process \("\/poteto-mode"\)/]) {
     assert.match(reasons, expected);
   }
-  assert.deepEqual(verdict.change, { rejections: 1, error: `report rejected: ${reasonsOf(verdict).join("; ")}` });
+  assert.equal(verdict.change.rejections, 1);
+  assert.equal(verdict.change.control?.invalid, 1);
+  assert.match(verdict.change.error!, /report rejected/);
 
   const second = acceptReport({ ...working, rejections: 1 }, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true, ahead: 1, commits: [HEAD] } }));
   assert.equal(second.change.phase, undefined);
@@ -362,8 +340,8 @@ test("unattended workers keep decision guidance at start, after compaction, and 
     assert.match(text, /Pass these instructions to any delegates/);
     assert.match(text, /smallest useful baseline as a draft pull request/);
     assert.match(text, /material assumptions, remaining limitations, and unresolved product choices in the pull request description/);
-    assert.match(text, /Use `needs-info` only when a missing prerequisite prevents any useful baseline/);
-    assert.match(text, /Uncertain preferences, several valid approaches, or incomplete acceptance criteria are not blockers/);
+    assert.match(text, /report `failure` with a concrete `reason`/);
+    assert.match(text, /issue-specific evidence/);
     assert.match(text, /Do not claim unperformed checks passed or bypass report validation/);
     assert.match(text, /not merging, deployment, or destructive external actions/);
   }
@@ -375,13 +353,13 @@ test("feedback workers leave unresolved decisions on the pull request and report
   assert.match(prompt, /do not ask for confirmation in the worker thread/);
   assert.match(prompt, /explain your assumption or limitation in `replies`/);
   assert.match(prompt, /must not stop work on the other items/);
-  assert.match(workerInstructions(addressing), /`needs-info` is not available/);
+  assert.match(workerInstructions(addressing), /No report requests information/);
   assert.match(nudgeText(addressing, null), /report `changes` or `no-change` with `replies`/);
 });
 
 test("the view names the pending effect of a transit state", () => {
   const view = toView(job({ phase: transit("publishing", [pushEffect], { tries: 2, nextAt: NOW + 5 }) }));
-  assert.deepEqual(view.next, { state: "review", op: "push", tries: 2, retryAt: NOW + 5 });
+  assert.deepEqual(view.next, { state: "checking", op: "push", tries: 2, retryAt: NOW + 5 });
   assert.equal(toView(job()).next, null);
 });
 
@@ -456,7 +434,7 @@ test("a round starts only once the newest pending feedback has been quiet for tw
   assert.equal(action?.type, "change");
   const change = (action as { change: Change }).change;
   assert.deepEqual(change.startRound, { ordinal: 2, kind: "feedback", baseSha: PUSHED, feedback: [{ kind: "review-comment", id: 1 }, { kind: "review-comment", id: 2 }] });
-  assert.equal(change.deadline, NOW + ROUND_MS);
+  assert.equal(change.deadline, null);
   const sending = apply(review, change);
   assert.equal(sending.round, 2);
   assert.ok("effects" in sending.phase);
@@ -480,52 +458,37 @@ test("the round message stands alone: the pull request, the issue, every item wi
   assert.match(text, /bb pstack issues report --file/);
 });
 
-test("a worker thread gone by the time a round starts is replaced from the pushed branch, as a spawn of its own", () => {
+test("an unavailable feedback worker enters confirmed-stop recovery in the recorded workspace", () => {
   const review = inReview();
-  const failed = plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "failed", error: "provider crashed" } }));
-  assert.equal((failed as { change: Change }).change.phase?.state, "respawning", "a failed thread is replaced too");
   const action = plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "gone" } }));
-  const respawning = apply(review, (action as { change: Change }).change);
-  assert.ok("effects" in respawning.phase);
-  assert.equal(respawning.phase.state, "respawning");
-  assert.deepEqual(respawning.phase.effects.map((effect) => effect.op), ["labels", "spawn", "check-worktree"]);
-  assert.deepEqual(respawning.phase.effects[2], { op: "check-worktree", key: `check-worktree:${review.id}:2`, base: PUSHED });
-  const spawn = respawning.phase.effects[1];
-  assert.ok(spawn?.op === "spawn");
-  assert.equal(spawn.key, `spawn:${review.id}:2`);
-  assert.deepEqual({ ...spawn.spec, prompt: undefined }, { ...WORKER, title: "acme/web#41: Submit button hides behind the footer", baseRef: `origin/${review.branch}`, prompt: undefined });
-  assert.match(spawn.spec.prompt, /^Feedback round 1 of 5/);
-
-  const deleted = plan(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]), remote: { head: null } }));
-  assert.match((deleted as { change: Change }).change.error!, /no longer exists on GitHub/);
-
-  const legacy = plan(inReview({ worker: null }), facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "gone" } }));
-  assert.equal((legacy as { change: Change }).change.phase?.state, "sticking");
+  assert.equal(action?.type, "change");
+  if (action?.type !== "change") throw new Error("expected recovery");
+  assert.equal(action.change.phase?.state, "recovering");
+  assert.ok(action.change.phase && "effects" in action.change.phase);
+  assert.deepEqual(action.change.phase.effects.map((effect) => effect.op), ["stop-thread", "recover-worker"]);
+  assert.equal(action.change.startRound?.ordinal, 2);
 });
 
 test("feedback after the fifth feedback round sticks the job instead of starting a sixth", () => {
   const items = [inline(1, NOW - 5 * MIN)];
   assert.equal((plan(inReview({ round: MAX_FEEDBACK_ROUNDS }), facts(pending(items))) as { change: Change }).change.phase?.state, "sending");
-  const limit = plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1 }), facts(pending(items)));
+  const limit = plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1, control: { ...initialControl(), feedbackRounds: MAX_FEEDBACK_ROUNDS } }), facts(pending(items)));
   const stuck = (limit as { change: Change }).change;
   assert.equal(stuck.phase?.state, "sticking");
-  assert.match(stuck.error!, /new feedback after 5 feedback rounds/);
-  assert.equal(plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1 }), facts(pending([]))), null, "no new feedback, nothing to end");
+  assert.match(stuck.error!, /unresolved feedback after 5 feedback rounds/);
+  assert.equal(plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1, control: { ...initialControl(), feedbackRounds: MAX_FEEDBACK_ROUNDS } }), facts(pending([]))), null, "no new feedback, nothing to end");
 });
 
-test("a merged or closed pull request ends the job from review or from a running round, stopping the worker", () => {
+test("merge completes delivery and closing without merge records failure", () => {
   for (const state of ["merged", "closed"] as const) {
-    for (const current of [inReview(), inReview({ phase: { state: "addressing" }, round: 2, deadline: NOW + MIN })]) {
-      const action = plan(current, facts({ ...pending([inline(1, NOW - 5 * MIN)]), pr: { state }, thread: { kind: "active" } }));
-      const closing = apply(current, (action as { change: Change }).change);
-      assert.ok("effects" in closing.phase);
-      assert.equal(closing.phase.state, "closing");
-      assert.deepEqual(closing.phase.effects.map((effect) => effect.op), ["stop-thread", "labels"]);
-      assert.deepEqual(closing.phase.effects[1], { op: "labels", key: `labels:${current.id}:close`, on: "issue", add: [], remove: ["agent:working", "agent:needs-info", "agent:review"] });
-      assert.equal(apply(closing, settle({ ...closing, phase: { ...closing.phase, effects: [closing.phase.effects[1]], tries: 1 } } as Job, { kind: "done", patch: {} }, NOW)).phase.state, "done");
-    }
+    const current = inReview();
+    const action = plan(current, facts({ ...pending([]), pr: { state } }));
+    assert.equal(action?.type, "change");
+    if (action?.type !== "change") throw new Error("expected terminal disposition");
+    const ending = apply(current, action.change);
+    assert.equal(ending.control.disposition, state === "merged" ? "merged" : "closed");
+    assert.equal(ending.phase.state, state === "merged" ? "closing" : "sticking");
   }
-  assert.equal(plan(inReview(), facts({ ...pending([inline(1, NOW - 5 * MIN)]), pr: null })), null, "an unknown pull request state starts nothing");
 });
 
 test("a running round waits and nudges like the first one", () => {
@@ -536,7 +499,7 @@ test("a running round waits and nudges like the first one", () => {
   assert.equal(plan({ ...addressing, deadline: NOW }, facts({ ...open, thread: { kind: "active" } })), null);
 });
 
-const ROUND_FACTS = (overrides: Partial<ReportFacts> = {}) => reportFacts({ worktree: { headSha: NEXT, dirty: false, ahead: 2, commits: [NEXT, PUSHED] }, remoteHead: PUSHED, listed: [reviewBody, inline(1, NOW - 5 * MIN)], gate: { pass: false, reason: "3 open steps" }, ...overrides });
+const ROUND_FACTS = (overrides: Partial<ReportFacts> = {}) => reportFacts({ worktree: { headSha: NEXT, dirty: false, ahead: 2, commits: [NEXT, PUSHED] }, remoteHead: PUSHED, listed: [reviewBody, inline(1, NOW - 5 * MIN)], gate: { pass: true }, ...overrides });
 const REPLIES = [
   { kind: "review", commentId: 500, body: "Renamed both helpers in ccccccc." },
   { kind: "review-comment", commentId: 1, body: "Renamed to `parseInput` in ccccccc, cc @lee." },
@@ -558,7 +521,7 @@ test("a feedback round's changes report pushes on top of the pushed commit, answ
     { op: "request-review", key: `request-review:${addressing.id}:2`, reviewers: ["lee", "maya"] },
     { op: "labels", key: `labels:${addressing.id}:review:2`, on: "issue", add: ["agent:review"], remove: ["agent:working"] },
   ]);
-  assert.equal(TRANSIT_OF(republishing), "review");
+  assert.equal(TRANSIT_OF(republishing), "checking");
   const followUp = acceptReport(addressing, report, ROUND_FACTS({ listed: [reviewBody, { ...inline(1, NOW - 5 * MIN), inReplyTo: 9 }] }));
   assert.ok(followUp.ok && followUp.change.phase && "effects" in followUp.change.phase);
   assert.deepEqual(followUp.change.phase.effects[2], { op: "reply", key: `reply:${addressing.id}:2:review-comment:1`, target: { kind: "review-comment", id: 1, thread: 9 }, body: "Renamed to `parseInput` in ccccccc, cc `@lee`." }, "a reply in a thread goes to the thread's first comment");

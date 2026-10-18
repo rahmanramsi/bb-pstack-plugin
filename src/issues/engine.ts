@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import type { HostPush } from "../host-contract.ts";
+import type { HostPush, HostInspectCommit } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { issueBoard, type BoardFilter, type IssueBoardSchema, type IssueSummarySchema } from "./board.ts";
@@ -23,6 +23,10 @@ import { acceptSync,
   REPORTING,
   TERMINAL,
   acceptReport,
+  rejectReport,
+  stick,
+  type ReviewFact,
+  type AcceptedReport,
   parseReport,
   awaitingThread,
   containsSha,
@@ -46,7 +50,6 @@ import { acceptSync,
   type Feedback,
   type GateFact,
   type Job,
-  type ParsedReport,
   type JobId,
   type RepoName,
   type ReportFacts,
@@ -55,8 +58,8 @@ import { acceptSync,
   type WorkerProblem,
   type WorkerSettings,
 } from "./job.ts";
-import type { IssueStore } from "./store.ts";
-import { commentBody, effectMarker, mergeNote, workerInstructions } from "./text.ts";
+import type { IssueStore, Submission } from "./store.ts";
+import { commentBody, effectMarker, mergeNote, workerInstructions, workerPrompt, roundPrompt } from "./text.ts";
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
@@ -66,13 +69,15 @@ const SETTLE_MARGIN_MS = 5_000;
 const REVOKE_MS = 30_000;
 
 /** Agents can write their own metadata, so it only points at a job; the store decides. */
-export const IssueMetadata = z.object({ pstackIssue: z.literal(1), jobId: z.string() });
+export const IssueMetadata = z.object({ pstackIssue: z.literal(1), jobId: z.string(), epoch: z.number().int().nonnegative().default(0) });
 
 export type IssuesDeps = {
   bb: BbPluginApi;
   store: IssueStore;
   github: GitHub;
   hostPush: HostPush;
+  inspectCommit: HostInspectCommit;
+  inspectOrigin: (hostId: string, path: string) => Promise<string | null>;
   /** Configured repositories; empty while issue workers are not set up. */
   repos: () => readonly RepoMapping[];
   /** The GitHub plugin's issue catalog, when available. Worker execution still requires a repository mapping. */
@@ -113,7 +118,7 @@ const isMissing = (error: unknown) => {
 };
 const short = (sha: string) => sha.slice(0, 7);
 
-type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
+type Worktree = { ok: true; path: string; environmentId: string; branch: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
 
 /** `deadline` is when the claim's lease ends, less a margin to settle; every call the effect makes ends by then. */
 type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>, deadline: number) => Promise<EffectOutcome>;
@@ -150,6 +155,79 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  async function workspaceThreads(environmentId: string, signal?: AbortSignal) {
+    const found: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+    for (let offset = 0; ; offset += 100) {
+      const page = await bb.sdk.threads.list({ environmentId, includeHidden: true, limit: 100, offset, ...(signal ? { signal } : {}) });
+      found.push(...page);
+      if (page.length < 100) return found;
+    }
+  }
+
+  async function matchingEpoch(job: Job, signal?: AbortSignal): Promise<string[]> {
+    const matches = [];
+    for (const id of await threadsNaming(job, signal)) {
+      const metadata = IssueMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId: id, ...(signal ? { signal } : {}) }));
+      if (metadata.success && metadata.data.epoch === job.control.epoch) matches.push(id);
+    }
+    return matches;
+  }
+
+  function recoveryPrompt(job: Job): string {
+    return [`Continue issue #${job.issue} in the existing workspace. Preserve dirty/untracked files and all local commits.`, `The previous worker stopped after ${job.error ?? "incomplete delivery"}.`, job.round > 1 ? roundPrompt(job, job.round, store.roundFeedback(job.id, job.round), store.roundSummaries(job.id), job.roundBase ?? job.pushedSha!) : workerPrompt(job), workerInstructions(job)].join("\n");
+  }
+
+  function reviewObservation(job: Job, snapshot: NonNullable<Awaited<ReturnType<RepoClient["reviewSnapshot"]>>>): ReviewFact {
+    const reasons: string[] = [];
+    if (!snapshot.complete) reasons.push("GitHub observations are incomplete");
+    if (snapshot.headRepository !== job.repo || snapshot.headBranch !== job.branch || snapshot.baseBranch !== job.baseBranch) reasons.push("pull request identity no longer matches the publication");
+    if (snapshot.mergeability !== "clean") reasons.push(`mergeability is ${snapshot.mergeability}`);
+    const pending = snapshot.checks.some((check) => check.state === "pending");
+    const failed = snapshot.checks.filter((check) => !["success", "neutral", "skipped", "pending"].includes(check.state));
+    reasons.push(...failed.map((check) => `${check.source}/${check.appId}/${check.name}: ${check.state}`));
+    {
+      reasons.push(...(snapshot.required.blockers ?? []));
+      for (const required of snapshot.required.checks ?? []) {
+        const matching = snapshot.checks.filter((check) => check.head === snapshot.head && check.name === required.name && (required.source === "either" || required.source === check.source) && (required.appId === null || check.appId === required.appId));
+        if (!matching.some((check) => required.accepted.some((accepted) => accepted === check.state))) reasons.push(`required check missing or unsatisfied: ${required.source}/${required.appId}/${required.name}`);
+      }
+    }
+    return { kind: "observed", target: { pr: snapshot.pr, head: snapshot.head, base: snapshot.base }, state: snapshot.state, draft: snapshot.draft, complete: snapshot.complete, ready: snapshot.complete && reasons.length === 0 && !pending, limitation: snapshot.required.kind === "unavailable" ? `Branch policy could not be inspected: ${snapshot.required.reason}. Observed CI and local evidence passed; merge prerequisites are not established.` : null, pending, reasons, fingerprint: reasons.map((reason) => reason.replace(/[0-9a-f]{40}/g, "<sha>")).sort().join("|") || "healthy" };
+  }
+
+  let delivering: Promise<void> | null = null;
+  function deliverStatuses(): Promise<void> {
+    if (delivering) return delivering;
+    const task = performStatusDelivery().finally(() => { if (delivering === task) delivering = null; });
+    delivering = task;
+    return task;
+  }
+
+  async function performStatusDelivery(): Promise<void> {
+    await Promise.all(store.statuses(clock()).map(async (status) => {
+      if (!store.claimStatus(status, clock())) return;
+      let error: string | null = null;
+      let nextAt = clock() + POLL_MS;
+      const repo = github.repo(status.repo, AbortSignal.timeout(50_000));
+      try { await repo.upsertIssueStatus({ issue: status.issue, marker: `<!-- pstack:issue-status:${status.repo}:${status.issue} -->`, revision: status.revision, body: status.body }); }
+      catch (failure) { error = message(failure); nextAt = Math.max(clock() + POLL_MS, failure instanceof GitHubTransientError ? failure.notBefore ?? 0 : 0); }
+      store.settleStatus(status, { error, nextAt, release: false });
+      const job = store.get(status.jobId);
+      if (!job || job.generation !== status.generation) { store.settleStatus(status, { error, nextAt }); return; }
+      const labels: Effect = { op: "labels", key: `status-labels:${status.revision}`, on: "issue", add: job.phase.state === "review" ? [LABEL.review] : TERMINAL.has(job.phase.state) ? [] : [LABEL.working], remove: job.phase.state === "review" ? [LABEL.working, LABEL.needsInfo] : TERMINAL.has(job.phase.state) ? [LABEL.working, LABEL.needsInfo, LABEL.review] : [LABEL.review, LABEL.needsInfo] };
+      store.decorate(job, labels);
+      for (const item of [...status.decorations, { effect: labels, nextAt: 0, attempts: 0, error: null }]) {
+        if (item.nextAt > clock()) continue;
+        if (clock() >= (status.leaseUntil ?? clock()) - SETTLE_MARGIN_MS) break;
+        const attempts = store.claimDecoration(status, item.effect.key);
+        if (attempts === null) continue;
+        const outcome = await runEffect(job, item.effect, attempts > 0 && EFFECT_POLICY[item.effect.op].recovery.kind === "probe" ? "probe-then-perform" : "perform", (status.leaseUntil ?? clock()) - SETTLE_MARGIN_MS);
+        store.settleDecoration(status, item.effect.key, outcome.kind === "done" ? null : "error" in outcome ? outcome.error : "delivery unconfirmed", clock() + POLL_MS);
+      }
+      store.settleStatus(status, { error, nextAt });
+    }));
+  }
+
   async function worktree(job: Job, signal?: AbortSignal): Promise<Worktree> {
     if (!job.threadId) return { ok: false, transient: false, error: "the job has no worker thread" };
     const thread = await bb.sdk.threads.get({ threadId: job.threadId, ...(signal ? { signal } : {}) });
@@ -157,6 +235,8 @@ export function createIssues(deps: IssuesDeps): Issues {
     const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) });
     if (environment.hostId !== job.hostId) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the mapped host ${job.hostId}` };
     if (environment.status !== "ready" || !environment.path) return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
+    const origin = await deps.inspectOrigin(job.hostId, environment.path);
+    if (!origin || !new RegExp(`^(?:https://github\\.com/|git@github\\.com:)${job.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.git)?$`, "i").test(origin)) return { ok: false, transient: false, error: "the recorded workspace origin does not match the authorized repository" };
     const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
     if (status.outcome === "unavailable") return { ok: false, transient: true, error: `the worktree status is unavailable: ${status.failure.message}` };
     if (status.outcome !== "available") return { ok: false, transient: false, error: status.message };
@@ -166,6 +246,8 @@ export function createIssues(deps: IssuesDeps): Issues {
     return {
       ok: true,
       path: environment.path,
+      environmentId: thread.environmentId,
+      branch: checkout.kind === "branch" ? checkout.branchName : "detached",
       headSha: headSha as Sha,
       dirty: workingTree.hasUncommittedChanges || workingTree.files.some((file) => file.status === "??"),
       ahead: mergeBase?.aheadCount ?? 0,
@@ -194,7 +276,7 @@ export function createIssues(deps: IssuesDeps): Issues {
             // Not the project's worktree base: the first worker starts from the ref report validation counts new
             // commits against, so a fresh worktree has nothing ahead of it; a replacement starts from the pushed branch.
             environment: { type: "host", hostId: job.hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: spec.baseRef } } },
-            pluginMetadata: { pstackIssue: 1, jobId: job.id },
+            pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch },
             prompt: spec.prompt,
             title: spec.title,
             providerId: spec.providerId,
@@ -202,14 +284,19 @@ export function createIssues(deps: IssuesDeps): Issues {
             reasoningLevel: spec.reasoningLevel,
             ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
           });
-          return done({ threadId: thread.id });
+          const worker = await bb.sdk.threads.get({ threadId: thread.id });
+          const environment = worker.environmentId ? await bb.sdk.environments.get({ environmentId: worker.environmentId }) : null;
+          const tree = await worktree({ ...job, threadId: thread.id });
+          if (!tree.ok && !tree.transient) return { kind: "fail", error: tree.error };
+          const control = tree.ok && worker.environmentId ? { ...job.control, workspace: { environmentId: worker.environmentId, hostId: environment?.hostId ?? job.hostId, path: tree.path, branch: tree.branch } } : job.control;
+          return done({ threadId: thread.id, control });
         } catch (error) {
           return { kind: "unknown", error: `spawn: ${message(error)}` };
         }
       },
       async probe(job, _effect, deadline) {
         // A replacement's probe must not adopt the thread it replaces, which still names the job.
-        const [threadId] = (await threadsNaming(job, until(deadline))).filter((id) => id !== job.threadId);
+        const [threadId] = (await matchingEpoch(job, until(deadline))).filter((id) => id !== job.threadId);
         return threadId ? done({ threadId }) : { kind: "absent" };
       },
     },
@@ -218,9 +305,16 @@ export function createIssues(deps: IssuesDeps): Issues {
         const tree = await worktree(job, until(deadline));
         if (!tree.ok) return tree.transient ? { kind: "retry", error: tree.error, notBefore: null } : { kind: "fail", error: tree.error };
         const repo = github.repo(job.repo, until(deadline));
-        const { remoteUrl, token } = await repo.pushCredentials();
+        const capabilities = await repo.capabilities({ fresh: true });
+        if (capabilities.archived || capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return { kind: "fail", error: "publication requires existing contents and pull requests write grants on an active repository" };
+        const comparisonSha = job.report?.outcome === "changes" && job.report.headSha === effect.sha && job.report.comparisonSha ? job.report.comparisonSha : effect.expectedRemoteSha ?? capabilities.defaultHead;
+        const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: effect.sha, comparisonSha }, until(deadline));
+        if (inspected.kind !== "inspected") return { kind: "fail", error: `publication commit ${inspected.sha} is unavailable; original workspace retained` };
+        if (!inspected.nonemptyDiff) return { kind: "fail", error: "the pinned publication has no changes against its comparison commit" };
+        if (inspected.workflows && capabilities.permissions.workflows !== "write") return { kind: "fail", error: "workflow changes require workflows write, which is not already granted; commits retained" };
+        const { remoteUrl, token } = await repo.pushCredentials({ workflows: inspected.workflows });
         try {
-          const input = { worktreePath: tree.path, remoteUrl, branch: job.branch, sha: effect.sha, expectedRemoteSha: effect.expectedRemoteSha, token };
+          const input = { worktreePath: tree.path, remoteUrl, branch: job.branch, sha: effect.sha, expectedRemoteSha: effect.expectedRemoteSha, comparisonSha, workflows: inspected.workflows, token };
           const result = await deps.hostPush(job.hostId, input, until(deadline - REVOKE_MS));
           if (result.status === "pushed") return done({ pushedSha: effect.sha });
           // A claim whose lease ran out may still be pushing the same commit, and its push can land first.
@@ -251,7 +345,10 @@ export function createIssues(deps: IssuesDeps): Issues {
       },
       async probe(job, _effect, deadline) {
         const pr = await github.repo(job.repo, until(deadline)).findPull(job.branch);
-        return pr ? done({ pr }) : { kind: "absent" };
+        if (!pr) return { kind: "absent" };
+        const snapshot = await github.repo(job.repo, until(deadline)).reviewSnapshot(pr.number);
+        if (!snapshot || snapshot.state !== "open" || snapshot.headRepository !== job.repo || snapshot.headBranch !== job.branch || snapshot.baseBranch !== job.baseBranch || snapshot.head !== job.pushedSha) return { kind: "fail", error: "the existing pull request does not match this job publication" };
+        return done({ pr });
       },
     },
     comment: {
@@ -260,13 +357,15 @@ export function createIssues(deps: IssuesDeps): Issues {
         return done();
       },
       async probe(job, effect, deadline) {
-        const since = (("effects" in job.phase && job.phase.firstAt) || clock()) - 60_000;
+        const since = job.createdAt - 60_000;
         return (await github.repo(job.repo, until(deadline)).findComment(job.issue, effectMarker(effect.key), since)) ? done() : { kind: "absent" };
       },
     },
     "send-round": {
       async perform(job, effect) {
         if (!job.threadId) return { kind: "fail", error: "the job has no worker thread" };
+        const thread = await threadFact(job.threadId);
+        if (thread?.kind === "gone" || thread?.kind === "failed") return { kind: "fail", error: "the repair worker is unavailable" };
         try {
           // Queued behind a turn that is still running, never steered into it.
           await bb.sdk.threads.send({ threadId: job.threadId, mode: "queue-if-active", input: [{ type: "text", text: effect.text, mentions: [] }] });
@@ -298,7 +397,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       async probe(job, effect, deadline) {
         if (!job.pr) return { kind: "absent" };
         const repo = github.repo(job.repo, until(deadline));
-        const since = (("effects" in job.phase && job.phase.firstAt) || clock()) - 60_000;
+        const since = job.createdAt - 60_000;
         const marker = effectMarker(effect.key);
         const found = effect.target.kind === "review-comment" ? await repo.findReviewComment(job.pr.number, marker, since) : await repo.findComment(job.pr.number, marker, since);
         return found ? done() : { kind: "absent" };
@@ -330,13 +429,40 @@ export function createIssues(deps: IssuesDeps): Issues {
       },
     },
     status: {
+      async perform() { return done(); },
+    },
+    "recover-worker": {
+      async perform(job) {
+        const workspace = job.control.workspace;
+        const settings = job.worker;
+        if (!workspace || !settings) return { kind: "fail", error: "safe environment reuse is unavailable; the original thread and workspace are retained" };
+        const environment = await bb.sdk.environments.get({ environmentId: workspace.environmentId });
+        if (environment.hostId !== workspace.hostId || environment.path !== workspace.path || environment.status !== "ready") return { kind: "fail", error: `the recorded environment ${workspace.environmentId} cannot be safely reused; work retained at ${workspace.path}` };
+        const status = await bb.sdk.environments.status({ environmentId: workspace.environmentId, mergeBaseBranch: `origin/${job.baseBranch}` });
+        if (status.outcome !== "available" || status.workspace.checkout.kind !== "branch" || status.workspace.checkout.branchName !== workspace.branch) return { kind: "fail", error: `the preserved branch identity cannot be confirmed in ${workspace.environmentId}; workspace retained` };
+        const writers = await workspaceThreads(workspace.environmentId);
+        if (writers.some((writer) => !["idle", "error"].includes(writer.status))) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}; work retained` };
+        try {
+          const thread = await bb.sdk.threads.spawn({ projectId: job.projectId, visibility: "visible", environment: { type: "reuse", environmentId: workspace.environmentId }, pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch }, prompt: recoveryPrompt(job), title: `Recover issue #${job.issue}`, providerId: settings.providerId, model: settings.model, reasoningLevel: settings.reasoningLevel, ...(settings.permissionMode ? { permissionMode: settings.permissionMode } : {}) });
+          return done({ threadId: thread.id, worker: settings });
+        } catch (error) { return { kind: "unknown", error: `recovery spawn: ${message(error)}` }; }
+      },
+      async probe(job, _effect, deadline) {
+        const matches = await matchingEpoch(job, until(deadline));
+        if (matches.length > 1) return { kind: "fail", error: "multiple recovery workers exist; stopping them and preserving the workspace" };
+        return matches[0] ? done({ threadId: matches[0] }) : { kind: "absent" };
+      },
+    },
+    "set-draft": {
       async perform(job, effect, deadline) {
-        const repo = github.repo(job.repo, until(deadline));
-        const body = commentBody(effect.body, effect.key);
-        const found = await repo.findComment(job.issue, effectMarker(effect.key), job.createdAt);
-        if (found) await repo.editComment(found.id, body);
-        else await repo.comment(job.issue, body);
-        return done();
+        const result = await github.repo(job.repo, until(deadline)).setDraft({ expected: effect.target, draft: effect.draft });
+        if (result.kind === "missing" || result.kind === "closed") return { kind: "fail", error: "the pull request disappeared or closed during readiness conversion" };
+        if (result.kind === "stale") return { kind: "changed-target", target: { pr: result.snapshot.pr, head: result.snapshot.head, base: result.snapshot.base } };
+        if (!effect.draft) {
+          const observation = reviewObservation(job, result.snapshot);
+          if (observation.kind !== "observed" || !observation.ready || observation.target.head !== effect.target.head || observation.target.base !== effect.target.base) return { kind: "changed-target", target: effect.target };
+        }
+        return done({ control: { ...job.control, readiness: effect.draft ? null : effect.target } });
       },
     },
     "close-issue": {
@@ -348,13 +474,22 @@ export function createIssues(deps: IssuesDeps): Issues {
     "stop-thread": {
       async perform(job, _effect, deadline) {
         const signal = until(deadline);
-        const threads = new Set([...(job.threadId ? [job.threadId] : []), ...(await threadsNaming(job, signal))]);
-        for (const threadId of threads) {
-          await bb.sdk.threads.stop({ threadId, signal }).catch((error) => {
-            if (!isMissing(error)) throw error;
-          });
+        let workspace = job.control.workspace;
+        if (!workspace && job.threadId) {
+          const original = await bb.sdk.threads.get({ threadId: job.threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });
+          const environment = original?.environmentId ? await bb.sdk.environments.get({ environmentId: original.environmentId, signal }) : null;
+          if (original?.environmentId && environment?.path) {
+            const tree = await worktree(job, signal);
+            workspace = { environmentId: original.environmentId, hostId: environment.hostId!, path: environment.path, branch: tree.ok ? tree.branch : "unknown" };
+          }
         }
-        return done();
+        const threads = new Set([...(job.threadId ? [job.threadId] : []), ...(await threadsNaming(job, signal)), ...(workspace ? (await workspaceThreads(workspace.environmentId, signal)).map((thread) => thread.id) : [])]);
+        for (const threadId of threads) {
+          await bb.sdk.threads.stop({ threadId, signal }).catch((error) => { if (!isMissing(error)) throw error; });
+          const stopped = await bb.sdk.threads.get({ threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });
+          if (stopped && (stopped.status !== "idle" && stopped.status !== "error" || (stopped.runtime !== undefined && !["idle", "error"].includes(stopped.runtime.displayStatus)))) return { kind: "retry", error: `stop is not confirmed for ${threadId}`, notBefore: clock() + SWEEP_MS };
+        }
+        return done({ control: { ...job.control, workspace } });
       },
     },
   };
@@ -368,7 +503,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       return probed.kind === "absent" && mode === "probe-then-perform" ? await handler.perform(job, effect, deadline) : probed;
     } catch (error) {
       if (error instanceof GitHubTransientError) return { kind: "retry", error: error.message, notBefore: error.notBefore };
-      if (error instanceof GitHubSetupError) return { kind: "retry", error: error.message, notBefore: null };
+      if (error instanceof GitHubSetupError) return { kind: "fail", error: error.message };
       if (error instanceof GitHubPermanentError) return { kind: "fail", error: error.message };
       return { kind: "unknown", error: `${effect.op}: ${message(error)}` };
     }
@@ -389,10 +524,14 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
         worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
       }
+      const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
+      if (capabilities.archived) return permanent("the repository is archived");
+      if (capabilities.defaultBranch !== job.baseBranch) return permanent("the configured base no longer matches the repository default branch");
+      if (capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return permanent("the existing installation lacks publication grants");
       const problem = await deps.checkWorker(job.hostId, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
       return problem ? permanent(problem) : worker;
     } catch (error) {
-      return { error: message(error), permanent: false };
+      return { error: message(error), permanent: error instanceof GitHubSetupError || error instanceof GitHubPermanentError };
     }
   }
 
@@ -401,7 +540,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     try {
       const thread = await bb.sdk.threads.get({ threadId });
       if (thread.archivedAt !== null || thread.deletedAt !== null) return { kind: "gone" };
-      if (thread.status === "error") return { kind: "failed", error: "the thread is in an error state" };
+      if (thread.status === "error" || thread.queuedMessageCount > 0) {
+        const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+        const retry = queued.filter((item) => item.payload.kind === "retry").map((item) => item.sendAt ?? clock() + SWEEP_MS);
+        if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt: retry.length ? Math.max(...retry) : null };
+        if (queued.length) return { kind: "active" };
+      }
       if (thread.status === "idle") return { kind: "idle", since: thread.updatedAt };
       return { kind: "active" };
     } catch (error) {
@@ -419,7 +563,29 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     if (first.includes("children")) facts.children = childFacts(job);
     if (first.includes("blockers") && job.parentId) {
-      facts.blockers = store.polledChildren(job.parentId)?.find((child) => child.number === job.issue)?.blockedBy ?? [];
+      const children = store.polledChildren(job.parentId) ?? [];
+      const blockers = children.find((child) => child.number === job.issue)?.blockedBy ?? [];
+      const localNumber = (ref: string) => Number(new RegExp(`^(?:${job.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})?#(\\d+)$`).exec(ref)?.[1] ?? NaN);
+      const visits = new Set<number>();
+      const path = new Set<number>();
+      const cycle = (number: number): boolean => {
+        if (path.has(number)) return true;
+        if (visits.has(number)) return false;
+        visits.add(number); path.add(number);
+        for (const ref of children.find((child) => child.number === number)?.blockedBy ?? []) if (cycle(localNumber(ref))) return true;
+        path.delete(number); return false;
+      };
+      if (cycle(job.issue)) facts.prerequisiteProblem = "prerequisite dependency cycle";
+      facts.prerequisites = [];
+      facts.blockers = blockers.filter((ref) => {
+        const number = localNumber(ref);
+        const child = children.find((candidate) => candidate.number === number);
+        if (!child) { facts.prerequisiteProblem = `prerequisite ${ref} is outside this parent job's owned scope`; return false; }
+        const prerequisite = store.open(job.repo, number) ?? store.children(job.parentId!).find((candidate) => candidate.issue === number);
+        if (prerequisite && TERMINAL.has(prerequisite.phase.state) && prerequisite.control.disposition !== "no-change" && prerequisite.control.disposition !== "merged") { facts.prerequisiteProblem = `prerequisite ${ref} failed`; return false; }
+        if (prerequisite?.control.readiness && prerequisite.pushedSha) facts.prerequisites = [...(facts.prerequisites ?? []), { issue: prerequisite.issue, branch: prerequisite.branch, sha: prerequisite.pushedSha }];
+        return child.state !== "closed" && !prerequisite?.control.readiness && prerequisite?.control.disposition !== "no-change" && prerequisite?.control.disposition !== "merged";
+      });
     }
     const wanted = [...first, ...moreFacts(job, facts)];
     if (wanted.includes("rounds")) facts.rounds = store.roundSummaries(job.id);
@@ -429,6 +595,12 @@ export function createIssues(deps: IssuesDeps): Issues {
         .branchSha(job.branch)
         .then((head) => ({ head }))
         .catch((error) => (bb.log.warn(`pstack issues: ${job.id}: could not read ${job.branch}: ${message(error)}`), null));
+    }
+    if (wanted.includes("review") && job.pr) {
+      try {
+        const snapshot = await github.repo(job.repo).reviewSnapshot(job.pr.number);
+        facts.review = snapshot ? reviewObservation(job, snapshot) : { kind: "observed", target: { pr: job.pr.number, head: job.pushedSha!, base: job.pushedSha! }, state: "closed", draft: true, complete: true, ready: false, pending: false, reasons: ["pull request missing"], fingerprint: "missing" };
+      } catch (error) { facts.review = { kind: "unavailable", reason: message(error) }; }
     }
     if (wanted.includes("worker")) facts.worker = await resolveWorker(job);
     if (wanted.includes("thread")) facts.thread = await threadFact(job.threadId);
@@ -450,7 +622,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const created = store.children(parent.id);
     return polled.map((child) => {
       const job = store.open(parent.repo, child.number) ?? created.find((row) => row.issue === child.number);
-      return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged" } : null };
+      return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged", ready: job.control.readiness !== null, disposition: job.control.disposition, branch: job.branch, sha: job.pushedSha } : null };
     });
   }
 
@@ -471,7 +643,9 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!("effects" in phase)) return;
         const claimed = store.write(job.id, job.version, { phase: { ...phase, tries: phase.tries + 1, firstAt: phase.firstAt ?? clock(), leaseUntil: action.leaseUntil } }, clock());
         if (!claimed) return;
-        const outcome = await runEffect(claimed, action.effect, action.mode, action.leaseUntil - SETTLE_MARGIN_MS);
+        const decoration = ["labels", "reply", "request-review", "status"].includes(action.effect.op);
+        if (decoration) store.decorate(claimed, action.effect);
+        const outcome = decoration ? done() : await runEffect(claimed, action.effect, action.mode, action.leaseUntil - SETTLE_MARGIN_MS);
         // A lost write here means stop replaced the outbox while the effect ran; its result is dropped on purpose.
         store.write(job.id, claimed.version, settle(claimed, outcome, clock()), clock());
         return;
@@ -483,6 +657,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     for (let step = 0; step < MAX_STEPS; step++) {
       const job = store.get(id);
       if (!job) return;
+      const pending = store.pendingSubmissions(id);
+      if (pending.length > 0 && (REPORTING.has(job.phase.state) || TERMINAL.has(job.phase.state))) {
+        const result = await evaluateSubmission(job, pending[0]!);
+        if (result.code === "pending") return;
+        continue;
+      }
       const action = plan(job, await gather(job));
       if (!action || action.type === "sleep") return;
       await apply(job, action);
@@ -534,11 +714,20 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!tree.ok) return { unavailable: tree.error };
       const remoteHead = job.round === 1 ? null : await github.repo(job.repo).branchSha(job.branch);
       if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub` };
+      const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
+      const comparisonSha = job.round === 1 ? capabilities.defaultHead : job.roundBase ?? remoteHead ?? capabilities.defaultHead;
+      const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha });
+      if (inspected.kind !== "inspected") return { unavailable: `missing commit object ${inspected.sha}` };
+      const gate = job.threadId ? deps.prGate(job.threadId) : { pass: false as const, reason: "the job has no worker thread" };
+      const finalTree = await worktree(job);
+      if (!finalTree.ok || finalTree.headSha !== tree.headSha || finalTree.dirty !== tree.dirty) return { unavailable: "the worker changed its snapshot while the report was being inspected" };
       return {
         now: clock(),
+        baseSha: capabilities.defaultHead,
+        inspected: { ...inspected, sha: inspected.sha as Sha, comparisonSha: inspected.comparisonSha as Sha },
         worktree: { headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead, commits: tree.commits },
         remoteHead,
-        gate: job.threadId ? deps.prGate(job.threadId) : { pass: false, reason: "the job has no worker thread" },
+        gate,
         titleConvention: await github.repo(job.repo).titleConvention(),
         listed: store.roundFeedback(job.id, job.round),
       };
@@ -551,9 +740,9 @@ export function createIssues(deps: IssuesDeps): Issues {
    * The job a thread's metadata names, null inside when that job does not exist, or null when the metadata names none.
    * Only a pointer: the store's binding decides who may report.
    */
-  async function namedJob(threadId: string): Promise<{ job: Job | null } | null> {
+  async function namedJob(threadId: string): Promise<{ job: Job | null; epoch: number } | null> {
     const metadata = IssueMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId }).catch(() => null));
-    return metadata.success ? { job: store.get(metadata.data.jobId as JobId) } : null;
+    return metadata.success ? { job: store.get(metadata.data.jobId as JobId), epoch: metadata.data.epoch } : null;
   }
 
   /** A worker in review publishes a merge commit; see acceptSync. */
@@ -579,68 +768,72 @@ export function createIssues(deps: IssuesDeps): Issues {
       return { ok: false, code: "rejected", message: ["Sync refused:", ...reasons.map((reason) => `- ${reason}`)].join("\n") };
     }
     background(tick(bound.id));
-    return { ok: true, message: `Sync accepted. pstack pushes ${short(facts.worktree.headSha)} to ${bound.branch}; the pull request stays in review.` };
+    return { ok: true, message: `Sync accepted. pstack pushes ${short(facts.worktree.headSha)} to ${bound.branch}; checks resume before review.` };
   }
 
-  async function report(threadId: string, text: string): Promise<ReportResult> {
-    const bound = store.byThread(threadId);
-    if (!bound) {
-      const named = (await namedJob(threadId))?.job;
-      if (!named || !awaitingThread(named)) return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can report" };
-      background(tick(named.id));
-      return { ok: false, code: "unavailable", message: "pstack has not confirmed this thread as the issue's worker yet, try again shortly" };
+  async function evaluateSubmission(job: Job, submission: Submission): Promise<{ code: string; result: ReportResult }> {
+    const reject = (code: string, explanation: string) => ({ code, result: { ok: false, code, message: explanation } as const });
+    if (submission.epoch !== job.control.epoch || submission.round !== job.round || submission.threadId !== job.threadId) {
+      if (awaitingThread(job) && submission.epoch === job.control.epoch) return reject("pending", "Report saved pending worker confirmation.");
+      store.finishSubmission(submission.id, "stale worker or round", clock());
+      return reject("stale_report", "The report is retained but belongs to a retired worker or round.");
     }
-    if (isTransit(bound.phase.state) && REPORTING.has(TRANSIT[bound.phase.state])) {
-      return { ok: false, code: "unavailable", message: "pstack is still starting this round, try again shortly" };
+    if (!REPORTING.has(job.phase.state)) {
+      store.finishSubmission(submission.id, "job no longer reporting", clock());
+      return reject("not_working", `job ${job.id} is ${job.phase.state}`);
     }
-    if (!REPORTING.has(bound.phase.state)) {
-      const sync = bound.phase.state === "review" ? " To publish a merge that resolves a conflict with the base branch, run `bb pstack issues sync` instead." : "";
-      return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report.${sync}` };
+    let parsed: ReturnType<typeof parseReport>;
+    try { parsed = parseReport(job, JSON.parse(submission.raw)); }
+    catch (error) { parsed = { ok: false, code: "invalid_report", message: `the report is not JSON: ${message(error)}` }; }
+    if (!parsed.ok) {
+      const result = reject(parsed.code, parsed.message);
+      if (parsed.code === "other_round") { store.finishSubmission(submission.id, JSON.stringify(result.result), clock()); return result; }
+      store.write(job.id, job.version, { ...rejectReport(job, [parsed.message]), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());
+      return result;
     }
-    let parsed: ParsedReport;
-    try {
-      const result = parseReport(bound, JSON.parse(text));
-      if (!result.ok) return { ok: false, code: result.code, message: result.message };
-      parsed = result.parsed;
-    } catch (error) {
-      return { ok: false, code: "invalid_report", message: `the report is not JSON: ${message(error)}` };
+    if (parsed.parsed.report.outcome === "failure") {
+      const report = parsed.parsed.report;
+      let headSha: Sha | null = null;
+      let control = job.control;
+      try {
+        const tree = await worktree(job);
+        if (tree.ok) { headSha = tree.headSha; control = { ...control, workspace: { environmentId: tree.environmentId, hostId: job.hostId, path: tree.path, branch: tree.branch }, preservation: tree.dirty ? "dirty and untracked work retained" : "local commits retained" }; }
+        else control = { ...control, preservation: tree.error };
+      } catch (error) { control = { ...control, preservation: message(error) }; }
+      const change = stick({ ...job, control }, report.reason);
+      const accepted: AcceptedReport = { ...report, headSha, acceptedAt: clock() };
+      const result = { ok: true, message: "Failure report saved. The original work and reason are preserved." } as const;
+      const written = store.write(job.id, job.version, { ...change, control: { ...control, disposition: "failure", readiness: null }, report: accepted, evaluation: { submissionId: submission.id, result: JSON.stringify(result) } }, clock());
+      return written ? { code: "accepted", result } : reject("pending", "Report saved for evaluation after the current transition.");
     }
-    const facts = await reportFacts(bound);
-    if ("unavailable" in facts) return { ok: false, code: "unavailable", message: `pstack could not check the report yet, try again shortly: ${facts.unavailable}` };
+    const facts = await reportFacts(job);
+    if ("unavailable" in facts) return reject("pending", `Report saved. Evaluation resumes automatically when dependencies recover. ${facts.unavailable}`);
+    const verdict = acceptReport(job, parsed.parsed, facts);
+    const result: ReportResult = verdict.ok ? { ok: true, message: `Report accepted. pstack pushes ${short(facts.worktree.headSha)} to ${job.branch}; publication and verification continue automatically.` } : { ok: false, code: "rejected", message: "moved" in verdict ? `Remote moved to ${verdict.moved}. Merge it and submit current evidence.` : ["Report rejected:", ...verdict.reasons.map((reason) => `- ${reason}`)].join("\n") };
+    const written = store.write(job.id, job.version, { ...verdict.change, evaluation: { submissionId: submission.id, result: JSON.stringify(result), snapshot: { worktree: facts.worktree, gate: facts.gate, inspected: facts.inspected, baseSha: facts.baseSha } } }, clock());
+    return written ? { code: verdict.ok ? "accepted" : "rejected", result } : reject("pending", "Report saved for automatic reevaluation.");
+  }
 
-    const written = writeFresh(bound.id, (job) => {
-      if (!REPORTING.has(job.phase.state) || job.round !== bound.round) return null;
-      const verdict = acceptReport(job, parsed, facts);
-      return { change: verdict.change, result: verdict };
-    });
-    if (!written) return { ok: false, code: "not_working", message: `job ${bound.id} is no longer waiting for a report` };
-    const outcome = written.result;
-    background(tick(bound.id));
-    if ("moved" in outcome) {
-      return {
-        ok: false,
-        code: "remote_moved",
-        message: `\`${bound.branch}\` on GitHub moved to ${short(outcome.moved)} since this round started. Run \`bb pstack gh fetch\`, merge \`origin/${bound.branch}\`, commit, and report again. This does not count as a rejection.`,
-      };
+  async function report(threadId: string, raw: string): Promise<ReportResult> {
+    let job = store.byThread(threadId);
+    if (!job) {
+      const candidate = await namedJob(threadId);
+      const named = candidate?.job;
+      if (!named || candidate?.epoch !== named.control.epoch || !awaitingThread(named)) return { ok: false, code: "not_issue_worker", message: "only a confirmed issue worker can report" };
+      job = named;
     }
-    if (!outcome.ok) {
-      return {
-        ok: false,
-        code: "rejected",
-        message: ["Report rejected:", ...outcome.reasons.map((reason) => `- ${reason}`), "Fix every reason and report again."].join("\n"),
-      };
+    if (!REPORTING.has(job.phase.state) && !awaitingThread(job)) return { ok: false, code: "not_working", message: `job ${job.id} is not accepting a worker report` };
+    if (awaitingThread(job)) {
+      const candidate = await namedJob(threadId);
+      if (!candidate || candidate.epoch !== job.control.epoch) return { ok: false, code: "stale_report", message: "the worker epoch is retired" };
     }
-    const sha = short(facts.worktree.headSha);
-    if (parsed.round === "feedback") {
-      const push = parsed.report.outcome === "changes" ? `pushes ${sha} to ${bound.branch}, ` : "";
-      return { ok: true, message: `Report accepted. pstack ${push}posts your replies, and asks the reviewers to look again.` };
+    const submission = store.submit(job, threadId, raw, clock());
+    if (submission.result) {
+      try { return JSON.parse(submission.result) as ReportResult; } catch { return { ok: false, code: "stale_report", message: submission.result }; }
     }
-    const messages = {
-      changes: `Report accepted. pstack pushes ${sha} to ${bound.branch} and opens a draft pull request.`,
-      "needs-info": "Report accepted. pstack posts your questions on the issue.",
-      "no-change": "Report accepted. pstack posts your reason on the issue and ends the job.",
-    } as const;
-    return { ok: true, message: messages[parsed.report.outcome] };
+    const evaluated = await evaluateSubmission(job, submission);
+    background(tick(job.id).then(deliverStatuses));
+    return evaluated.code === "pending" ? { ok: true, message: evaluated.result.message } : evaluated.result;
   }
 
   async function stop(id: JobId, by: string): Promise<boolean> {
@@ -662,7 +855,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const named = await namedJob(threadId);
     if (!named) return;
     const { job } = named;
-    if (job && awaitingThread(job)) return tick(job.id);
+    if (job && awaitingThread(job) && named.epoch === job.control.epoch) return tick(job.id);
     if (job && ("effects" in job.phase ? job.phase.effects.some((effect) => effect.op === "stop-thread") : false)) return;
     await bb.sdk.threads.stop({ threadId }).catch((error) => {
       if (!isMissing(error)) throw error;
@@ -819,10 +1012,11 @@ export function createIssues(deps: IssuesDeps): Issues {
       try {
         if (clock() >= nextPoll) {
           nextPoll = clock() + POLL_MS;
-          await poll();
+          await poll().catch((error) => bb.log.warn(message(error)));
         }
         // Not awaited: a job's slow push must not hold back polling or the next pass. tick() runs one reconcile per job.
         background(tickDue());
+        background(deliverStatuses());
       } catch (error) {
         bb.log.error(`pstack issues: ${message(error)}`);
       }
@@ -900,8 +1094,9 @@ export function createIssues(deps: IssuesDeps): Issues {
       return job ? workerInstructions(job) : null;
     },
     async sweep() {
-      await poll();
+      await poll().catch((error) => bb.log.warn(message(error)));
       await tickDue();
+      await deliverStatuses();
       await Promise.all([...running.values()].map((entry) => entry.done.catch(() => {})));
     },
     stop,

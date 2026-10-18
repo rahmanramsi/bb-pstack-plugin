@@ -62,8 +62,9 @@ function fixture() {
   sh(worktree, "config", "credential.helper", `!f() { cat >> ${join(loot, "credential")}; env >> ${join(loot, "credential")}; }; f`);
 
   const harness = experimental_createHostEntryHarness(entry, { experimental_paths: { dataDir: join(root, "data"), tempDir: temp } });
+  const baseSha = sh(worktree, "rev-parse", "HEAD");
   const push = (sha: string, expectedRemoteSha: string | null, branch = BRANCH) =>
-    harness.experimental_call("push", { worktreePath: worktree, remoteUrl: `file://${remote}`, branch, sha, expectedRemoteSha, token: TOKEN });
+    harness.experimental_call("push", { worktreePath: worktree, remoteUrl: `file://${remote}`, branch, sha, expectedRemoteSha, comparisonSha: expectedRemoteSha ?? baseSha, workflows: false, token: TOKEN });
   const remoteHead = () => {
     try {
       return sh(root, "--git-dir", remote, "rev-parse", `refs/heads/${BRANCH}`);
@@ -71,7 +72,7 @@ function fixture() {
       return null;
     }
   };
-  return { root, remote, evil, worktree, temp, loot, push, remoteHead, harness };
+  return { root, remote, evil, worktree, temp, loot, push, remoteHead, harness, baseSha };
 }
 
 test("push sends the reported commit from a scratch repository the worktree's config and hooks never touch", async () => {
@@ -142,7 +143,7 @@ test("a push the remote refuses is rejected with the remote's reason, not retrie
 test("pushBranch pushes any plain branch name and still never rewrites it", async () => {
   const f = fixture();
   const call = (sha: string, expectedRemoteSha: string | null, branch: string) =>
-    f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch, sha, expectedRemoteSha, token: TOKEN });
+    f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch, sha, expectedRemoteSha, comparisonSha: f.baseSha, workflows: false, token: TOKEN });
   const first = commit(f.worktree, "a.txt", "one\n");
   assert.deepEqual(await call(first, null, "feat/thing"), { status: "pushed", sha: first });
   assert.equal(sh(f.root, "--git-dir", f.remote, "rev-parse", "refs/heads/feat/thing"), first);
@@ -156,7 +157,7 @@ test("pushBranch pushes any plain branch name and still never rewrites it", asyn
   const rebased = commit(f.worktree, "r.txt", "rebased\n");
   const diverged = await call(rebased, first, "feat/thing");
   assert.equal(diverged.status === "rejected" && diverged.reason, "not-descendant");
-  const leased = (expected: string) => f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: "feat/thing", sha: rebased, expectedRemoteSha: expected, token: TOKEN, rewrite: true });
+  const leased = (expected: string) => f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: "feat/thing", sha: rebased, expectedRemoteSha: expected, comparisonSha: f.baseSha, workflows: false, token: TOKEN, rewrite: true });
   assert.equal(((await leased("c".repeat(40))) as { reason?: string }).reason, "stale-remote", "a rewrite still needs the remote at the expected commit");
   assert.deepEqual(await leased(first), { status: "pushed", sha: rebased });
   assert.equal(sh(f.root, "--git-dir", f.remote, "rev-parse", "refs/heads/feat/thing"), rebased);

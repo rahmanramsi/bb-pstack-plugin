@@ -146,7 +146,7 @@ export function progressBody(children: readonly ChildFact[]): string {
       : !child.job
         ? "not started"
         : TERMINAL.has(child.job.state)
-          ? `${child.job.merged ? "merged" : child.job.state}, needs a person`
+          ? `${child.job.merged ? "merged" : child.job.disposition === "no-change" ? "no change needed" : child.job.state}`
           : child.job.state === "queued" || child.job.state === "review"
             ? CHILD_STATE[child.job.state]
             : CHILD_STATE.open;
@@ -161,7 +161,7 @@ const AUTONOMOUS_WORK = [
   "Choose reasonable defaults from the issue, repository conventions, and existing behavior. Make reversible implementation, design, and scope decisions yourself, including when a playbook would normally ask the human. Pass these instructions to any delegates.",
   "Deliver the smallest useful baseline as a draft pull request, even when some requirements remain uncertain. Put material assumptions, remaining limitations, and unresolved product choices in the pull request description so the reviewer can decide there. Continue with the parts you can implement.",
   "Run the relevant checks and report their actual results. Do not claim unperformed checks passed or bypass report validation. This authorizes work in the assigned branch and submission through the report command, not merging, deployment, or destructive external actions.",
-  "Use `needs-info` only when a missing prerequisite prevents any useful baseline, such as inaccessible source code or a required external interface with no usable contract. Report the concrete blocker and what is needed in `questions` on GitHub, never as a question in this thread. Uncertain preferences, several valid approaches, or incomplete acceptance criteria are not blockers.",
+  "If an essential prerequisite prevents any useful baseline, report `failure` with a concrete `reason`, the work you preserved, and checks attempted. Failure may retain dirty or untracked files. Unavailable tooling is a failure or a disclosed limitation, never evidence of no-change. Report no-change only with issue-specific evidence that no implementation is needed.",
 ].join("\n");
 
 /** The first message. It stands alone, so a replacement thread or a compacted context can act on it. */
@@ -174,6 +174,8 @@ export function workerPrompt(job: Job): string {
     fenced(`${job.snapshot.title}\n\n${job.snapshot.body.trim() || "(no description)"}`),
     "",
     ...parentSection(job),
+    ...job.control.prerequisites.map((item) => `Include prerequisite #${item.issue}. Fetch with bb pstack gh fetch, then merge origin/${item.branch} at ${item.sha} before implementing and verifying this issue.`),
+    ...(job.progress ? ["## Integration", "", fenced(job.progress), ""] : []),
     "## Rules",
     "",
     AUTONOMOUS_WORK,
@@ -192,7 +194,7 @@ export function workerPrompt(job: Job): string {
     REPORT_EXAMPLE,
     "```",
     "",
-    "`outcome` is `changes` (with `pr`), `no-change` (the issue needs no code change; `summary` is the reason posted on the issue), or `needs-info` (with `questions` posted on the issue). Every outcome lists `verification`: each check you ran and its result.",
+    "`outcome` is `changes` (with `pr`), `no-change` (the issue needs no code change; `summary` is the reason posted on the issue), or `failure` (with a concrete `reason` and preserved work). Every outcome lists `verification`: each check you ran and its result.",
     "A rejected report exits 1 with every reason. Fix them and report again.",
   ].join("\n");
 }
@@ -285,9 +287,9 @@ export function workerInstructions(job: Job): string {
   return [
     `This thread works on GitHub issue #${job.issue} in ${job.repo} for pstack.`,
     AUTONOMOUS_WORK,
-    ...(job.round > 1 ? ["In a feedback round, `needs-info` is not available. Put any remaining blocker or decision in `replies` on the pull request and complete the other feedback."] : []),
+    "No report requests information. Resolve ordinary uncertainty and deliver a useful baseline, or report a concrete failure.",
     "`bb pstack issues report --file <path>` is this run's built-in PR tool: pstack validates the report, pushes the reported commit, opens or updates the pull request, and posts your replies to review comments.",
-    "Never run `git push`, never use `gh`, and never switch or create branches. Commit everything before reporting. After the first push, add commits and never rewrite pushed history.",
+    "Never run `git push`, never use `gh`, and never switch or create branches. Commit changes before reporting success. A failure report preserves dirty files. After the first push, add commits and never rewrite pushed history.",
     "Fetch with `bb pstack gh fetch`; plain `git fetch` has no GitHub credentials. While the pull request is in review with no feedback round open, publish a merge that resolves a conflict with `bb pstack issues sync`.",
     ...(job.snapshot.parent ? [`This issue is a sub-issue of #${job.snapshot.parent.number}. Resolve only #${job.issue}; never close the parent.`] : []),
     "The pull request title and body describe the change for a reviewer who never saw this thread: follow `.github/pull_request_template.md` when it exists, else the descriptions section of Opening a PR, with no process context.",
@@ -303,4 +305,20 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
     ...(gate && !gate.pass && job.pushedSha === null ? [`A \`changes\` report needs \`bb pstack gate pr\` to pass, and it fails: ${gate.reason}`] : []),
     `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}.`,
   ].join("\n");
+}
+
+export function statusBody(job: Job): string {
+  const result = job.control.disposition;
+  const status = result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.phase.state === "review" ? "Ready for review" : job.phase.state;
+  return [
+    `Issue #${job.issue}: ${status}`,
+    job.control.policyLimitation,
+    job.progress,
+    job.report?.summary,
+    job.error ? `Reason: ${job.error}` : null,
+    job.pr ? `Pull request: ${job.pr.url}` : null,
+    job.report ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : null,
+    `Branch: \`${job.branch}\``,
+    ...(job.report?.verification ?? []).map((line) => `- ${line}`),
+  ].filter(Boolean).join("\n\n");
 }

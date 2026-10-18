@@ -3,9 +3,13 @@
  * that breaks an invariant the types encode throws: that is a bug, not input. Every job write is one UPDATE guarded by
  * the row's version, in one transaction with the round history and feedback rows it implies.
  */
+import { createHash } from "node:crypto";
+import { statusBody } from "./text.ts";
 import type { Db } from "../store.ts";
 import {
   TERMINAL,
+  initialControl,
+  type Control,
   TRANSIT,
   WATCHED,
   branchFor,
@@ -99,7 +103,22 @@ export type IssueWrites = {
   saveChildren(parentId: JobId, children: readonly SubIssue[], now: number): void;
 };
 
-export type IssueStore = IssueReads & IssueWrites;
+export type Submission = { id: number; jobId: JobId; epoch: number; round: number; threadId: string; raw: string; result: string | null };
+export type Decoration = { effect: Effect; nextAt: number; attempts: number; error: string | null };
+export type IssueStatus = { repo: RepoName; issue: number; jobId: JobId; generation: number; revision: number; body: string; deliveredRevision: number; leaseUntil: number | null; nextAt: number; error: string | null; decorations: Decoration[] };
+export type DurableDelivery = {
+  submit(job: Job, threadId: string, raw: string, now: number): Submission;
+  pendingSubmissions(id: JobId): Submission[];
+  finishSubmission(id: number, result: string, now: number): void;
+  statuses(now: number): IssueStatus[];
+  delivery(repo: RepoName, issue: number): { pending: boolean; error: string | null };
+  claimStatus(status: IssueStatus, now: number): boolean;
+  settleStatus(status: IssueStatus, input: { error: string | null; nextAt: number; release?: boolean }): void;
+  decorate(job: Job, effect: Effect): void;
+  claimDecoration(status: IssueStatus, key: string): number | null;
+  settleDecoration(status: IssueStatus, key: string, error: string | null, nextAt: number): void;
+};
+export type IssueStore = IssueReads & IssueWrites & DurableDelivery;
 
 type JobRow = {
   id: string;
@@ -137,6 +156,7 @@ type JobRow = {
   round_base: string | null;
   parent_id: string | null;
   progress: string | null;
+  control_json: string;
 };
 
 type FeedbackRow = {
@@ -187,6 +207,7 @@ function parsePhase(row: JobRow): Phase {
 
 function parse(row: JobRow): Job {
   return {
+    control: { ...initialControl(), ...JSON.parse(row.control_json) as Partial<Control> },
     id: row.id as JobId,
     version: row.version,
     repo: row.repo as RepoName,
@@ -219,6 +240,7 @@ function parse(row: JobRow): Job {
 
 function columns(change: Change): Record<string, unknown> {
   const set: Record<string, unknown> = {};
+  if (change.control) set.control_json = JSON.stringify(change.control);
   if (change.phase) {
     const phase = change.phase;
     const transit = "effects" in phase;
@@ -261,6 +283,20 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND issue = ? AND state NOT IN (${placeholders(TERMINAL_LIST)})`)
       .get(repo, issue, ...TERMINAL_LIST) as JobRow | undefined;
 
+  function projectStatus(job: Job): void {
+    if (job.phase.state === "ignored") return;
+    const body = statusBody(job);
+    db.prepare(`INSERT INTO issue_status (repo, issue, job_id, generation, revision, body) VALUES (?, ?, ?, ?, 1, ?)
+      ON CONFLICT(repo,issue) DO UPDATE SET job_id = excluded.job_id, generation = excluded.generation,
+        revision = issue_status.revision + 1, body = excluded.body, next_at = 0,
+        decorations_json = CASE WHEN excluded.generation > issue_status.generation THEN '[]' ELSE issue_status.decorations_json END
+      WHERE excluded.generation > issue_status.generation OR
+        (excluded.job_id = issue_status.job_id AND excluded.body != issue_status.body)`)
+      .run(job.repo, job.issue, job.id, job.generation, body);
+  }
+
+  for (const row of db.prepare("SELECT * FROM issue_jobs ORDER BY generation, created_at").all() as JobRow[]) projectStatus(parse(row));
+
   const insert = db.transaction((job: NewJob, now: number): Job | null => {
     if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
     if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
@@ -271,8 +307,8 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     const generation = earlier + 1;
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, base_branch, branch, state, error, created_at, updated_at, parent_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         project_id, host_id, base_branch, branch, state, error, created_at, updated_at, parent_id, runtime_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     ).run(
       job.id,
       job.repo,
@@ -292,7 +328,9 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       now,
       job.parentId ?? null,
     );
-    return get(job.id);
+    const inserted = get(job.id);
+    if (inserted) projectStatus(inserted);
+    return inserted;
   });
 
   const addFeedback = db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
@@ -324,7 +362,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     due(now) {
       const rows = db
         .prepare(
-          `SELECT id FROM issue_jobs WHERE state IN (${placeholders(WATCHED)})
+          `SELECT id FROM issue_jobs WHERE id IN (SELECT job_id FROM issue_submissions WHERE evaluated_at IS NULL) OR state IN (${placeholders(WATCHED)})
              OR (state IN (${placeholders(TRANSIT_LIST)}) AND coalesce(effect_lease_until, 0) <= ? AND coalesce(effect_next_at, 0) <= ?)
            ORDER BY created_at, id`,
         )
@@ -380,13 +418,13 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       }
       const set = columns(change);
       const names = Object.keys(set);
-      const assignments = [...names.map((name) => `${name} = ?`), "version = version + 1", "updated_at = ?"].join(", ");
+      const assignments = [...names.map((name) => `${name} = ?`), "version = version + 1", "runtime_revision = runtime_revision + 1", "updated_at = ?"].join(", ");
       const changed = db.prepare(`UPDATE issue_jobs SET ${assignments} WHERE id = ? AND version = ?`).run(...Object.values(set), now, id, version).changes;
       if (changed !== 1) return null;
       const job = get(id)!;
       if (change.startRound) {
         const { ordinal, kind, baseSha, feedback } = change.startRound;
-        db.prepare("INSERT INTO issue_rounds (job_id, ordinal, kind, started_at, base_sha) VALUES (?, ?, ?, ?, ?)").run(id, ordinal, kind, now, baseSha);
+        db.prepare("INSERT INTO issue_rounds (job_id, ordinal, kind, started_at, base_sha, cause, target_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, ordinal, kind, now, baseSha, change.startRound.cause ?? kind, change.startRound.target ? JSON.stringify(change.startRound.target) : null);
         const send = db.prepare("UPDATE issue_feedback SET round = ? WHERE job_id = ? AND kind = ? AND github_id = ? AND round IS NULL");
         for (const ref of feedback) {
           if (send.run(ordinal, id, ref.kind, ref.id).changes !== 1) throw new Error(`issue job ${id}: ${ref.kind} ${ref.id} is not pending feedback`);
@@ -399,7 +437,9 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       if (fields.length > 0) {
         db.prepare(`UPDATE issue_rounds SET ${fields.map((name) => `${name} = ?`).join(", ")} WHERE job_id = ? AND ordinal = ?`).run(...Object.values(history), id, job.round);
       }
-      if (change.finishRound) db.prepare("UPDATE issue_rounds SET finished_at = ? WHERE job_id = ? AND ordinal = ? AND finished_at IS NULL").run(now, id, job.round);
+      if (change.finishRound) db.prepare("UPDATE issue_rounds SET finished_at = ?, outcome_json = coalesce(outcome_json, ?) WHERE job_id = ? AND ordinal = ? AND finished_at IS NULL").run(now, JSON.stringify({ state: job.phase.state, disposition: job.control.disposition, report: job.report?.outcome ?? null }), id, job.round);
+      if (change.evaluation) db.prepare("UPDATE issue_submissions SET evaluated_at = ?, result = ?, snapshot_json = ? WHERE id = ? AND evaluated_at IS NULL").run(now, change.evaluation.result, change.evaluation.snapshot ? JSON.stringify(change.evaluation.snapshot) : null, change.evaluation.submissionId);
+      projectStatus(job);
       return job;
     }),
     addFeedback,
@@ -439,7 +479,65 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       ).run(id, now, error);
     },
   };
-  return { ...reads, ...notifying(writes, onChange) };
+  const submission = (row: { id: number; job_id: string; epoch: number; round: number; thread_id: string; raw: string; result: string | null }): Submission => ({ id: row.id, jobId: row.job_id as JobId, epoch: row.epoch, round: row.round, threadId: row.thread_id, raw: row.raw, result: row.result });
+  const deliveries: DurableDelivery = {
+    submit(job, threadId, raw, now) {
+      const hash = createHash("sha256").update(raw).update(`\0${job.version}`).digest("hex");
+      db.prepare("INSERT OR IGNORE INTO issue_submissions (job_id, epoch, round, thread_id, hash, raw, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(job.id, job.control.epoch, job.round, threadId, hash, raw, now);
+      return submission(db.prepare("SELECT * FROM issue_submissions WHERE job_id = ? AND epoch = ? AND round = ? AND thread_id = ? AND hash = ?").get(job.id, job.control.epoch, job.round, threadId, hash) as Parameters<typeof submission>[0]);
+    },
+    pendingSubmissions(id) {
+      return (db.prepare("SELECT * FROM issue_submissions WHERE job_id = ? AND evaluated_at IS NULL ORDER BY id").all(id) as Parameters<typeof submission>[0][]).map(submission);
+    },
+    finishSubmission(id, result, now) {
+      db.prepare("UPDATE issue_submissions SET evaluated_at = ?, result = ? WHERE id = ? AND evaluated_at IS NULL").run(now, result, id);
+    },
+    delivery(repo, issue) {
+      const row = db.prepare("SELECT revision, delivered_revision, error, decorations_json FROM issue_status WHERE repo = ? AND issue = ?").get(repo, issue) as { revision: number; delivered_revision: number; error: string | null; decorations_json: string } | undefined;
+      if (!row) return { pending: false, error: null };
+      const decorations = JSON.parse(row.decorations_json) as Decoration[];
+      return { pending: row.revision > row.delivered_revision || decorations.length > 0, error: row.error ?? decorations.find((item) => item.error)?.error ?? null };
+    },
+    statuses(now) {
+      return (db.prepare("SELECT * FROM issue_status WHERE next_at <= ? AND coalesce(lease_until,0) <= ?").all(now, now) as { repo: string; issue: number; job_id: string; generation: number; revision: number; body: string; delivered_revision: number; lease_until: number | null; next_at: number; error: string | null; decorations_json: string }[]).map((row) => ({ repo: row.repo as RepoName, issue: row.issue, jobId: row.job_id as JobId, generation: row.generation, revision: row.revision, body: row.body, deliveredRevision: row.delivered_revision, leaseUntil: row.lease_until, nextAt: row.next_at, error: row.error, decorations: JSON.parse(row.decorations_json) as Decoration[] }));
+    },
+    claimStatus(status, now) {
+      const leaseUntil = now + 60_000;
+      const claimed = db.prepare("UPDATE issue_status SET lease_until = ? WHERE repo = ? AND issue = ? AND revision = ? AND coalesce(lease_until,0) <= ?").run(leaseUntil, status.repo, status.issue, status.revision, now).changes === 1;
+      if (claimed) status.leaseUntil = leaseUntil;
+      return claimed;
+    },
+    settleStatus(status, input) {
+      db.prepare("UPDATE issue_status SET delivered_revision = CASE WHEN ? IS NULL THEN max(delivered_revision,?) ELSE delivered_revision END, lease_until = CASE WHEN ? THEN NULL ELSE lease_until END, next_at = CASE WHEN revision = ? THEN ? ELSE 0 END, error = ? WHERE repo = ? AND issue = ? AND lease_until = ?")
+        .run(input.error, status.revision, input.release === false ? 0 : 1, status.revision, input.nextAt, input.error, status.repo, status.issue, status.leaseUntil);
+    },
+    decorate: db.transaction((job: Job, effect: Effect) => {
+      const row = db.prepare("SELECT job_id, decorations_json FROM issue_status WHERE repo = ? AND issue = ?").get(job.repo, job.issue) as { job_id: string; decorations_json: string } | undefined;
+      if (!row || row.job_id !== job.id) return;
+      const decorations = JSON.parse(row.decorations_json) as Decoration[];
+      if (!decorations.some((item) => item.effect.key === effect.key)) decorations.push({ effect, attempts: 0, nextAt: 0, error: null });
+      db.prepare("UPDATE issue_status SET decorations_json = ?, next_at = 0 WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), job.repo, job.issue);
+    }),
+    claimDecoration: db.transaction((status: IssueStatus, key: string): number | null => {
+      const row = db.prepare("SELECT decorations_json FROM issue_status WHERE repo = ? AND issue = ? AND job_id = ? AND lease_until = ?").get(status.repo, status.issue, status.jobId, status.leaseUntil) as { decorations_json: string } | undefined;
+      if (!row) return null;
+      const decorations = JSON.parse(row.decorations_json) as Decoration[];
+      const item = decorations.find((candidate) => candidate.effect.key === key);
+      if (!item) return null;
+      const previous = item.attempts;
+      item.attempts += 1;
+      db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ? AND job_id = ? AND lease_until = ?").run(JSON.stringify(decorations), status.repo, status.issue, status.jobId, status.leaseUntil);
+      return previous;
+    }),
+    settleDecoration: db.transaction((status: IssueStatus, key: string, error: string | null, nextAt: number) => {
+      const row = db.prepare("SELECT decorations_json FROM issue_status WHERE repo = ? AND issue = ? AND job_id = ?").get(status.repo, status.issue, status.jobId) as { decorations_json: string } | undefined;
+      if (!row) return;
+      const current = JSON.parse(row.decorations_json) as Decoration[];
+      const decorations = current.flatMap((item) => item.effect.key !== key ? [item] : error === null ? [] : [{ ...item, error, nextAt }]);
+      db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ? AND job_id = ?").run(JSON.stringify(decorations), status.repo, status.issue, status.jobId);
+    }),
+  };
+  return { ...reads, ...notifying(writes, onChange), ...deliveries };
 }
 
 function notifying(writes: IssueWrites, onChange: () => void): IssueWrites {

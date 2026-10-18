@@ -147,12 +147,9 @@ async function push(input: PushInput & { rewrite?: boolean | undefined }, tempDi
       }
     }
 
-    if (input.comparisonSha !== undefined || input.workflows !== undefined) {
-      if (input.comparisonSha === undefined || input.workflows === undefined) return { status: "rejected", reason: "denied", detail: "push classification is incomplete" };
-      const classified = await inspectObjects({ worktreePath: input.worktreePath, sha: input.sha, comparisonSha: input.comparisonSha }, local, signal);
-      if (classified.kind === "missing-object") return { status: "rejected", reason: "missing-commit", detail: `missing comparison object ${classified.sha}` };
-      if (classified.workflows !== input.workflows) return { status: "rejected", reason: "denied", detail: "workflow classification changed" };
-    }
+    const classified = await inspectObjects({ worktreePath: input.worktreePath, sha: input.sha, comparisonSha: input.comparisonSha }, local, signal);
+    if (classified.kind === "missing-object") return { status: "rejected", reason: "missing-commit", detail: `missing comparison object ${classified.sha}` };
+    if (classified.workflows !== input.workflows) return { status: "rejected", reason: "denied", detail: "workflow classification changed" };
     const ref = `refs/heads/${input.branch}`;
     // Ancestry is checked above unless a rewrite was asked for, so the lease forces nothing else. It makes the
     // remote-state check atomic: an empty expected value means the branch must not exist yet.
