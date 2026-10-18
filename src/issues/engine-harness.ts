@@ -481,6 +481,12 @@ export function harness() {
     files.set("/worktrees/x/report.json", JSON.stringify(value));
     return current.run(["issues", "report", "--file", "report.json"], threadId);
   };
+  /** The worker commits a merge and asks pstack to push it while in review. */
+  const sync = async (threadId: string, tree: Partial<Worktree>) => {
+    const environmentId = threads.get(threadId)!.environmentId;
+    worktrees.set(environmentId, { ...worktrees.get(environmentId)!, ...tree });
+    return current.run(["issues", "sync"], threadId);
+  };
   const settle = async () => {
     for (let i = 0; i < 5; i++) await current.issues.sweep();
   };
@@ -560,6 +566,7 @@ export function harness() {
     only,
     byIssue,
     report,
+    sync,
     settle,
     restart,
     overlap,

@@ -288,6 +288,7 @@ export function workerInstructions(job: Job): string {
     ...(job.round > 1 ? ["In a feedback round, `needs-info` is not available. Put any remaining blocker or decision in `replies` on the pull request and complete the other feedback."] : []),
     "`bb pstack issues report --file <path>` is this run's built-in PR tool: pstack validates the report, pushes the reported commit, opens or updates the pull request, and posts your replies to review comments.",
     "Never run `git push`, never use `gh`, and never switch or create branches. Commit everything before reporting. After the first push, add commits and never rewrite pushed history.",
+    "Fetch with `bb pstack gh fetch`; plain `git fetch` has no GitHub credentials. While the pull request is in review with no feedback round open, publish a merge that resolves a conflict with `bb pstack issues sync`.",
     ...(job.snapshot.parent ? [`This issue is a sub-issue of #${job.snapshot.parent.number}. Resolve only #${job.issue}; never close the parent.`] : []),
     "The pull request title and body describe the change for a reviewer who never saw this thread: follow `.github/pull_request_template.md` when it exists, else the descriptions section of Opening a PR, with no process context.",
   ].join("\n");

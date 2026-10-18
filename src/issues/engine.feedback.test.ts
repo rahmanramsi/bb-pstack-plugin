@@ -491,3 +491,33 @@ test("`@<app> stop` from someone with write access, on the issue or the pull req
   assert.equal(g.sent.length, 0, "no round");
   assert.deepEqual(g.stopped, [job.threadId]);
 });
+
+test("a worker in review syncs a merge that resolves a conflict: pstack pushes it on top without a feedback round", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const pushed = h.pushes.at(-1)!.sha;
+  const repliesBefore = appReplies(h, pr).length;
+
+  const report = await h.report(job.threadId!, roundReport([]), { headSha: SHA4, commits: [SHA4, pushed] });
+  assert.equal(report.exitCode, 1);
+  assert.match(report.stderr!, /is review, not waiting for a report[\s\S]*bb pstack issues sync/);
+
+  const unmerged = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, SHA3] });
+  assert.equal(unmerged.exitCode, 1);
+  assert.match(unmerged.stderr!, /does not contain/);
+  const dirty = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, pushed], dirty: true });
+  assert.match(dirty.stderr!, /uncommitted/);
+
+  const merged = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, pushed], dirty: false });
+  assert.equal(merged.exitCode, 0, merged.stderr);
+  assert.match(merged.stdout!, /pushes 4444444/);
+  await h.settle();
+  const back = await h.only();
+  assert.equal(back.state, "review", back.error ?? "");
+  assert.equal(back.round, job.round, "no feedback round was used");
+  assert.deepEqual([h.pushes.at(-1)!.sha, h.pushes.at(-1)!.expectedRemoteSha], [SHA4, pushed]);
+  assert.equal(appReplies(h, pr).length, repliesBefore);
+
+  const again = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, pushed] });
+  assert.match(again.stderr!, /nothing to sync/);
+});

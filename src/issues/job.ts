@@ -821,6 +821,25 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
   return ["republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: roundBase(job) }, ...after]];
 }
 
+/**
+ * review → republishing with only a push: a worker in review that merged the base branch, or the branch's head on
+ * GitHub, publishes that merge. It is not a feedback round: nothing is answered and no review is requested. HEAD must
+ * contain the branch's head on GitHub, so the push only adds commits.
+ */
+export function acceptSync(job: Job, facts: { worktree: { headSha: Sha; dirty: boolean; commits: readonly Sha[] }; remoteHead: Sha | null }): { ok: true; change: Change } | { ok: false; reasons: string[] } {
+  const reasons: string[] = [];
+  if (job.phase.state !== "review") reasons.push(`job ${job.id} is ${job.phase.state}; sync is only for a job in review`);
+  if (facts.worktree.dirty) reasons.push("the worktree has uncommitted or untracked changes: commit or remove every change first");
+  if (facts.remoteHead === null) reasons.push(`the branch ${job.branch} is not on GitHub`);
+  else if (facts.worktree.headSha === facts.remoteHead) reasons.push(`HEAD is already ${job.branch}'s head on GitHub; there is nothing to sync`);
+  else if (!containsSha(facts.worktree, facts.remoteHead)) {
+    reasons.push(`HEAD does not contain ${facts.remoteHead.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`bb pstack gh fetch\`, merge \`origin/${job.branch}\`, and sync again`);
+  }
+  if (reasons.length > 0) return { ok: false, reasons };
+  const sha = facts.worktree.headSha;
+  return { ok: true, change: { phase: enter("republishing", [{ op: "push", key: `push:${job.id}:${sha}`, sha, expectedRemoteSha: facts.remoteHead }]), error: null } };
+}
+
 function replyEffect(job: Job, reply: RoundReport["replies"][number], answers: Feedback): Extract<Effect, { op: "reply" }> {
   const target: ReplyTarget = answers.kind === "review-comment" ? { kind: answers.kind, id: answers.id, thread: answers.inReplyTo ?? answers.id } : { kind: answers.kind, id: answers.id };
   return { op: "reply", key: `reply:${job.id}:${job.round}:${reply.kind}:${reply.commentId}`, target, body: replyText(reply.body, answers) };

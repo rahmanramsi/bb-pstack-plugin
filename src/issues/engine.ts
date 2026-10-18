@@ -16,7 +16,7 @@ import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { issueBoard, type BoardFilter, type IssueBoardSchema, type IssueSummarySchema } from "./board.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
-import {
+import { acceptSync,
   EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
@@ -556,6 +556,32 @@ export function createIssues(deps: IssuesDeps): Issues {
     return metadata.success ? { job: store.get(metadata.data.jobId as JobId) } : null;
   }
 
+  /** A worker in review publishes a merge commit; see acceptSync. */
+  async function sync(threadId: string): Promise<ReportResult> {
+    const bound = store.byThread(threadId);
+    if (!bound) return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can sync" };
+    if (bound.phase.state !== "review") return { ok: false, code: "not_review", message: `job ${bound.id} is ${bound.phase.state}; sync is only for a job in review${REPORTING.has(bound.phase.state) ? ", so report with `bb pstack issues report`" : ""}` };
+    let facts: Parameters<typeof acceptSync>[1];
+    try {
+      const tree = await worktree(bound);
+      if (!tree.ok) return { ok: false, code: "unavailable", message: `pstack could not read the worktree yet, try again shortly: ${tree.error}` };
+      facts = { worktree: tree, remoteHead: await github.repo(bound.repo).branchSha(bound.branch) };
+    } catch (error) {
+      return { ok: false, code: "unavailable", message: `pstack could not check the sync yet, try again shortly: ${message(error)}` };
+    }
+    const written = writeFresh(bound.id, (job) => {
+      const verdict = acceptSync(job, facts);
+      return verdict.ok ? { change: verdict.change, result: verdict } : null;
+    });
+    if (!written) {
+      const verdict = acceptSync(store.get(bound.id) ?? bound, facts);
+      const reasons = verdict.ok ? [`job ${bound.id} changed while pstack checked it; try again`] : verdict.reasons;
+      return { ok: false, code: "rejected", message: ["Sync refused:", ...reasons.map((reason) => `- ${reason}`)].join("\n") };
+    }
+    background(tick(bound.id));
+    return { ok: true, message: `Sync accepted. pstack pushes ${short(facts.worktree.headSha)} to ${bound.branch}; the pull request stays in review.` };
+  }
+
   async function report(threadId: string, text: string): Promise<ReportResult> {
     const bound = store.byThread(threadId);
     if (!bound) {
@@ -567,7 +593,10 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (isTransit(bound.phase.state) && REPORTING.has(TRANSIT[bound.phase.state])) {
       return { ok: false, code: "unavailable", message: "pstack is still starting this round, try again shortly" };
     }
-    if (!REPORTING.has(bound.phase.state)) return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report` };
+    if (!REPORTING.has(bound.phase.state)) {
+      const sync = bound.phase.state === "review" ? " To publish a merge that resolves a conflict with the base branch, run `bb pstack issues sync` instead." : "";
+      return { ok: false, code: "not_working", message: `job ${bound.id} is ${bound.phase.state}, not waiting for a report.${sync}` };
+    }
     let parsed: ParsedReport;
     try {
       const result = parseReport(bound, JSON.parse(text));
@@ -857,7 +886,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       background(tick(job.id));
       return job.id;
     },
-    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, stop }),
+    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
         bb.events.on(event, ({ thread }) => {
