@@ -9,7 +9,7 @@ import Database from "better-sqlite3";
 import type { PushInput, PushResult } from "../host-contract.ts";
 import { parseChoice } from "../models.ts";
 import { MIGRATIONS } from "../store.ts";
-import { createIssues } from "./engine.ts";
+import { createIssues, type IssuesDeps } from "./engine.ts";
 import { createGitHub } from "./github.ts";
 import type { JobView, RepoName } from "./job.ts";
 import { openIssueStore, type IssueStore } from "./store.ts";
@@ -289,7 +289,7 @@ export type FakeThread = {
   activeWorkflowCount?: number;
 };
 
-export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typeof Database>, now: number) => void } = {}) {
+export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typeof Database>, now: number) => void; configureDeps?: (deps: IssuesDeps) => void } = {}) {
   const clock = { now: Date.parse("2026-10-17T12:00:00Z") };
   gh = {
     issues: new Map(),
@@ -476,7 +476,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         };
       },
     });
-    const issues = createIssues({
+    const deps: IssuesDeps = {
       bb,
       store,
       github: createGitHub({ credentials: () => ({ appId: "1", privateKey }), apiUrl: base, gitUrl: "https://github.test", clock: () => clock.now }),
@@ -512,7 +512,9 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         return CATALOG.has(tuple) ? null : `${tuple}: not in the host's catalog`;
       },
       clock: () => clock.now,
-    });
+    };
+    options.configureDeps?.(deps);
+    const issues = createIssues(deps);
     const cli = defineCli({ name: "pstack", summary: "pstack", commands: issues.commands });
     return { issues, crash: () => (life.dead = true), run: (argv: string[], threadId?: string) => cli.run(argv, { threadId, cwd: "/worktrees/x" }) };
   }

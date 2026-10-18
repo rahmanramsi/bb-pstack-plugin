@@ -152,6 +152,7 @@ const BACKOFF_MS = [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
 export type EffectOutcome =
   | { kind: "publication-diverged"; remoteSha: Sha; reason: "stale-remote" | "not-descendant" }
   | { kind: "changed-target"; target: ReviewTarget }
+  | { kind: "closed"; state: Exclude<PullState, "open"> }
   /** It happened, now or earlier (the probe found it). */
   | { kind: "done"; patch: EffectPatch }
   /** The probe found no trace of it. */
@@ -541,7 +542,7 @@ function next(job: Job, facts: Facts): Action | null {
         }
         case "idle":
           if (facts.waiting) return null;
-          if (job.control.idleObservation && thread.since <= job.control.idleObservation.since) return null;
+          if (job.control.idleObservation && thread.since <= job.control.idleObservation.since && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
           if (job.nudges >= MAX_NUDGES) {
             if (job.control.idleObservation && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
             return { type: "change", change: recover(job, "the worker stopped without reporting after two reminders") };
@@ -724,6 +725,8 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
       ];
       return { phase: enter("recovering", effects), startRound: { ordinal, kind: "feedback", cause: "publication", baseSha: outcome.remoteSha, feedback: [], feedbackFrom: job.round }, roundBase: outcome.remoteSha, control: { ...control, workerContext: { round: ordinal, text, recoveryReason: null } }, nudges: 0, rejections: 0, error: `publication requires reconciliation with ${outcome.remoteSha}: ${outcome.reason}` };
     }
+    case "closed":
+      return close(job, outcome.state);
     case "fail":
       return head.op === "send-round" ? recover(job, outcome.error) : stick(job, outcome.error, outcome.publicFailure);
   }
@@ -763,7 +766,9 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
   const control = { ...job.control, readiness: null, feedbackRounds: job.control.feedbackRounds + 1, workerContext: { round: ordinal, text, recoveryReason: null } };
   if (!respawn) return { phase: enter("sending", [...draft, relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round, control };
   if (!job.worker) return stick(job, "the worker thread is gone and the job has no worker settings to start another");
-  return { ...recover({ ...job, control }, "the feedback worker is unavailable"), ...round };
+  const recovery = recover(job, "the feedback worker is unavailable");
+  if (recovery.phase?.state !== "recovering" || !recovery.control) return recovery;
+  return { ...recovery, ...round, control: { ...recovery.control, feedbackRounds: control.feedbackRounds, workerContext: control.workerContext } };
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */

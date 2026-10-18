@@ -383,7 +383,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!job.threadId) return { kind: "fail", error: "the job has no worker thread" };
         const thread = await threadFact(job.threadId);
         if (thread?.kind === "failed" && thread.retryAt && thread.retryAt > clock()) return { kind: "retry", error: thread.error, notBefore: thread.retryAt };
-        if (thread === null) return { kind: "retry", error: "worker activity is unavailable", notBefore: null };
+        if (thread === null || thread.kind === "waiting") return { kind: "retry", error: "worker activity is unavailable or awaiting queued work", notBefore: null };
         if (thread?.kind === "gone" || thread?.kind === "failed") return { kind: "fail", error: "the repair worker is unavailable" };
         try {
           // Queued behind a turn that is still running, never steered into it.
@@ -479,7 +479,8 @@ export function createIssues(deps: IssuesDeps): Issues {
     "set-draft": {
       async perform(job, effect, deadline) {
         const result = await github.repo(job.repo, until(deadline)).setDraft({ expected: effect.target, draft: effect.draft });
-        if (result.kind === "missing" || result.kind === "closed") return { kind: "fail", error: "the pull request disappeared or closed during readiness conversion" };
+        if (result.kind === "missing") return { kind: "fail", error: "the pull request disappeared during readiness conversion" };
+        if (result.kind === "closed") return result.snapshot.state === "open" ? { kind: "retry", error: "pull request closure is not confirmed", notBefore: null } : { kind: "closed", state: result.snapshot.state };
         if (result.kind === "stale") return { kind: "changed-target", target: { pr: result.snapshot.pr, head: result.snapshot.head, base: result.snapshot.base } };
         return done({ control: { ...job.control, readiness: null, reviewIntent: effect.draft ? null : effect.target } });
       },
@@ -659,10 +660,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         store.write(job.id, job.version, action.change, clock());
         return;
       case "nudge": {
-        if (!store.write(job.id, job.version, action.change, clock()) || !job.threadId) return;
-        await bb.sdk.threads
-          .send({ threadId: job.threadId, mode: "queue-if-active", input: [{ type: "text", text: action.text, mentions: [] }] })
-          .catch((error) => bb.log.warn(`pstack issues: could not nudge ${job.threadId}: ${message(error)}`));
+        store.write(job.id, job.version, { ...action.change, phase: enter("recovering", [{ op: "send-round", key: `nudge:${job.id}:${job.version}`, text: action.text }]) }, clock());
         return;
       }
       case "effect": {
