@@ -557,7 +557,8 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
     case "unknown":
       return { phase: { ...phase, leaseUntil: null, nextAt: backoff() }, error: outcome.error };
     case "retry":
-      return { phase: { ...phase, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
+      // An effect that may pass later never runs out of tries: its backoff stays at the longest step instead.
+      return { phase: { ...phase, tries: Math.min(phase.tries, BACKOFF_MS.length), leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
     case "fail":
       return stick(job, outcome.error);
   }

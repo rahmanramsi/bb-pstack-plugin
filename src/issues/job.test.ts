@@ -187,7 +187,7 @@ test("a spawn whose outcome is unknown is probed, never re-run, and sticks once 
   assert.match(late.error!, /spawn may not have happened/);
 });
 
-test("retry backs off and honours the server's notBefore; fail sticks the job", () => {
+test("retry backs off and honours the server's notBefore without running out of tries; fail sticks the job", () => {
   const claimed = job({ threadId: "thr_w", phase: transit("publishing", [pushEffect], { tries: 3, firstAt: NOW }) });
   const backoff = settle(claimed, { kind: "retry", error: "host offline", notBefore: null }, NOW);
   assert.ok(backoff.phase && "effects" in backoff.phase);
@@ -197,6 +197,16 @@ test("retry backs off and honours the server's notBefore; fail sticks the job", 
   const rateLimited = settle(claimed, { kind: "retry", error: "rate limited", notBefore: NOW + 30 * MIN }, NOW);
   assert.ok(rateLimited.phase && "effects" in rateLimited.phase);
   assert.equal(rateLimited.phase.nextAt, NOW + 30 * MIN);
+
+  let retried = job({ threadId: "thr_w", phase: transit("publishing", [pushEffect]) });
+  for (let attempt = 0; attempt < 3 * MAX_EFFECT_TRIES; attempt++) {
+    const action = plan(retried, facts({ now: NOW + attempt * 60 * MIN }));
+    assert.equal(action?.type, "effect", `attempt ${attempt}: ${retried.error}`);
+    const claimedAgain = { ...retried, phase: { ...retried.phase, tries: (retried.phase as { tries: number }).tries + 1, firstAt: NOW } } as Job;
+    retried = apply(claimedAgain, settle(claimedAgain, { kind: "retry", error: "host offline", notBefore: null }, NOW + attempt * 60 * MIN));
+  }
+  assert.ok("effects" in retried.phase && retried.phase.tries < MAX_EFFECT_TRIES && retried.phase.nextAt === NOW + 23 * 60 * MIN + 15 * MIN, "retries never run out, and back off at most 15 minutes");
+  assert.equal(retried.error, "host offline");
 
   const failed = settle(claimed, { kind: "fail", error: "the remote branch moved" }, NOW);
   assert.equal(failed.phase?.state, "sticking");
