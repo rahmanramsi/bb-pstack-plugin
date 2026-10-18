@@ -591,7 +591,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       return {
         ok: false,
         code: "remote_moved",
-        message: `\`${bound.branch}\` on GitHub moved to ${short(outcome.moved)} since this round started. Run \`git fetch origin\`, merge \`origin/${bound.branch}\`, commit, and report again. This does not count as a rejection.`,
+        message: `\`${bound.branch}\` on GitHub moved to ${short(outcome.moved)} since this round started. Run \`bb pstack gh fetch\`, merge \`origin/${bound.branch}\`, commit, and report again. This does not count as a rejection.`,
       };
     }
     if (!outcome.ok) {

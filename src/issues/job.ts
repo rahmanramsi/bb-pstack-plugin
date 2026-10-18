@@ -781,7 +781,7 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
   if (facts.remoteHead !== null && facts.remoteHead !== base) return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead } };
   const reasons = commitProblems(job, report.outcome, facts.worktree, `${base.slice(0, 7)}, the head of \`${job.branch}\``);
   if (!containsSha(facts.worktree, base)) {
-    reasons.push(`HEAD does not contain ${base.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`git fetch origin\`, merge \`origin/${job.branch}\`, and report again`);
+    reasons.push(`HEAD does not contain ${base.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`bb pstack gh fetch\`, merge \`origin/${job.branch}\`, and report again`);
   }
   const listed = new Set(facts.listed.map(refKey));
   const replied = report.replies.map((reply) => refKey({ kind: reply.kind, id: reply.commentId }));

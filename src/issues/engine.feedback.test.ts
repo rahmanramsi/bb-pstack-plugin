@@ -407,7 +407,7 @@ test("a branch moved on GitHub between rounds becomes the round's base: the work
   await h.settle();
   assert.equal((await h.only()).state, "addressing");
   const text: string = h.sent.at(-1)!.input[0].text;
-  assert.match(text, new RegExp(`\`${job.branch}\` on GitHub is at 5555555[\\s\\S]*git fetch origin[\\s\\S]*merge \`origin/${job.branch}\``));
+  assert.match(text, new RegExp(`\`${job.branch}\` on GitHub is at 5555555[\\s\\S]*bb pstack gh fetch[\\s\\S]*merge \`origin/${job.branch}\``));
 
   const reply = [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }];
   const stale = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SHA2] });
@@ -428,13 +428,13 @@ test("a branch moved on GitHub during a round refuses the report without countin
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
-  assert.doesNotMatch(h.sent.at(-1)!.input[0].text, /git fetch origin/, "the branch had not moved when the round started");
+  assert.doesNotMatch(h.sent.at(-1)!.input[0].text, /past the commit pstack last pushed/, "the branch had not moved when the round started");
   h.gh().refs.set(job.branch, UPDATED);
 
   const reply = [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }];
   const refused = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SHA2] });
   assert.equal(refused.exitCode, 1);
-  assert.match(refused.stderr!, /moved to 6666666 since this round started[\s\S]*git fetch origin/);
+  assert.match(refused.stderr!, /moved to 6666666 since this round started[\s\S]*bb pstack gh fetch/);
   const still = await h.only();
   assert.equal(still.state, "addressing");
   assert.equal(still.error, null, "not a rejection");
@@ -460,7 +460,7 @@ test("a replacement worker whose worktree starts behind the branch on GitHub is 
   assert.equal(addressing.state, "addressing", addressing.error ?? "");
   const note = h.sent.find((message) => message.threadId === addressing.threadId);
   assert.ok(note, "the replacement gets a note");
-  assert.match(note.input[0].text, /starts at 2222222[\s\S]*is at 5555555[\s\S]*git fetch origin/);
+  assert.match(note.input[0].text, /starts at 2222222[\s\S]*is at 5555555[\s\S]*bb pstack gh fetch/);
 });
 
 test("`@<app> stop` from someone with write access, on the issue or the pull request, stops the job and is never feedback", async () => {
