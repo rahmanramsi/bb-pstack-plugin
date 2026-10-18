@@ -96,7 +96,7 @@ test("repository poll state is stored per repository", () => {
 });
 
 test("the migration's state lists match job.ts", () => {
-  const sql = MIGRATIONS.at(-1)!;
+  const sql = MIGRATIONS.find((statement) => statement.includes("CREATE TABLE issue_jobs_unattended"))!;
   const list = (pattern: RegExp) => new Set([...pattern.exec(sql)![1]!.matchAll(/'([^']+)'/g)].map((match) => match[1]));
   assert.deepEqual(list(/state IN \(\s*([^)]*)\)\),/), new Set([...RESTING_STATES, ...Object.keys(TRANSIT)]));
   assert.deepEqual(list(/CHECK \(\(state IN \(([^)]*)\)\) = \(effects_json/), new Set(Object.keys(TRANSIT)));
@@ -281,7 +281,8 @@ test("each write that changes something signals once, and a write that changes n
 
 test("unattended upgrade archives legacy waits byte for byte and preserves leased publication and manual starts", () => {
   const db = new Database(":memory:");
-  for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+  const autonomyIndex = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE issue_legacy_archive"));
+  for (const statement of MIGRATIONS.slice(0, autonomyIndex)) db.exec(statement);
   const raw = '{"outcome":"needs-info", "questions":["Which API?"],"verification":["source unavailable"]}';
   const pending = JSON.stringify([{ op: "comment", key: "legacy:questions", body: "Which API?" }]);
   const insert = db.prepare(`INSERT INTO issue_jobs (id,repo,issue,generation,trigger_event_id,triggered_by,triggered_at,issue_json,project_id,host_id,base_branch,branch,state,effects_json,effect_tries,effect_first_at,effect_lease_until,effect_next_at,thread_id,report_json,pushed_sha,created_at,updated_at)
@@ -295,7 +296,7 @@ test("unattended upgrade archives legacy waits byte for byte and preserves lease
   insert.run("terminal-new", 44, 2, snapshot, "agent/issue-44-new", "done", null, 0, "thr_new", raw, SHA);
   db.prepare("INSERT INTO issue_rounds(job_id,ordinal,kind,started_at,report_json) VALUES('old-wait',1,'initial',1,?)").run(raw);
   const before = db.prepare("SELECT * FROM issue_jobs ORDER BY id").all();
-  let applied = MIGRATIONS.length - 1;
+  let applied = autonomyIndex;
   const upgrade = db.transaction(() => { for (const statement of MIGRATIONS.slice(applied)) db.exec(statement); applied = MIGRATIONS.length; });
   upgrade(); upgrade();
   assert.deepEqual(db.prepare("SELECT * FROM issue_legacy_archive ORDER BY id").all(), before);

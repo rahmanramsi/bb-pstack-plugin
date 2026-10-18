@@ -251,3 +251,76 @@ test("CI repair recovers a gone published worker in the preserved environment", 
   assert.equal(h.spawned[1]!.environment.type, "reuse");
   assert.equal(h.store.get(job.id)!.control.repair?.cause.includes("conflicting"), true);
 });
+
+test("a missing fresh base object asks the authorized worker to fetch and resumes the saved report", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const worker = (await h.only()).threadId!;
+  h.gh().refs.set("main", SHA3);
+  h.failures.missingObject = SHA3;
+  const saved = await h.report(worker, GOOD);
+  assert.equal(saved.exitCode, 0);
+  await h.settle();
+  assert.match(h.sent.at(-1)!.input[0].text, /bb pstack gh fetch/);
+  assert.match(h.sent.at(-1)!.input[0].text, new RegExp(SHA3));
+  assert.equal(h.pushes.length, 0);
+  h.failures.missingObject = null;
+  h.restart(); await h.settle();
+  assert.equal((await h.only()).outcome, "ready");
+});
+
+test("saved report verification never rebinds to a later worker commit", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const worker = (await h.only()).threadId!;
+  h.failures.missingObject = SHA1;
+  await h.report(worker, GOOD); await h.settle();
+  h.worktrees.get(h.threads.get(worker)!.environmentId)!.headSha = SHA3;
+  h.failures.missingObject = null;
+  h.restart(); await h.settle();
+  assert.equal(h.pushes.length, 0);
+  const row = h.db.prepare("SELECT intended_sha, result FROM issue_submissions WHERE intended_sha IS NOT NULL ORDER BY id LIMIT 1").get() as { intended_sha: string; result: string };
+  assert.equal(row.intended_sha, SHA2);
+  assert.match(row.result, /stale_snapshot/);
+  assert.equal((await h.report(worker, GOOD, { headSha: SHA3 })).exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).pushedSha, SHA3);
+});
+
+test("permanent report prerequisites fail with preserved submission while transient faults stay pending", async () => {
+  for (const status of [403, 404, 502]) {
+    const h = harness();
+    h.label(41); await h.settle();
+    const worker = (await h.only()).threadId!;
+    h.gh().outages.push({ key: "GET /repos/acme/web/installation", status, times: Infinity });
+    await h.report(worker, GOOD); await h.settle();
+    const job = await h.only();
+    assert.equal(h.pushes.length, 0);
+    if (status === 502) assert.equal(job.state, "working");
+    else {
+      assert.equal(job.outcome, "failure");
+      h.gh().outages.length = 0; h.clock.now += 2 * MIN; h.restart(); await h.settle();
+      assert.match(h.gh().comments.get(41)![0]!.body, /Failed/);
+      assert.equal((h.db.prepare("SELECT count(*) AS n FROM issue_submissions WHERE raw LIKE '%changes%'").get() as { n: number }).n, 1);
+    }
+  }
+});
+
+test("permanent essential PR observation denial ends checking but a transport outage resumes", async () => {
+  for (const status of [403, 502]) {
+    const h = harness();
+    const { job, pr } = await h.toReview();
+    h.gh().outages.push({ key: `GET /repos/acme/web/pulls/${pr}`, status, times: Infinity });
+    await h.settle();
+    if (status === 403) {
+      assert.equal((await h.only()).outcome, "failure");
+      assert.equal((await h.only()).pushedSha, job.pushedSha);
+      assert.match(h.gh().comments.get(41)![0]!.body, /Failed/);
+    } else {
+      assert.equal((await h.only()).state, "review");
+      h.gh().outages.length = 0;
+      await h.settle();
+      assert.equal((await h.only()).outcome, "ready");
+    }
+  }
+});

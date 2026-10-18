@@ -427,6 +427,7 @@ CREATE TABLE issue_jobs_unattended (
        SELECT 1 FROM issue_jobs newer WHERE newer.repo = j.repo AND newer.issue = j.issue AND newer.state != 'ignored'
          AND (newer.generation > j.generation OR (newer.generation = j.generation AND newer.created_at > j.created_at))
      );`,
+  `ALTER TABLE issue_submissions ADD COLUMN intended_sha TEXT`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

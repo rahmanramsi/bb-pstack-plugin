@@ -309,7 +309,7 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
 
 export function statusBody(job: Job): string {
   const result = job.control.disposition;
-  const status = result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.phase.state === "review" ? "Ready for review" : job.phase.state;
+  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.phase.state === "review" ? "Ready for review" : job.phase.state === "checking" ? "Checking CI" : job.phase.state === "addressing" ? "Addressing feedback" : job.phase.state === "recovering" ? "Recovering work" : job.phase.state;
   return [
     `Issue #${job.issue}: ${status}`,
     job.control.policyLimitation,
@@ -317,7 +317,7 @@ export function statusBody(job: Job): string {
     job.report?.summary,
     job.error ? `Reason: ${job.error}` : null,
     job.pr ? `Pull request: ${job.pr.url}` : null,
-    job.report ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : null,
+    job.report ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : job.control.preservedSha ? `Preserved commit: ${job.control.preservedSha}` : null,
     `Branch: \`${job.branch}\``,
     ...(job.report?.verification ?? []).map((line) => `- ${line}`),
   ].filter(Boolean).join("\n\n");

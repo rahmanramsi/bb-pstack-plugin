@@ -260,12 +260,14 @@ export type Control = {
   readiness: ReviewTarget | null;
   localEvidence: { head: Sha; base: Sha } | null;
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
+  objectRepair: { sha: Sha } | null;
   prerequisites: readonly { issue: number; branch: BranchName; sha: Sha }[];
   policyLimitation: string | null;
   disposition: "merged" | "closed" | "no-change" | "failure" | "stopped" | null;
+  preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, prerequisites: [], policyLimitation: null, disposition: null, preservation: null });
+export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, objectRepair: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -555,7 +557,7 @@ function feedbackAction(job: Job, facts: Facts): Action | null {
 export function rejectReport(job: Job, reasons: readonly string[]): Change {
   const best = job.control.bestReasons;
   const improved = best !== null && reasons.length < best.length && reasons.every((reason) => best.includes(reason));
-  const control = { ...job.control, invalid: improved ? 1 : job.control.invalid + 1, bestReasons: best === null || improved ? reasons : best };
+  const control = { ...job.control, invalid: improved ? 1 : job.control.invalid + 1, recoveries: improved ? 0 : job.control.recoveries, bestReasons: best === null || improved ? reasons : best };
   const current = { ...job, control };
   return control.invalid >= MAX_INVALID_REPORTS ? { ...recover(current, `report validation made no progress: ${reasons.join("; ")}`), rejections: job.rejections + 1 } : { control, rejections: job.rejections + 1, error: `report rejected: ${reasons.join("; ")}` };
 }
@@ -567,12 +569,13 @@ export function recover(job: Job, reason: string): Change {
 }
 
 export type ReviewFact =
-  | { kind: "unavailable"; reason: string }
+  | { kind: "unavailable"; reason: string; permanent?: boolean }
   | { kind: "observed"; target: ReviewTarget; state: PullState; draft: boolean; complete: boolean; ready: boolean; pending: boolean; reasons: readonly string[]; fingerprint: string; limitation?: string | null };
 
 function checkReview(job: Job, facts: Facts): Action | null {
   const review = facts.review;
-  if (!review || review.kind === "unavailable") return null;
+  if (!review) return null;
+  if (review.kind === "unavailable") return review.permanent ? { type: "change", change: stick(job, review.reason) } : null;
   if (review.state !== "open") return { type: "change", change: close(job, review.state) };
   const target = review.target;
   const previous = job.control.readiness;

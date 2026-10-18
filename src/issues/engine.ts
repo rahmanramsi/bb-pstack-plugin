@@ -23,6 +23,7 @@ import { acceptSync,
   REPORTING,
   TERMINAL,
   acceptReport,
+  enter,
   rejectReport,
   stick,
   type ReviewFact,
@@ -600,7 +601,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       try {
         const snapshot = await github.repo(job.repo).reviewSnapshot(job.pr.number);
         facts.review = snapshot ? reviewObservation(job, snapshot) : { kind: "observed", target: { pr: job.pr.number, head: job.pushedSha!, base: job.pushedSha! }, state: "closed", draft: true, complete: true, ready: false, pending: false, reasons: ["pull request missing"], fingerprint: "missing" };
-      } catch (error) { facts.review = { kind: "unavailable", reason: message(error) }; }
+      } catch (error) { facts.review = { kind: "unavailable", reason: message(error), permanent: error instanceof GitHubPermanentError || error instanceof GitHubSetupError }; }
     }
     if (wanted.includes("worker")) facts.worker = await resolveWorker(job);
     if (wanted.includes("thread")) facts.thread = await threadFact(job.threadId);
@@ -661,6 +662,13 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (pending.length > 0 && (REPORTING.has(job.phase.state) || TERMINAL.has(job.phase.state))) {
         const result = await evaluateSubmission(job, pending[0]!);
         if (result.code === "pending") return;
+        if (result.code === "worker-action") {
+          const current = store.get(id);
+          if (!current) return;
+          const action = plan(current, await gather(current));
+          if (!action || action.type === "sleep") return;
+          await apply(current, action);
+        }
         continue;
       }
       const action = plan(job, await gather(job));
@@ -708,19 +716,19 @@ export function createIssues(deps: IssuesDeps): Issues {
     throw new Error(`issue job ${id} kept changing while it was being written`);
   }
 
-  async function reportFacts(job: Job): Promise<ReportFacts | { unavailable: string }> {
+  async function reportFacts(job: Job): Promise<ReportFacts | { unavailable: string; disposition: "retry" | "worker" | "fail"; sha?: Sha }> {
     try {
       const tree = await worktree(job);
-      if (!tree.ok) return { unavailable: tree.error };
+      if (!tree.ok) return { unavailable: tree.error, disposition: tree.transient ? "retry" : "fail" };
       const remoteHead = job.round === 1 ? null : await github.repo(job.repo).branchSha(job.branch);
-      if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub` };
+      if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub`, disposition: "fail" };
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       const comparisonSha = job.round === 1 ? capabilities.defaultHead : job.roundBase ?? remoteHead ?? capabilities.defaultHead;
       const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha });
-      if (inspected.kind !== "inspected") return { unavailable: `missing commit object ${inspected.sha}` };
+      if (inspected.kind !== "inspected") return { unavailable: `missing local commit object ${inspected.sha}`, disposition: "worker", sha: inspected.sha as Sha };
       const gate = job.threadId ? deps.prGate(job.threadId) : { pass: false as const, reason: "the job has no worker thread" };
       const finalTree = await worktree(job);
-      if (!finalTree.ok || finalTree.headSha !== tree.headSha || finalTree.dirty !== tree.dirty) return { unavailable: "the worker changed its snapshot while the report was being inspected" };
+      if (!finalTree.ok || finalTree.headSha !== tree.headSha || finalTree.dirty !== tree.dirty) return { unavailable: "the worker changed its snapshot while the report was being inspected", disposition: "retry" };
       return {
         now: clock(),
         baseSha: capabilities.defaultHead,
@@ -732,7 +740,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         listed: store.roundFeedback(job.id, job.round),
       };
     } catch (error) {
-      return { unavailable: message(error) };
+      return { unavailable: message(error), disposition: error instanceof GitHubPermanentError || error instanceof GitHubSetupError ? "fail" : "retry" };
     }
   }
 
@@ -806,9 +814,41 @@ export function createIssues(deps: IssuesDeps): Issues {
       const written = store.write(job.id, job.version, { ...change, control: { ...control, disposition: "failure", readiness: null }, report: accepted, evaluation: { submissionId: submission.id, result: JSON.stringify(result) } }, clock());
       return written ? { code: "accepted", result } : reject("pending", "Report saved for evaluation after the current transition.");
     }
+    try {
+      const tree = await worktree(job);
+      if (tree.ok) {
+        if (submission.intendedSha && tree.headSha !== submission.intendedSha) {
+          const result = reject("stale_snapshot", `The saved report is bound to ${submission.intendedSha}; the worker must verify and report the current commit.`);
+          store.finishSubmission(submission.id, JSON.stringify(result.result), clock());
+          return result;
+        }
+        if (!store.bindSubmission(submission.id, tree.headSha)) return reject("pending", "The report snapshot is being reconciled.");
+        submission.intendedSha = tree.headSha;
+      }
+    } catch { /* The classified facts below retain a report during host outages. */ }
     const facts = await reportFacts(job);
-    if ("unavailable" in facts) return reject("pending", `Report saved. Evaluation resumes automatically when dependencies recover. ${facts.unavailable}`);
-    const verdict = acceptReport(job, parsed.parsed, facts);
+    if ("unavailable" in facts) {
+      if (facts.disposition === "fail") {
+        const result = reject("prerequisite_failed", facts.unavailable);
+        const change = stick(job, facts.unavailable);
+        store.write(job.id, job.version, { ...change, control: { ...(change.control ?? job.control), preservedSha: submission.intendedSha }, evaluation: { submissionId: submission.id, result: JSON.stringify(result.result), snapshot: { unavailable: facts.unavailable } } }, clock());
+        return result;
+      }
+      if (facts.disposition === "worker" && facts.sha) {
+        if (job.control.objectRepair?.sha !== facts.sha) {
+          const text = `Your report is saved and bound to ${submission.intendedSha}. Fetch the missing object ${facts.sha} with bb pstack gh fetch in this worker, incorporate the current base if needed, and run the relevant checks. If HEAD changes, submit a fresh report with the actual verification results. No human retry is needed.`;
+          store.write(job.id, job.version, { phase: enter("recovering", [{ op: "send-round", key: `fetch-object:${job.id}:${job.round}:${facts.sha}`, text }]), control: { ...job.control, objectRepair: { sha: facts.sha } }, error: facts.unavailable }, clock());
+        }
+        return reject("worker-action", "Report saved. The worker is fetching the missing Git object and verifying the current base.");
+      }
+      return reject("pending", `Report saved. Evaluation resumes automatically when dependencies recover. ${facts.unavailable}`);
+    }
+    if (submission.intendedSha !== facts.worktree.headSha) {
+      const result = reject("stale_snapshot", "The worker changed HEAD during report evaluation; current verification is required.");
+      store.finishSubmission(submission.id, JSON.stringify(result.result), clock());
+      return result;
+    }
+    const verdict = acceptReport({ ...job, control: { ...job.control, objectRepair: null } }, parsed.parsed, facts);
     const result: ReportResult = verdict.ok ? { ok: true, message: `Report accepted. pstack pushes ${short(facts.worktree.headSha)} to ${job.branch}; publication and verification continue automatically.` } : { ok: false, code: "rejected", message: "moved" in verdict ? `Remote moved to ${verdict.moved}. Merge it and submit current evidence.` : ["Report rejected:", ...verdict.reasons.map((reason) => `- ${reason}`)].join("\n") };
     const written = store.write(job.id, job.version, { ...verdict.change, evaluation: { submissionId: submission.id, result: JSON.stringify(result), snapshot: { worktree: facts.worktree, gate: facts.gate, inspected: facts.inspected, baseSha: facts.baseSha } } }, clock());
     return written ? { code: verdict.ok ? "accepted" : "rejected", result } : reject("pending", "Report saved for automatic reevaluation.");
@@ -833,7 +873,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     const evaluated = await evaluateSubmission(job, submission);
     background(tick(job.id).then(deliverStatuses));
-    return evaluated.code === "pending" ? { ok: true, message: evaluated.result.message } : evaluated.result;
+    return ["pending", "worker-action"].includes(evaluated.code) ? { ok: true, message: evaluated.result.message } : evaluated.result;
   }
 
   async function stop(id: JobId, by: string): Promise<boolean> {

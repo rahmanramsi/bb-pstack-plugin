@@ -103,12 +103,13 @@ export type IssueWrites = {
   saveChildren(parentId: JobId, children: readonly SubIssue[], now: number): void;
 };
 
-export type Submission = { id: number; jobId: JobId; epoch: number; round: number; threadId: string; raw: string; result: string | null };
+export type Submission = { id: number; jobId: JobId; epoch: number; round: number; threadId: string; raw: string; result: string | null; intendedSha: Sha | null };
 export type Decoration = { effect: Effect; nextAt: number; attempts: number; error: string | null };
 export type IssueStatus = { repo: RepoName; issue: number; jobId: JobId; generation: number; revision: number; body: string; deliveredRevision: number; leaseUntil: number | null; nextAt: number; error: string | null; decorations: Decoration[] };
 export type DurableDelivery = {
   submit(job: Job, threadId: string, raw: string, now: number): Submission;
   pendingSubmissions(id: JobId): Submission[];
+  bindSubmission(id: number, sha: Sha): boolean;
   finishSubmission(id: number, result: string, now: number): void;
   statuses(now: number): IssueStatus[];
   delivery(repo: RepoName, issue: number): { pending: boolean; error: string | null };
@@ -479,12 +480,15 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       ).run(id, now, error);
     },
   };
-  const submission = (row: { id: number; job_id: string; epoch: number; round: number; thread_id: string; raw: string; result: string | null }): Submission => ({ id: row.id, jobId: row.job_id as JobId, epoch: row.epoch, round: row.round, threadId: row.thread_id, raw: row.raw, result: row.result });
+  const submission = (row: { id: number; job_id: string; epoch: number; round: number; thread_id: string; raw: string; result: string | null; intended_sha: string | null }): Submission => ({ id: row.id, jobId: row.job_id as JobId, epoch: row.epoch, round: row.round, threadId: row.thread_id, raw: row.raw, result: row.result, intendedSha: row.intended_sha as Sha | null });
   const deliveries: DurableDelivery = {
     submit(job, threadId, raw, now) {
       const hash = createHash("sha256").update(raw).update(`\0${job.version}`).digest("hex");
       db.prepare("INSERT OR IGNORE INTO issue_submissions (job_id, epoch, round, thread_id, hash, raw, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(job.id, job.control.epoch, job.round, threadId, hash, raw, now);
       return submission(db.prepare("SELECT * FROM issue_submissions WHERE job_id = ? AND epoch = ? AND round = ? AND thread_id = ? AND hash = ?").get(job.id, job.control.epoch, job.round, threadId, hash) as Parameters<typeof submission>[0]);
+    },
+    bindSubmission(id, sha) {
+      return db.prepare("UPDATE issue_submissions SET intended_sha = ? WHERE id = ? AND evaluated_at IS NULL AND (intended_sha IS NULL OR intended_sha = ?)").run(sha, id, sha).changes === 1;
     },
     pendingSubmissions(id) {
       return (db.prepare("SELECT * FROM issue_submissions WHERE job_id = ? AND evaluated_at IS NULL ORDER BY id").all(id) as Parameters<typeof submission>[0][]).map(submission);

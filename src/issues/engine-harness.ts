@@ -306,7 +306,7 @@ export function harness() {
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, workflows: false, scheduledRetryAt: null as number | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null };
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
@@ -464,7 +464,7 @@ export function harness() {
       store,
       github: createGitHub({ credentials: () => ({ appId: "1", privateKey }), apiUrl: base, gitUrl: "https://github.test", clock: () => clock.now }),
       inspectOrigin: async () => "https://github.com/acme/web.git",
-      inspectCommit: async (_hostId, input) => ({ kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows }),
+      inspectCommit: async (_hostId, input) => failures.missingObject ? { kind: "missing-object", sha: failures.missingObject } : ({ kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows }),
       hostPush: async (hostId: string, input: PushInput, signal?: AbortSignal): Promise<PushResult> => {
         assert.equal(hostId, "host_worker");
         pushes.push(input);
