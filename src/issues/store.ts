@@ -50,12 +50,7 @@ export type NewJob = {
 /** A job's last poll of its pull request: the cursor github.ts hands back, the state it read, and why it last failed. */
 export type JobPoll = { cursor: unknown; prState: PullState | null; polledAt: number | null; error: string | null };
 
-export type IssueStore = {
-  /**
-   * Inserts the job for a label event. Its generation is 1 + the issue's earlier jobs that were not ignored, and its
-   * branch follows from it. Null when the event is already recorded or an open job holds the issue.
-   */
-  insert(job: NewJob, now: number): Job | null;
+export type IssueReads = {
   get(id: JobId): Job | null;
   byThread(threadId: string): Job | null;
   byTrigger(eventId: number): Job | null;
@@ -64,15 +59,6 @@ export type IssueStore = {
   due(now: number): JobId[];
   /** Newest first; terminal jobs only with `all`. */
   list(filter: { repo?: RepoName; all: boolean }): Job[];
-  /**
-   * The one write. Returns the new row, or null when the version moved (re-read and replan), or when a round start
-   * does not list every pending item. In the same
-   * transaction, a round start inserts the round's row and marks its feedback as sent, and the current round's row
-   * records the accepted report, the pushed commit, and, once, when the change says the round finished.
-   */
-  write(id: JobId, version: number, change: Change, now: number): Job | null;
-  /** Stores feedback not seen before; an item already stored, sent or not, is left as it is. Returns how many were new. */
-  addFeedback(repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number;
   /** Whether the item is stored already, sent or not. */
   hasFeedback(repo: RepoName, ref: FeedbackRef): boolean;
   /** The job's feedback not yet sent in a round, oldest first. */
@@ -82,8 +68,26 @@ export type IssueStore = {
   /** The feedback a round sent, which its report must answer. */
   roundFeedback(id: JobId, ordinal: number): Feedback[];
   repoPoll(repo: RepoName): { poll: unknown; polledAt: number | null; error: string | null };
-  saveRepoPoll(repo: RepoName, poll: unknown, now: number, error: string | null): void;
   jobPoll(id: JobId): JobPoll;
+};
+
+/** A write that returns null or 0 changed nothing; any other result means it did. */
+export type IssueWrites = {
+  /**
+   * Inserts the job for a label event. Its generation is 1 + the issue's earlier jobs that were not ignored, and its
+   * branch follows from it. Null when the event is already recorded or an open job holds the issue.
+   */
+  insert(job: NewJob, now: number): Job | null;
+  /**
+   * The one write. Returns the new row, or null when the version moved (re-read and replan), or when a round start
+   * does not list every pending item. In the same
+   * transaction, a round start inserts the round's row and marks its feedback as sent, and the current round's row
+   * records the accepted report, the pushed commit, and, once, when the change says the round finished.
+   */
+  write(id: JobId, version: number, change: Change, now: number): Job | null;
+  /** Stores feedback not seen before; an item already stored, sent or not, is left as it is. Returns how many were new. */
+  addFeedback(repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number;
+  saveRepoPoll(repo: RepoName, poll: unknown, now: number, error: string | null): void;
   /** A successful poll of the job: its pull request's new feedback and state, and the next cursor, in one transaction. */
   recordPoll(id: JobId, poll: { cursor: unknown; prState: PullState | null; feedback: readonly Feedback[] }, now: number): void;
   /** A failed poll keeps the last cursor and state, so the next poll starts where the last good one ended. */
@@ -94,6 +98,8 @@ export type IssueStore = {
   polledChildren(parentId: JobId): SubIssue[] | null;
   saveChildren(parentId: JobId, children: readonly SubIssue[], now: number): void;
 };
+
+export type IssueStore = IssueReads & IssueWrites;
 
 type JobRow = {
   id: string;
@@ -245,7 +251,7 @@ const TERMINAL_LIST = [...TERMINAL];
 const TRANSIT_LIST = Object.keys(TRANSIT);
 const placeholders = (values: readonly unknown[]) => values.map(() => "?").join(", ");
 
-export function openIssueStore(db: Db): IssueStore {
+export function openIssueStore(db: Db, onChange: () => void): IssueStore {
   const get = (id: JobId): Job | null => {
     const row = db.prepare("SELECT * FROM issue_jobs WHERE id = ?").get(id) as JobRow | undefined;
     return row ? parse(row) : null;
@@ -301,8 +307,7 @@ export function openIssueStore(db: Db): IssueStore {
     return added;
   });
 
-  return {
-    insert,
+  const reads: IssueReads = {
     get,
     byThread(threadId) {
       const row = db.prepare("SELECT * FROM issue_jobs WHERE thread_id = ?").get(threadId) as JobRow | undefined;
@@ -336,6 +341,36 @@ export function openIssueStore(db: Db): IssueStore {
         .all(...(repo ? [repo] : []), ...(all ? [] : TERMINAL_LIST)) as JobRow[];
       return rows.map(parse);
     },
+    hasFeedback(repo, ref) {
+      return db.prepare("SELECT 1 FROM issue_feedback WHERE repo = ? AND kind = ? AND github_id = ?").get(repo, ref.kind, ref.id) !== undefined;
+    },
+    pendingFeedback(id) {
+      const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round IS NULL ORDER BY created_at, github_id").all(id) as FeedbackRow[];
+      return rows.map(parseFeedback);
+    },
+    roundSummaries(id) {
+      const rounds = db.prepare("SELECT ordinal, report_json FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(id) as { ordinal: number; report_json: string | null }[];
+      return rounds.map((round) => ({ ordinal: round.ordinal, summary: round.report_json === null ? null : ((JSON.parse(round.report_json) as AcceptedReport).summary ?? null) }));
+    },
+    roundFeedback(id, ordinal) {
+      const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round = ? ORDER BY created_at, github_id").all(id, ordinal) as FeedbackRow[];
+      return rows.map(parseFeedback);
+    },
+    repoPoll(repo) {
+      const row = db.prepare("SELECT poll_json, polled_at, error FROM issue_repos WHERE repo = ?").get(repo) as
+        | { poll_json: string | null; polled_at: number | null; error: string | null }
+        | undefined;
+      return { poll: row?.poll_json ? JSON.parse(row.poll_json) : null, polledAt: row?.polled_at ?? null, error: row?.error ?? null };
+    },
+    jobPoll(id) {
+      const row = db.prepare("SELECT cursor_json, pr_state, polled_at, error FROM issue_job_polls WHERE job_id = ?").get(id) as
+        | { cursor_json: string | null; pr_state: PullState | null; polled_at: number | null; error: string | null }
+        | undefined;
+      return { cursor: row?.cursor_json ? JSON.parse(row.cursor_json) : null, prState: row?.pr_state ?? null, polledAt: row?.polled_at ?? null, error: row?.error ?? null };
+    },
+  };
+  const writes: IssueWrites = {
+    insert,
     write: db.transaction((id: JobId, version: number, change: Change, now: number): Job | null => {
       // Feedback that arrived after plan() read the queue is newer than the quiet period it checked: refuse, so the
       // replan sees it and waits again, instead of leaving it for a round of its own.
@@ -368,38 +403,11 @@ export function openIssueStore(db: Db): IssueStore {
       return job;
     }),
     addFeedback,
-    hasFeedback(repo, ref) {
-      return db.prepare("SELECT 1 FROM issue_feedback WHERE repo = ? AND kind = ? AND github_id = ?").get(repo, ref.kind, ref.id) !== undefined;
-    },
-    pendingFeedback(id) {
-      const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round IS NULL ORDER BY created_at, github_id").all(id) as FeedbackRow[];
-      return rows.map(parseFeedback);
-    },
-    roundSummaries(id) {
-      const rounds = db.prepare("SELECT ordinal, report_json FROM issue_rounds WHERE job_id = ? ORDER BY ordinal").all(id) as { ordinal: number; report_json: string | null }[];
-      return rounds.map((round) => ({ ordinal: round.ordinal, summary: round.report_json === null ? null : ((JSON.parse(round.report_json) as AcceptedReport).summary ?? null) }));
-    },
-    roundFeedback(id, ordinal) {
-      const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round = ? ORDER BY created_at, github_id").all(id, ordinal) as FeedbackRow[];
-      return rows.map(parseFeedback);
-    },
-    repoPoll(repo) {
-      const row = db.prepare("SELECT poll_json, polled_at, error FROM issue_repos WHERE repo = ?").get(repo) as
-        | { poll_json: string | null; polled_at: number | null; error: string | null }
-        | undefined;
-      return { poll: row?.poll_json ? JSON.parse(row.poll_json) : null, polledAt: row?.polled_at ?? null, error: row?.error ?? null };
-    },
     saveRepoPoll(repo, poll, now, error) {
       db.prepare(
         `INSERT INTO issue_repos (repo, poll_json, polled_at, error) VALUES (?, ?, ?, ?)
          ON CONFLICT (repo) DO UPDATE SET poll_json = excluded.poll_json, polled_at = excluded.polled_at, error = excluded.error`,
       ).run(repo, poll === null ? null : JSON.stringify(poll), now, error);
-    },
-    jobPoll(id) {
-      const row = db.prepare("SELECT cursor_json, pr_state, polled_at, error FROM issue_job_polls WHERE job_id = ?").get(id) as
-        | { cursor_json: string | null; pr_state: PullState | null; polled_at: number | null; error: string | null }
-        | undefined;
-      return { cursor: row?.cursor_json ? JSON.parse(row.cursor_json) : null, prState: row?.pr_state ?? null, polledAt: row?.polled_at ?? null, error: row?.error ?? null };
     },
     recordPoll: db.transaction((id: JobId, poll: { cursor: unknown; prState: PullState | null; feedback: readonly Feedback[] }, now: number) => {
       const job = get(id);
@@ -431,4 +439,18 @@ export function openIssueStore(db: Db): IssueStore {
       ).run(id, now, error);
     },
   };
+  return { ...reads, ...notifying(writes, onChange) };
+}
+
+function notifying(writes: IssueWrites, onChange: () => void): IssueWrites {
+  return Object.fromEntries(
+    Object.entries(writes).map(([key, write]) => [
+      key,
+      (...args: unknown[]) => {
+        const result = (write as (...args: unknown[]) => unknown)(...args);
+        if (result !== null && result !== 0) onChange();
+        return result;
+      },
+    ]),
+  ) as IssueWrites;
 }

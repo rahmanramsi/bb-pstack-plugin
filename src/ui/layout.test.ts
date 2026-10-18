@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { agreementMatrix, bannerSummary, checklistGroups, directiveRunId, ganttLayout, panelFlow, panelRunId, runProgress, severityCounts, swarmGrid, type Job } from "./layout.ts";
+import { agreementMatrix, bannerSummary, checklistGroups, directiveRunId, formatAge, ganttLayout, issueNext, panelFlow, panelRunId, runProgress, severityCounts, swarmGrid, type Job } from "./layout.ts";
 
 function job(key: string, overrides: Partial<Job> = {}): Job {
   return { key, kind: "seat", label: key, model: "codex/model/high", state: "queued", attempt: 0, threadId: null, host: null, startedAt: null, finishedAt: null, error: null, summary: null, slice: null, ...overrides };
@@ -64,4 +64,20 @@ test("checklist retains status, evidence and skip reason within its original sec
   assert.deepEqual(groups[0]!.steps[1]!.evidence, ["commit:abc"]);
   assert.equal(groups[1]!.steps[0]!.reason, "Local only");
   assert.deepEqual(bannerSummary({ violations: [], poteto: null, revision: 1, activeRuns: [], checklist }), { runs: 0, open: 1 });
+});
+
+test("an issue job in transit names the state it heads for, its step, and its retry count", () => {
+  assert.equal(issueNext({ next: null }), null);
+  assert.equal(issueNext({ next: { state: "review", op: "open-pr", tries: 0, retryAt: null } }), "Next: In review · open-pr");
+  assert.equal(issueNext({ next: { state: "stopped", op: "labels", tries: 1, retryAt: null } }), "Next: Stopped · labels · try 2");
+  assert.match(issueNext({ next: { state: "review", op: "push", tries: 2, retryAt: 0 } })!, /^Next: In review · push · try 3 · retry at \S/);
+});
+
+test("ages read in minutes, then hours, then days", () => {
+  const now = 10 * 24 * 3_600_000;
+  assert.equal(formatAge(now - 30_000, now), "just now");
+  assert.equal(formatAge(now + 5_000, now), "just now");
+  assert.equal(formatAge(now - 4 * 60_000, now), "4m ago");
+  assert.equal(formatAge(now - 3 * 3_600_000, now), "3h ago");
+  assert.equal(formatAge(now - 3 * 24 * 3_600_000, now), "3d ago");
 });

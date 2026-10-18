@@ -96,6 +96,8 @@ export type Issues = {
   instructions(threadId: string): string | null;
   /** One pass of the service: poll every repository, reconcile every job that may act, and wait for any reconcile in flight. */
   sweep(): Promise<void>;
+  /** Moves the job to stopping and starts its ending effects. False when it already ended or is ending, or does not exist. */
+  stop(id: JobId, by: string): Promise<boolean>;
 };
 
 export type ReportResult = { ok: true; message: string } | { ok: false; code: string; message: string };
@@ -824,6 +826,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       await tickDue();
       await Promise.all([...running.values()].map((entry) => entry.done.catch(() => {})));
     },
+    stop,
   };
 }
 

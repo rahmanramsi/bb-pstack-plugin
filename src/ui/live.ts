@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
-import { STATE_CHANNEL, type RunView } from "../contract.ts";
+import { ISSUES_CHANNEL, STATE_CHANNEL, type RunView } from "../contract.ts";
 import type { rpcContract } from "../rpc.ts";
 import type { Thread } from "./layout.ts";
 
@@ -9,9 +9,12 @@ export type LiveState<T> =
   | { status: "error"; message: string }
   | { status: "ready"; value: T; refreshError: string | null };
 
+export function hasRevision(payload: unknown): payload is { revision: number } {
+  return typeof payload === "object" && payload !== null && "revision" in payload && typeof payload.revision === "number" && Number.isInteger(payload.revision);
+}
+
 export function signalMatchesThread(payload: unknown, threadId: string): boolean {
-  return typeof payload === "object" && payload !== null && "threadId" in payload && payload.threadId === threadId
-    && "revision" in payload && typeof payload.revision === "number" && Number.isInteger(payload.revision);
+  return hasRevision(payload) && "threadId" in payload && payload.threadId === threadId;
 }
 
 export function createCoalescedRefresh(load: () => Promise<void>) {
@@ -39,7 +42,7 @@ export function createCoalescedRefresh(load: () => Promise<void>) {
   return { refresh, dispose() { disposed = true; queued = false; if (scheduled !== null) clearTimeout(scheduled); } };
 }
 
-function useLiveView<T>(threadId: string, load: () => Promise<T>) {
+function useLiveView<T>(load: () => Promise<T>, channel: string, matches: (payload: unknown) => boolean) {
   const [state, setState] = useState<LiveState<T>>({ status: "loading" });
   const refreshRef = useRef<() => void>(() => {});
   const connection = useRealtimeConnectionState();
@@ -69,9 +72,9 @@ function useLiveView<T>(threadId: string, load: () => Promise<T>) {
       clearInterval(poll);
       document.removeEventListener("visibilitychange", visible);
     };
-  }, [threadId, load]);
-  useRealtime(STATE_CHANNEL, (payload) => {
-    if (signalMatchesThread(payload, threadId) && document.visibilityState !== "hidden") refreshRef.current();
+  }, [load]);
+  useRealtime(channel, (payload) => {
+    if (matches(payload) && document.visibilityState !== "hidden") refreshRef.current();
   });
   useEffect(() => {
     if (connection === "connected" && previousConnection.current !== "connected") refreshRef.current();
@@ -84,11 +87,19 @@ function useLiveView<T>(threadId: string, load: () => Promise<T>) {
 export function useThreadView(threadId: string) {
   const rpc = useRpc<typeof rpcContract>();
   const load = useCallback(() => rpc.call("pstackThreadView", { threadId }), [rpc, threadId]);
-  return useLiveView<Thread>(threadId, load);
+  return useLiveView<Thread>(load, STATE_CHANNEL, (payload) => signalMatchesThread(payload, threadId));
 }
 
 export function useRunView(threadId: string, runId: string) {
   const rpc = useRpc<typeof rpcContract>();
   const load = useCallback(() => rpc.call("pstackRunView", { threadId, runId }), [rpc, threadId, runId]);
-  return useLiveView<RunView | null>(threadId, load);
+  return useLiveView<RunView | null>(load, STATE_CHANNEL, (payload) => signalMatchesThread(payload, threadId));
+}
+
+export function useIssueBoard(filter: { all: boolean } | { threadId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const threadId = "threadId" in filter ? filter.threadId : null;
+  const all = "all" in filter && filter.all;
+  const load = useCallback(() => rpc.call("pstackIssueBoard", threadId === null ? { all } : { threadId }), [rpc, threadId, all]);
+  return useLiveView(load, ISSUES_CHANNEL, hasRevision);
 }

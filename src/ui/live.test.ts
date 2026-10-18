@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { createCoalescedRefresh, signalMatchesThread } from "./live.ts";
+import { createCoalescedRefresh, hasRevision, signalMatchesThread } from "./live.ts";
 
 test("realtime signals invalidate only the matching thread and include a revision", () => {
   assert.equal(signalMatchesThread({ threadId: "t1", revision: 3 }, "t1"), true);
@@ -9,6 +9,15 @@ test("realtime signals invalidate only the matching thread and include a revisio
   assert.equal(signalMatchesThread({ threadId: "t1" }, "t1"), false);
   assert.equal(signalMatchesThread({ threadId: "t1", revision: .5 }, "t1"), false);
   assert.equal(signalMatchesThread(null, "t1"), false);
+});
+
+test("any issue signal with a revision invalidates issue views, whichever repository or thread changed", () => {
+  assert.equal(hasRevision({ revision: 1760000000000 }), true);
+  assert.equal(hasRevision({ revision: 3, threadId: "t2" }), true);
+  assert.equal(hasRevision({}), false);
+  assert.equal(hasRevision({ revision: "3" }), false);
+  assert.equal(hasRevision({ revision: .5 }), false);
+  assert.equal(hasRevision(null), false);
 });
 
 test("refresh bursts coalesce and changes during a request cause one follow-up", async () => {

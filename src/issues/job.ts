@@ -629,10 +629,13 @@ export function stick(job: Job, reason: string): Change {
   return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason };
 }
 
+export function canStop(state: JobState): boolean {
+  return !TERMINAL.has(state) && state !== "stopping" && state !== "sticking";
+}
+
 /** Any non-terminal state → stopping. Replaces a pending outbox. Null when the job already ended or is ending. */
 export function stop(job: Job, by: string): Change | null {
-  const state = job.phase.state;
-  if (TERMINAL.has(state) || state === "stopping" || state === "sticking") return null;
+  if (!canStop(job.phase.state)) return null;
   return rounded(job, { phase: enter("stopping", endingEffects(job, "stop")), deadline: null, error: `stopped by ${by}` });
 }
 
@@ -868,6 +871,7 @@ export type JobView = {
   parentId: JobId | null;
   repo: RepoName;
   issue: number;
+  title: string;
   issueUrl: string;
   state: JobState;
   /** For a transit state: where it is heading and the effect it is on. */
@@ -892,6 +896,7 @@ export function toView(job: Job): JobView {
     parentId: job.parentId,
     repo: job.repo,
     issue: job.issue,
+    title: job.snapshot.title,
     issueUrl: job.snapshot.url,
     state: phase.state,
     next:

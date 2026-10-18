@@ -3,6 +3,9 @@ import { z } from "zod";
 /** Realtime channel. Payload is `{ threadId, revision }` only; every mount refetches through RPC. */
 export const STATE_CHANNEL = "pstack-state";
 
+/** Realtime channel for issue jobs and repository polls. Payload is `{ revision }` only, since every client receives it. */
+export const ISSUES_CHANNEL = "pstack-issues";
+
 /** Chat directive the CLI prints for a run; the agent copies it into its reply once. */
 export const runDirective = (runId: string) => `::pstack-run{run="${runId}"}`;
 export const RUN_ID = /^psr_[0-9a-f-]{36}$/;

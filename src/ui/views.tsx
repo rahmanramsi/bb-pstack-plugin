@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Markdown } from "@get-bb/plugin-sdk/app";
 import { Button } from "../../components/ui/button.tsx";
 import type { RunView } from "../contract.ts";
@@ -7,6 +7,15 @@ import {
   severityCounts, severityOrder, swarmGrid, type Checklist, type Job,
 } from "./layout.ts";
 import type { LiveState } from "./live.ts";
+
+export function useNow() {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => { if (document.visibilityState !== "hidden") setNow(Date.now()); }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
 
 export function LoadMessage<T>({ state }: { state: LiveState<T> }) {
   if (state.status === "loading") return <p role="status" className="ps-message" aria-busy="true">Loading pstack...</p>;

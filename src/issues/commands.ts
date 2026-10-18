@@ -4,7 +4,8 @@
 import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { readThreadFile } from "../thread-files.ts";
-import { JOB_ID, MAX_FEEDBACK_ROUNDS, toView, type Job, type JobId, type JobView, type RepoName } from "./job.ts";
+import { issueBoard, listed, repoView, type ListedJob, type RepoView } from "./board.ts";
+import { JOB_ID, MAX_FEEDBACK_ROUNDS, type JobId, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
 export type RepoMapping = { repo: RepoName; projectId: string; hostId: string };
@@ -81,11 +82,6 @@ function stateLabel(job: JobView): string {
   return `${job.state} → ${job.next.state}: ${job.next.op}${job.next.tries > 0 ? `, try ${job.next.tries + 1}` : ""}${retry}`;
 }
 
-/** A repository's last poll. `error` is why it failed, including setup problems such as an App that is not installed. */
-export type RepoView = { repo: RepoName; polledAt: number | null; error: string | null };
-/** A job with its last poll of its issue and pull request, which fails on its own when GitHub cannot read them. */
-type ListedJob = JobView & { poll: { polledAt: number | null; error: string | null } };
-
 function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now: number): string {
   if (repos.length === 0 && jobs.length === 0) return "No issue jobs.";
   return repos
@@ -135,14 +131,6 @@ export function issueCommands(deps: {
 }): Record<string, PluginCliCommand> {
   const { bb, store } = deps;
   const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
-  const repoView = (repo: RepoName): RepoView => {
-    const { polledAt, error } = store.repoPoll(repo);
-    return { repo, polledAt, error };
-  };
-  const listed = (job: Job): ListedJob => {
-    const { polledAt, error } = store.jobPoll(job.id);
-    return { ...toView(job), poll: { polledAt, error } };
-  };
 
   return {
     "issues list": cliCommand({
@@ -154,10 +142,8 @@ export function issueCommands(deps: {
       },
       run(input) {
         const only = input.options.repo?.toLowerCase() as RepoName | undefined;
-        const jobs = store.list({ repo: only, all: input.options.all ?? false }).map(listed);
-        const names = [...new Set([...deps.repos().map((mapping) => mapping.repo), ...jobs.map((job) => job.repo)])].filter((repo) => !only || repo === only);
-        const repos = names.map(repoView);
-        return input.options.json ? json({ repos, jobs }) : { exitCode: 0, stdout: `${formatList(repos, jobs, deps.clock())}\n` };
+        const board = issueBoard(store, deps.repos().map((mapping) => mapping.repo), { repo: only, all: input.options.all ?? false });
+        return input.options.json ? json(board) : { exitCode: 0, stdout: `${formatList(board.repos, board.jobs, deps.clock())}\n` };
       },
     }),
     "issues show": cliCommand({
@@ -167,7 +153,8 @@ export function issueCommands(deps: {
       run(input) {
         const job = store.get(jobId(input.positionals.job));
         if (!job) throw new PluginCliError(`no issue job ${input.positionals.job}`, { code: "job_not_found" });
-        return input.options.json ? json(listed(job)) : { exitCode: 0, stdout: `${formatShow(listed(job), repoView(job.repo), deps.clock())}\n` };
+        const view = listed(store, job);
+        return input.options.json ? json(view) : { exitCode: 0, stdout: `${formatShow(view, repoView(store, job.repo), deps.clock())}\n` };
       },
     }),
     "issues stop": cliCommand({
