@@ -29,6 +29,7 @@ import {
   type Phase,
   type RepoName,
   type ReportFacts,
+  type ReviewFact,
   type Sha,
   type SpawnSpec,
   type WorkerSettings,
@@ -665,4 +666,75 @@ test("review without matching local evidence converges through drafting", () => 
   const current = job({ phase: { state: "review" }, control: { ...initialControl(), reviewIntent: target } });
   const action = plan(current, facts({ review: { kind: "observed", target, state: "open", draft: false, complete: true, ready: true, pending: false, observedAt: NOW, mergeability: "clean", reasons: [], fingerprint: "healthy" } }));
   assert.equal(action?.type === "change" && action.change.phase?.state, "drafting");
+});
+
+test("own PR closure precedes prerequisite waits, failures and changed pins", () => {
+  const target = { pr: 7, head: HEAD, base: PUSHED };
+  const phases: Phase[] = [{ state: "checking" }, { state: "review" }, { state: "addressing" }, { state: "working" }, enter("sending", [{ op: "send-round", key: "send", text: "feedback" }]), enter("respawning", [{ op: "stop-thread", key: "stop" }])];
+  for (const phase of phases) for (const state of ["merged", "closed"] as const) for (const source of ["poll", "snapshot"] as const) {
+    const current = inReview({ phase, control: { ...initialControl(), readiness: target, localEvidence: target } });
+    const review: ReviewFact = { kind: "observed", target, state: source === "snapshot" ? state : "open", draft: false, complete: true, ready: true, pending: false, observedAt: NOW, mergeability: "clean", reasons: [], fingerprint: "healthy" };
+    const action = plan(current, facts({ prerequisiteWait: true, prerequisiteProblem: "prerequisite #52 failed", prerequisites: [{ issue: 52, branch: current.branch, sha: NEXT }], pr: { state: source === "poll" ? state : "open" }, review }));
+    assert.ok(action?.type === "change", `${phase.state} ${state} ${source}`);
+    assert.equal(action.change.phase?.state, state === "merged" ? "closing" : "sticking");
+    assert.equal(action.change.control?.disposition, state);
+    assert.equal(action.change.control?.readiness, null);
+    if (source === "snapshot" && state === "merged") assert.equal(action.change.control?.mergedHead, HEAD);
+  }
+});
+
+test("prerequisite failure still fails an unfinished PR while another lookup waits", () => {
+  const current = inReview();
+  const action = plan(current, facts({ prerequisiteWait: true, prerequisiteProblem: "prerequisite #52 failed", pr: { state: "open" } }));
+  assert.ok(action?.type === "change");
+  assert.equal(action.change.phase?.state, "sticking");
+  assert.equal(action.change.control?.publicFailure?.kind, "prerequisite");
+});
+
+test("prerequisite waits allow guarded review regression without spending repair or recovery", () => {
+  const target = { pr: 7, head: HEAD, base: PUSHED };
+  const current = inReview({ control: { ...initialControl(), readiness: target, localEvidence: target } });
+  const healthy = { kind: "observed", target, state: "open", draft: false, complete: true, ready: true, pending: false, observedAt: NOW, mergeability: "clean", reasons: [], fingerprint: "healthy" } as const;
+  const regressions: Extract<ReviewFact, { kind: "observed" }>[] = [
+    { ...healthy, target: { ...target, head: NEXT } },
+    { ...healthy, target: { ...target, base: NEXT } },
+    { ...healthy, ready: false, reasons: ["checks failed"], fingerprint: "ci" },
+    { ...healthy, complete: false, ready: false },
+  ];
+  for (const review of regressions) {
+    const action = plan(current, facts({ prerequisiteWait: true, review }));
+    assert.ok(action?.type === "change");
+    assert.equal(action.change.phase?.state, "drafting");
+    assert.ok(action.change.phase && "effects" in action.change.phase);
+    assert.deepEqual(action.change.phase.effects.map((effect) => effect.op), ["set-draft"]);
+    assert.deepEqual(action.change.phase.effects[0].op === "set-draft" && action.change.phase.effects[0].target, review.target);
+    assert.equal(action.change.control?.readiness, null);
+    assert.deepEqual(action.change.control?.localEvidence, current.control.localEvidence);
+    assert.deepEqual(action.change.control?.repair, current.control.repair);
+    assert.equal(action.change.control?.recoveries, current.control.recoveries);
+    assert.equal(action.change.startRound, undefined);
+  }
+});
+
+test("a prerequisite wait preserves evidence and gates ready promotion, repair, feedback and idle recovery", () => {
+  const target = { pr: 7, head: HEAD, base: PUSHED };
+  const review = { kind: "observed", target, state: "open", draft: false, complete: true, ready: true, pending: false, observedAt: NOW, mergeability: "clean", reasons: [], fingerprint: "healthy" } as const;
+  const control = { ...initialControl(), readiness: target, localEvidence: target, reviewIntent: target };
+  const ready = inReview({ control });
+  assert.equal(plan(ready, facts({ prerequisiteWait: true })), null);
+  assert.equal(plan(ready, facts({ prerequisiteWait: true, review })), null);
+  const feedback = plan(ready, facts({ ...pending([inline(1, NOW - 5 * MIN)]), prerequisiteWait: true, review, thread: { kind: "gone" } }));
+  assert.ok(feedback?.type === "change");
+  assert.equal(feedback.change.phase?.state, "drafting");
+  assert.equal(feedback.change.startRound, undefined);
+  assert.equal(feedback.change.control?.recoveries, control.recoveries);
+  assert.equal(feedback.change.control?.feedbackRounds, control.feedbackRounds);
+  for (const localEvidence of [target, null]) {
+    const checking = inReview({ phase: { state: "checking" }, control: { ...control, readiness: null, localEvidence } });
+    assert.equal(plan(checking, facts({ prerequisiteWait: true, review: { ...review, draft: true } })), null);
+    assert.equal(plan(checking, facts({ ...pending([inline(1, NOW - 5 * MIN)]), prerequisiteWait: true, review: { ...review, draft: true, ready: false, reasons: ["checks failed"] }, thread: { kind: "gone" } })), null);
+  }
+  for (const state of ["working", "addressing", "queued"] as const) {
+    assert.equal(plan(inReview({ phase: { state }, control }), facts({ prerequisiteWait: true, worker: WORKER, thread: { kind: "gone" } })), null);
+  }
 });

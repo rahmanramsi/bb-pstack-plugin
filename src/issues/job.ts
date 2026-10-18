@@ -502,8 +502,8 @@ export function plan(job: Job, facts: Facts): Action | null {
 function next(job: Job, facts: Facts): Action | null {
   const { phase } = job;
   const { now } = facts;
-  // A round handed to the worker for a pull request that has since closed would be a wasted turn or spawn.
-  if ((phase.state === "sending" || phase.state === "respawning") && facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job, facts.pr.state) };
+  if (facts.review?.kind === "observed" && facts.review.state !== "open") return { type: "change", change: close(job, facts.review.state, facts.review.target.head) };
+  if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job, facts.pr.state) };
   if (isTransit(phase.state) && "effects" in phase) {
     const head = phase.effects[0];
     const policy = EFFECT_POLICY[head.op];
@@ -521,7 +521,7 @@ function next(job: Job, facts: Facts): Action | null {
     if (phase.state === "review" && target) return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `prerequisites-draft:${job.id}:${job.version}`, target, draft: true }]) } };
     return { type: "change", change: { control } };
   }
-  if (facts.prerequisiteWait) return null;
+  if (facts.prerequisiteWait && phase.state !== "checking" && phase.state !== "review") return null;
 
   switch (phase.state) {
     case "queued": {
@@ -539,16 +539,15 @@ function next(job: Job, facts: Facts): Action | null {
       return { type: "change", change: start(job, facts.worker, now) };
     }
     case "checking":
-      if (facts.feedback?.pending.length && facts.review?.kind === "observed" && facts.review.draft && facts.review.state === "open") return feedbackAction(job, facts);
+      if (!facts.prerequisiteWait && facts.feedback?.pending.length && facts.review?.kind === "observed" && facts.review.draft) return feedbackAction(job, facts);
       return checkReview(job, facts);
     case "review": {
       const regression = checkReview(job, facts);
       if (regression) return regression;
-      return feedbackAction(job, facts);
+      return facts.prerequisiteWait ? null : feedbackAction(job, facts);
     }
     case "addressing":
     case "working": {
-      if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job, facts.pr.state) };
       if (facts.blockers?.length || facts.children?.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change")) return null;
       const thread = facts.thread;
       if (!thread) return null;
@@ -583,7 +582,6 @@ function feedbackAction(job: Job, facts: Facts): Action | null {
   const { pr, feedback } = facts;
   const now = facts.now;
   if (!pr || !feedback) return null;
-  if (pr.state !== "open") return { type: "change", change: close(job, pr.state) };
   if (feedback.pending.length === 0) return null;
   if (job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) {
     return { type: "change", change: stick(job, `unresolved feedback after ${MAX_FEEDBACK_ROUNDS} feedback rounds`) };
@@ -625,7 +623,6 @@ function checkReview(job: Job, facts: Facts): Action | null {
   }
   if (!review) return null;
   if (review.kind === "unavailable") return review.permanent ? { type: "change", change: stick(job, review.reason) } : null;
-  if (review.state !== "open") return { type: "change", change: close(job, review.state, review.target.head) };
   const target = review.target;
   const previous = job.control.readiness;
   const changed = previous && (previous.head !== target.head || previous.base !== target.base);
@@ -656,6 +653,7 @@ function checkReview(job: Job, facts: Facts): Action | null {
   if (facts.feedback?.pending.length && !review.draft) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `feedback-observed:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
   if (awaitingCI) return null;
   if (!review.draft && (!review.ready || !local)) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `checking-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+  if (facts.prerequisiteWait) return null;
   const grace = job.control.mergeabilityGrace;
   if (review.mergeability === "unknown") {
     const same = grace?.target.pr === target.pr && grace.target.head === target.head && grace.target.base === target.base;

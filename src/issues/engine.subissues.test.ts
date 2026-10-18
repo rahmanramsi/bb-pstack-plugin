@@ -40,6 +40,7 @@ test("host ancestry proves merged default-base prerequisites beyond the SDK comm
   h.gh().refs.set("main", "2".repeat(40));
   h.clock.now += 2 * 60_000;
   await h.settle();
+  await h.advance(MIN);
   const dependent = await h.byIssue(52);
   const response = await h.report(dependent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40)], ancestors: ["1".repeat(40), "2".repeat(40)], ahead: 1 });
   assert.equal(response.exitCode, 0, response.stderr);
@@ -507,3 +508,60 @@ test("checking retains local evidence but cannot promote ready during historical
   assert.equal((await h.byIssue(52)).outcome, "ready");
   assert.equal(h.store.get(dependent.id)!.control.repair, null);
 });
+
+for (const observation of ["merged", "head"] as const) {
+  test(`historical prerequisite contention cannot hide the dependent PR's observed ${observation}`, async () => {
+    let activityUnavailable = false;
+    const h = withParent([51, 52], { configureDeps(deps) {
+      const repo = deps.github.repo;
+      deps.github = { repo: (name, signal) => {
+        const client = repo(name, signal);
+        return { ...client, activity: async (...args) => {
+          if (activityUnavailable) throw new GitHubTransientError("activity temporarily unavailable", null);
+          return client.activity(...args);
+        } };
+      } };
+    } });
+    h.gh().issues.get(52)!.blockedBy = [51];
+    await h.settle();
+    const child = await h.byIssue(51);
+    await h.report(child.threadId!, GOOD); await h.advance(2 * MIN);
+    const dependent = await h.byIssue(52);
+    await h.report(dependent.threadId!, GOOD, { headSha: "4".repeat(40), ancestors: ["2".repeat(40)], ahead: 2 });
+    await h.advance(2 * MIN);
+    const ready = h.store.get(dependent.id)!;
+    assert.ok(ready.control.readiness);
+    const original = h.store.get(child.id)!;
+    h.store.write(original.id, original.version, { phase: { state: "done" }, control: { ...original.control, disposition: "merged", mergedHead: null, readiness: null } }, h.clock.now);
+    Object.assign(h.gh().pulls.get(original.pr!.number)!, { state: "closed", merged: true });
+    h.db.prepare("UPDATE issue_job_polls SET pr_state = 'merged' WHERE job_id = ?").run(child.id);
+    h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now, child.id);
+    assert.equal(h.store.claimReview(h.store.get(child.id)!, h.clock.now), true);
+    h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now, dependent.id);
+    if (observation === "merged") Object.assign(h.gh().pulls.get(ready.pr!.number)!, { state: "closed", merged: true });
+    else h.gh().refs.set(ready.branch, "5".repeat(40));
+    activityUnavailable = true;
+    const messages = h.sent.length;
+    const drafts = h.gh().draftConversions.length;
+    h.restart(); await h.settle();
+    await h.advance(15_000);
+    const observed = h.store.get(dependent.id)!;
+    assert.equal(h.store.jobPoll(dependent.id).prState, "open", "activity intentionally lags the review snapshot");
+    assert.equal(h.store.get(child.id)!.control.mergedHead, null, "the historical lookup remains contended");
+    assert.equal(observed.control.readiness, null);
+    assert.deepEqual(observed.control.prerequisites, ready.control.prerequisites);
+    assert.deepEqual(observed.control.localEvidence, ready.control.localEvidence);
+    assert.deepEqual(observed.control.repair, ready.control.repair);
+    assert.equal(observed.control.recoveries, ready.control.recoveries);
+    assert.equal(h.sent.length, messages);
+    if (observation === "merged") {
+      assert.equal(observed.phase.state, "done");
+      assert.equal(observed.control.disposition, "merged");
+      assert.equal(observed.control.mergedHead, "4".repeat(40));
+    } else {
+      assert.equal(observed.phase.state, "checking");
+      assert.equal(h.gh().issues.get(ready.pr!.number)!.pr!.draft, true);
+      assert.deepEqual(h.gh().draftConversions.slice(drafts), [true]);
+    }
+  });
+}
