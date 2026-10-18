@@ -600,3 +600,12 @@ test("a pull request merged while a round is being handed over ends the job inst
     assert.equal((merged as { change: Change }).change.phase?.state, "closing", current.phase.state);
   }
 });
+
+test("public failure classification survives effect settlement without publishing raw diagnostics", () => {
+  const current = job({ phase: enter("publishing", [pushEffect]) });
+  const change = settle(current, { kind: "fail", error: "/private/worktree: denied", publicFailure: { kind: "workflow-permission" } }, NOW);
+  assert.deepEqual(change.control?.publicFailure, { kind: "workflow-permission" });
+  assert.equal(change.error, "/private/worktree: denied");
+  const fallback = settle(current, { kind: "fail", error: "/private/worktree: offline" }, NOW);
+  assert.deepEqual(fallback.control?.publicFailure, { kind: "execution" });
+});

@@ -844,10 +844,10 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (tree.ok) { headSha = tree.headSha; control = { ...control, workspace: { environmentId: tree.environmentId, hostId: job.hostId, path: tree.path, branch: tree.branch }, preservation: tree.dirty ? "dirty and untracked work retained" : "local commits retained" }; }
         else control = { ...control, preservation: tree.error };
       } catch (error) { control = { ...control, preservation: message(error) }; }
-      const change = stick({ ...job, control }, report.reason);
+      const change = stick({ ...job, control }, report.reason, { kind: "report", reason: report.reason });
       const accepted: AcceptedReport = { ...report, headSha, acceptedAt: clock() };
       const result = { ok: true, message: "Failure report saved. The original work and reason are preserved." } as const;
-      const written = store.write(job.id, job.version, { ...change, control: { ...control, disposition: "failure", readiness: null }, report: accepted, evaluation: { submissionId: submission.id, result: JSON.stringify(result) } }, clock());
+      const written = store.write(job.id, job.version, { ...change, control: { ...control, publicFailure: { kind: "report", reason: report.reason }, disposition: "failure", readiness: null }, report: accepted, evaluation: { submissionId: submission.id, result: JSON.stringify(result) } }, clock());
       return written ? { code: "accepted", result } : reject("pending", "Report saved for evaluation after the current transition.");
     }
     try {

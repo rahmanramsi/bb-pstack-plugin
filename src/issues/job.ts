@@ -161,7 +161,7 @@ export type EffectOutcome =
   /** It did not happen, and may on a later try (5xx, rate limit, host offline). */
   | { kind: "retry"; error: string; notBefore: number | null }
   /** It did not happen and will not (permission denied, the remote branch moved, invalid input). */
-  | { kind: "fail"; error: string };
+  | { kind: "fail"; error: string; publicFailure?: PublicFailure };
 
 export type EffectPatch = { worker?: WorkerSettings; control?: Control; threadId?: string; pushedSha?: Sha; pr?: { number: number; url: string } };
 
@@ -250,7 +250,17 @@ export type Phase =
 
 export type ReviewTarget = { pr: number; head: Sha; base: Sha };
 export type Workspace = { environmentId: string; hostId: string; path: string; branch: string };
+export type PublicFailure =
+  | { kind: "workflow-permission" }
+  | { kind: "publication-denied" }
+  | { kind: "prerequisite"; issues: number[] }
+  | { kind: "verification" }
+  | { kind: "recovery-exhausted" }
+  | { kind: "report"; reason: string }
+  | { kind: "execution" };
+
 export type Control = {
+  publicFailure: PublicFailure | null;
   epoch: number;
   feedbackRounds: number;
   workspace: Workspace | null;
@@ -272,7 +282,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -492,7 +502,7 @@ function next(job: Job, facts: Facts): Action | null {
     if (phase.state === "review" && facts.review?.kind === "observed") return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `prerequisites-draft:${job.id}:${job.version}`, target: facts.review.target, draft: true }]) } };
     return { type: "change", change: { control } };
   }
-  if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem) };
+  if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem, { kind: "prerequisite", issues: job.control.prerequisites.map(({ issue }) => issue) }) };
 
   switch (phase.state) {
     case "queued": {
@@ -575,7 +585,7 @@ export function rejectReport(job: Job, reasons: readonly string[]): Change {
 }
 
 export function recover(job: Job, reason: string): Change {
-  if (job.control.recoveries >= MAX_RECOVERIES) return stick(job, `automatic recovery exhausted: ${reason}; work is preserved in ${job.control.workspace?.path ?? "the original worker environment"}`);
+  if (job.control.recoveries >= MAX_RECOVERIES) return stick(job, `automatic recovery exhausted: ${reason}; work is preserved in ${job.control.workspace?.path ?? "the original worker environment"}`, { kind: "recovery-exhausted" });
   const epoch = job.control.epoch + 1;
   return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null, idleObservation: null, workerContext: { round: job.round, text: job.control.workerContext?.text ?? "", recoveryReason: reason } }, nudges: 0, deadline: null, error: reason };
 }
@@ -607,7 +617,7 @@ function checkReview(job: Job, facts: Facts): Action | null {
   }
   if (facts.children?.length) {
     const failed = facts.children.filter((child) => child.state === "open" && child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
-    if (failed.length) return { type: "change", change: stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`) };
+    if (failed.length) return { type: "change", change: stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`, { kind: "prerequisite", issues: failed.map((child) => child.number) }) };
     const pending = facts.children.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change");
     if (pending) {
       if (job.phase.state === "review") return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `children-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null, localEvidence: null } } };
@@ -633,7 +643,7 @@ function checkReview(job: Job, facts: Facts): Action | null {
   const cause = local ? review.fingerprint : "local-evidence";
   const counts = job.control.repair?.counts ?? (job.control.repair ? { [job.control.repair.cause]: job.control.repair.attempts } : {});
   const attempts = (counts[cause] ?? 0) + 1;
-  if (attempts > MAX_REPAIRS) return { type: "change", change: stick(job, `repair exhausted for ${cause}: ${review.reasons.join("; ") || "fresh head-bound local verification is missing"}`) };
+  if (attempts > MAX_REPAIRS) return { type: "change", change: stick(job, `repair exhausted for ${cause}: ${review.reasons.join("; ") || "fresh head-bound local verification is missing"}`, { kind: "verification" }) };
   const ordinal = job.round + 1;
   const text = [workerInstructionsForRepair(job, target, review.reasons), `Report round ${ordinal - 1} with replies [] and checks you ran in this worker.`].join("\n");
   return { type: "change", change: { phase: enter("repairing", [{ op: "set-draft", key: `repair-draft:${job.id}:${ordinal}`, target, draft: true }, { op: "send-round", key: `repair:${job.id}:${ordinal}`, text }]), startRound: { ordinal, kind: "feedback", cause: review.reasons.some((reason) => reason.includes("conflicting")) ? "conflict" : "ci", target, baseSha: target.head, feedback: [] }, roundBase: target.head, control: { ...job.control, readiness: null, workerContext: { round: ordinal, text, recoveryReason: null }, repair: { cause, attempts, counts: { ...counts, [cause]: attempts } } }, nudges: 0, rejections: 0, error: null } };
@@ -650,7 +660,7 @@ function track(job: Job, children: readonly ChildFact[]): Action | null {
   const open = children.filter((child) => child.state === "open");
   const failed = open.filter((child) => child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
   const progressing = open.some((child) => !child.job || (!TERMINAL.has(child.job.state) && !child.job.ready));
-  if (!progressing && failed.length) return { type: "change", change: { ...stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`), progress: body } };
+  if (!progressing && failed.length) return { type: "change", change: { ...stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`, { kind: "prerequisite", issues: failed.map((child) => child.number) }), progress: body } };
   if (!progressing && failed.length === 0) {
     const commits = children.flatMap((child) => child.job?.branch && child.job.sha ? [`Merge origin/${child.job.branch} at ${child.job.sha} for #${child.number}.`] : []);
     return { type: "change", change: { phase: { state: "queued" }, control: { ...job.control, prerequisites: integrationPrerequisites(children) }, progress: [body, "Verify the combined result in this issue's own worker.", ...commits].join("\n\n"), error: null } };
@@ -715,7 +725,7 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
       return { phase: enter("recovering", effects), startRound: { ordinal, kind: "feedback", cause: "publication", baseSha: outcome.remoteSha, feedback: [], feedbackFrom: job.round }, roundBase: outcome.remoteSha, control: { ...control, workerContext: { round: ordinal, text, recoveryReason: null } }, nudges: 0, rejections: 0, error: `publication requires reconciliation with ${outcome.remoteSha}: ${outcome.reason}` };
     }
     case "fail":
-      return head.op === "send-round" ? recover(job, outcome.error) : stick(job, outcome.error);
+      return head.op === "send-round" ? recover(job, outcome.error) : stick(job, outcome.error, outcome.publicFailure);
   }
 }
 
@@ -787,11 +797,11 @@ function endingEffects(job: Job, kind: "stop" | "stick" | "close"): Effect[] {
  * Any non-terminal state → sticking. A job already on its way to an end goes there directly and drops the rest of its
  * outbox, so an effect that keeps failing while the job ends cannot loop.
  */
-export function stick(job: Job, reason: string): Change {
+export function stick(job: Job, reason: string, publicFailure: PublicFailure = { kind: "execution" }): Change {
   const state = job.phase.state;
   if (state === "stopping" || state === "stopped") return { phase: { state: "stopped" } };
   if (state === "sticking" || TERMINAL.has(state)) return { phase: { state: "stuck" } };
-  return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason, control: { ...job.control, readiness: null, disposition: "failure" } };
+  return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason, control: { ...job.control, publicFailure, readiness: null, disposition: "failure" } };
 }
 
 export function canStop(state: JobState): boolean {
@@ -951,7 +961,7 @@ function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts
       break;
   }
   const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted, ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, readiness: null, disposition: "failure" as const } } : report.outcome === "no-change" ? { control: { ...job.control, disposition: "no-change" as const } } : {}) }));
+  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted, ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, readiness: null, disposition: "failure" as const, publicFailure: { kind: "report" as const, reason: report.reason } } } : report.outcome === "no-change" ? { control: { ...job.control, disposition: "no-change" as const } } : {}) }));
 }
 
 function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
@@ -993,7 +1003,7 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
     if (length > COMMENT_MAX) reasons.push(`${where} is ${length} characters as posted; GitHub's limit is ${COMMENT_MAX}`);
   }
   const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted, ...(job.control.publicationRepair && report.outcome === "no-change" ? { pushedSha: facts.worktree.headSha } : {}), ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, disposition: "failure" as const } } : {}) }));
+  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted, ...(job.control.publicationRepair && report.outcome === "no-change" ? { pushedSha: facts.worktree.headSha } : {}), ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, disposition: "failure" as const, publicFailure: { kind: "report" as const, reason: report.reason } } } : {}) }));
 }
 
 /**
