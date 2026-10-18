@@ -309,18 +309,39 @@ test("a worker cannot stop jobs, and a thread naming a job that is not waiting f
   assert.deepEqual(h.stopped, ["thr_dup"]);
 });
 
-test("a worker role bb cannot run sticks the job at once with the reason, before any label or spawn", async () => {
+test("a worker role the mapped host cannot run creates no job, shows why on the repository, and the issue starts once it is fixed", async () => {
   for (const [role, reason] of [["codex/gpt-6.1-sol/extreme", /reasoning level "extreme"/], ["codex/gpt-missing/high", /codex\/gpt-missing\/high: not in the host's catalog/]] as const) {
     const h = harness();
     h.setWorkerRole(role);
     h.label(41);
     await h.engine().issues.sweep();
-    const job = await h.only();
-    assert.equal(job.state, "stuck");
-    assert.match(job.error!, reason);
+    assert.deepEqual(await h.views(), []);
     assert.equal(h.spawned.length, 0);
     assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
+    const listed = (await h.engine().run(["issues", "list"])).stdout!;
+    assert.match(listed, /poll error: issue worker cannot run on host host_worker: /);
+    assert.match(listed, reason);
+
+    h.setWorkerRole("codex/gpt-6.1-sol/high");
+    h.clock.now += MIN;
+    await h.engine().issues.sweep();
+    assert.equal((await h.only()).state, "working");
+    assert.equal(h.store.repoPoll(REPO).error, null);
   }
+});
+
+test("the engine answers doctor with the poll's resolution: inherit-parent is the project default, and an unreachable project is not permanent", async () => {
+  const h = harness();
+  h.setWorkerRole("inherit-parent");
+  assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_web", hostId: "host_worker" }), {
+    providerId: "claude-code",
+    model: "claude-opus-5-5",
+    reasoningLevel: "high",
+    permissionMode: "full",
+  });
+  assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_offline", hostId: "host_worker" }), { error: "project settings are unavailable", permanent: false });
+  h.setWorkerRole("codex/gpt-missing/high");
+  assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_web", hostId: "host_worker" }), { error: "codex/gpt-missing/high: not in the host's catalog", permanent: true });
 });
 
 test("queued jobs that cannot resolve their worker yet do not hold back a job that can", async () => {

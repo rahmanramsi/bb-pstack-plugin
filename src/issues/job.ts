@@ -317,6 +317,9 @@ export type ThreadFact =
  */
 export type WorkerProblem = { error: string; permanent: boolean };
 
+/** Where an issue worker runs: a job, or the repository mapping that will create jobs. */
+export type WorkerTarget = { projectId: string; hostId: string };
+
 export type GateFact = { pass: true } | { pass: false; reason: string };
 
 export type PullState = "open" | "merged" | "closed";

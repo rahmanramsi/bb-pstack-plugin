@@ -54,6 +54,7 @@ import {
   type SubIssue,
   type WorkerProblem,
   type WorkerSettings,
+  type WorkerTarget,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 import { commentBody, effectMarker, mergeNote, workerInstructions } from "./text.ts";
@@ -98,6 +99,8 @@ export type Issues = {
   sweep(): Promise<void>;
   /** Moves the job to stopping and starts its ending effects. False when it already ended or is ending, or does not exist. */
   stop(id: JobId, by: string): Promise<boolean>;
+  /** The issue worker's settings on the target, or why it cannot run there. The poll and `bb pstack doctor` both ask this. */
+  resolveWorker(target: WorkerTarget): Promise<WorkerSettings | WorkerProblem>;
 };
 
 export type ReportResult = { ok: true; message: string } | { ok: false; code: string; message: string };
@@ -370,22 +373,22 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function resolveWorker(job: Job): Promise<WorkerSettings | WorkerProblem> {
+  async function resolveWorker(target: WorkerTarget): Promise<WorkerSettings | WorkerProblem> {
     const permanent = (error: string): WorkerProblem => ({ error, permanent: true });
     const choice = deps.resolveRole("issue worker")[0];
     if (!choice) return permanent("no model is configured for the issue worker role");
     try {
-      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: job.projectId });
+      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: target.projectId });
       const permissionMode = defaults?.permissionMode ?? null;
       let worker: WorkerSettings;
       if (choice.kind === "tuple") {
         if (!isReasoningLevel(choice.reasoningLevel)) return permanent(`the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows`);
         worker = { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
       } else {
-        if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
+        if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${target.projectId} has no default`);
         worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
       }
-      const problem = await deps.checkWorker(job.hostId, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
+      const problem = await deps.checkWorker(target.hostId, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
       return problem ? permanent(problem) : worker;
     } catch (error) {
       return { error: message(error), permanent: false };
@@ -647,7 +650,7 @@ export function createIssues(deps: IssuesDeps): Issues {
    * pull request's feedback that counts is stored: job.ts's rules pass, and its author has write access and is not
    * the App.
    */
-  async function pollJobs(repo: RepoClient): Promise<void> {
+  async function pollJobs(repo: RepoClient, canStart: boolean): Promise<void> {
     const jobs = store.list({ repo: repo.name, all: false });
     if (jobs.length === 0) return;
     const appLogin = await repo.appLogin();
@@ -672,7 +675,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           }
           store.recordPoll(job.id, { cursor: result.next, prState: result.pull?.state ?? null, feedback }, clock());
           if (stopper) await stop(job.id, `@${stopper} on GitHub`);
-          else if (job.phase.state === "tracking" || job.phase.state === "updating") await pollChildren(repo, job);
+          else if (job.phase.state === "tracking" || job.phase.state === "updating") await pollChildren(repo, job, canStart);
         } catch (error) {
           store.recordPollError(job.id, message(error), clock());
         }
@@ -681,10 +684,10 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   /**
-   * A parent's sub-issues and their blockers. Stops the parent when its issue lost the label or closed, and inserts a
-   * job for each open sub-issue that has neither an open job nor one this parent created.
+   * A parent's sub-issues and their blockers. Stops the parent when its issue lost the label or closed, and, when
+   * `canStart`, inserts a job for each open sub-issue that has neither an open job nor one this parent created.
    */
-  async function pollChildren(repo: RepoClient, parent: Job): Promise<void> {
+  async function pollChildren(repo: RepoClient, parent: Job, canStart: boolean): Promise<void> {
     const issue = await repo.issue(parent.issue);
     if (!issue.open || !issue.labels.includes(LABEL.trigger)) {
       await stop(parent.id, issue.open ? `removing the ${LABEL.trigger} label` : "closing the issue");
@@ -695,6 +698,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       listed.map(async ({ number, title, url, state }) => ({ number, title, url, state, blockedBy: state === "open" ? await repo.blockedBy(number) : [] })),
     );
     store.saveChildren(parent.id, children, clock());
+    if (!canStart) return;
     const created = new Set(store.children(parent.id).map((job) => job.issue));
     const baseBranch = await repo.defaultBranch();
     const { title, body, url } = parent.snapshot;
@@ -728,13 +732,20 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     const repo = github.repo(mapping.repo);
     const errors: string[] = [];
-    try {
-      cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
-    } catch (error) {
-      errors.push(message(error));
+    // A job created now would stick at once. The cursor stays put, so the issues labeled meanwhile start once the
+    // configuration is fixed; a problem that may clear by itself gates nothing.
+    const worker = await resolveWorker(mapping);
+    const canStart = !("error" in worker && worker.permanent);
+    if (!canStart) errors.push(`issue worker cannot run on host ${mapping.hostId}: ${worker.error}`);
+    else {
+      try {
+        cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
+      } catch (error) {
+        errors.push(message(error));
+      }
     }
     try {
-      await pollJobs(repo);
+      await pollJobs(repo, canStart);
     } catch (error) {
       errors.push(message(error));
     }
@@ -827,6 +838,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       await Promise.all([...running.values()].map((entry) => entry.done.catch(() => {})));
     },
     stop,
+    resolveWorker,
   };
 }
 

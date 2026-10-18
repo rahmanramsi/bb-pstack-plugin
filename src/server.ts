@@ -40,6 +40,7 @@ import {
 } from "./models.ts";
 import {
   checkRoles,
+  checkIssueWorker,
   checkTuple,
   failedChecks,
   loadCatalog,
@@ -361,7 +362,7 @@ export default async function plugin(bb: BbPluginApi) {
         }),
         doctor: cliCommand({
           summary:
-            "Check that every role's model exists in the live provider catalog",
+            "Check that every role's model exists in the live provider catalog, and that the issue worker can run on each issue repository's host",
           options: {
             environment: {
               type: "string",
@@ -378,7 +379,9 @@ export default async function plugin(bb: BbPluginApi) {
               environmentId = thread.environmentId ?? undefined;
             }
             const catalog = await loadCatalog(bb, environmentId ? { environmentId } : {}, providerIds(roles));
-            const checks: Check[] = checkRoles(roles, catalog);
+            const configured = roles.find((role) => role.role === "issue worker")?.models[0] ?? "none";
+            const workers = await Promise.all(issueRepos().map(async (mapping) => checkIssueWorker(mapping, configured, await issues.resolveWorker(mapping))));
+            const checks: Check[] = [...checkRoles(roles, catalog), ...workers];
             const failed = failedChecks(checks);
             return {
               exitCode: failed.length > 0 ? 1 : 0,

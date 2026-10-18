@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import type { WorkerProblem, WorkerSettings } from "./issues/job.ts";
 import { parseChoice, type EffectiveRole } from "./models.ts";
 
 export type CatalogModel = { model: string; levels: readonly string[] };
@@ -63,6 +64,16 @@ export function checkRoles(roles: readonly EffectiveRole[], catalog: Catalog): C
       subject: `${role.role}: ${value}`,
     })),
   );
+}
+
+/**
+ * One issue repository's worker, as the poll resolves it on the mapped host. `configured` is the role's value, which
+ * may be inherit-parent; the detail names the tuple it resolved to.
+ */
+export function checkIssueWorker(mapping: { repo: string; hostId: string }, configured: string, worker: WorkerSettings | WorkerProblem): Check {
+  const subject = `issue worker on host ${mapping.hostId} for ${mapping.repo}: ${configured}`;
+  if (!("error" in worker)) return { ok: true, subject, detail: `runs ${worker.providerId}/${worker.model}/${worker.reasoningLevel}` };
+  return { ok: false, subject, detail: worker.permanent ? worker.error : `could not check: ${worker.error}` };
 }
 
 export function providerIds(roles: readonly EffectiveRole[]): string[] {

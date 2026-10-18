@@ -91,3 +91,20 @@ test("removing the label from the parent stops it", async () => {
   await h.settle();
   for (const issue of [50, 51, 52]) assert.equal((await h.byIssue(issue)).state, "stopped", `#${issue}`);
 });
+
+test("a parent creates no child job while the issue worker cannot run, and creates it once the role is fixed", async () => {
+  const h = withParent([51]);
+  await h.settle();
+  h.gh().issues.set(53, { number: 53, title: "Part 53", body: "Do part 53.", user: "maya", updatedAt: h.clock.now, labels: new Set() });
+  h.gh().issues.get(50)!.subIssues = [51, 53];
+  h.setWorkerRole("codex/gpt-missing/high");
+  h.clock.now += 2 * 60_000;
+  await h.settle();
+  assert.equal((await h.views()).find((job) => job.issue === 53), undefined);
+  assert.equal((await h.byIssue(50)).state, "tracking");
+
+  h.setWorkerRole("codex/gpt-6.1-sol/high");
+  h.clock.now += 2 * 60_000;
+  await h.settle();
+  assert.equal((await h.byIssue(53)).state, "working");
+});

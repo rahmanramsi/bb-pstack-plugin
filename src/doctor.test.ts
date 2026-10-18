@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  checkIssueWorker,
   checkRoles,
   checkTuple,
   failedChecks,
@@ -55,4 +56,17 @@ test("a multi-line detail stays on its check's line", () => {
     { ok: false, subject: "bug-fix: x/y/z", detail: "boom\n  at stack\n" },
   ]);
   assert.equal(rendered, "FAIL  bug-fix: x/y/z  (boom at stack)");
+});
+
+test("an issue worker check names the repository and host, passes with the resolved tuple, and fails on any problem", () => {
+  const mapping = { repo: "acme/web", hostId: "host_linux" };
+  const ok = checkIssueWorker(mapping, "inherit-parent", { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", permissionMode: null });
+  assert.deepEqual(ok, { ok: true, subject: "issue worker on host host_linux for acme/web: inherit-parent", detail: "runs claude-code/claude-opus-5-5/high" });
+  const missing = checkIssueWorker(mapping, "codex/gpt-9/high", { error: "codex/gpt-9/high: codex has no model", permanent: true });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.detail, "codex/gpt-9/high: codex has no model");
+  const offline = checkIssueWorker(mapping, "codex/gpt-9/high", { error: "host offline", permanent: false });
+  assert.equal(offline.ok, false);
+  assert.equal(offline.detail, "could not check: host offline");
+  assert.deepEqual(failedChecks([ok, missing, offline]).map((check) => check.detail), [missing.detail, offline.detail]);
 });
