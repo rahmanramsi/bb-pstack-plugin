@@ -392,7 +392,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       return rounds.map((round) => ({ ordinal: round.ordinal, summary: round.report_json === null ? null : ((JSON.parse(round.report_json) as AcceptedReport).summary ?? null) }));
     },
     roundFeedback(id, ordinal) {
-      const rows = db.prepare("SELECT * FROM issue_feedback WHERE job_id = ? AND round = ? ORDER BY created_at, github_id").all(id, ordinal) as FeedbackRow[];
+      const rows = db.prepare("SELECT f.* FROM issue_feedback f JOIN issue_rounds r ON r.job_id = f.job_id AND f.round = coalesce(r.feedback_round, r.ordinal) WHERE r.job_id = ? AND r.ordinal = ? ORDER BY f.created_at, f.github_id").all(id, ordinal) as FeedbackRow[];
       return rows.map(parseFeedback);
     },
     repoPoll(repo) {
@@ -413,10 +413,11 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     write: db.transaction((id: JobId, version: number, change: Change, now: number): Job | null => {
       // Feedback that arrived after plan() read the queue is newer than the quiet period it checked: refuse, so the
       // replan sees it and waits again, instead of leaving it for a round of its own.
-      if (change.startRound?.kind === "feedback") {
+      if (change.startRound?.kind === "feedback" && change.startRound.feedbackFrom === undefined) {
         const { waiting } = db.prepare("SELECT count(*) AS waiting FROM issue_feedback WHERE job_id = ? AND round IS NULL").get(id) as { waiting: number };
         if (waiting !== change.startRound.feedback.length) return null;
       }
+      const previous = change.startRound ? get(id) : null;
       const set = columns(change);
       const names = Object.keys(set);
       const assignments = [...names.map((name) => `${name} = ?`), "version = version + 1", "runtime_revision = runtime_revision + 1", "updated_at = ?"].join(", ");
@@ -425,7 +426,14 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       const job = get(id)!;
       if (change.startRound) {
         const { ordinal, kind, baseSha, feedback } = change.startRound;
-        db.prepare("INSERT INTO issue_rounds (job_id, ordinal, kind, started_at, base_sha, cause, target_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, ordinal, kind, now, baseSha, change.startRound.cause ?? kind, change.startRound.target ? JSON.stringify(change.startRound.target) : null);
+        if (previous && ordinal > previous.round) db.prepare("UPDATE issue_rounds SET finished_at = ?, outcome_json = coalesce(outcome_json, ?) WHERE job_id = ? AND ordinal = ? AND finished_at IS NULL").run(now, JSON.stringify({ state: previous.phase.state, report: previous.report?.outcome ?? null, headSha: previous.report?.headSha ?? null }), id, previous.round);
+        let feedbackRound: number | null = null;
+        if (change.startRound.feedbackFrom !== undefined) {
+          const source = db.prepare("SELECT coalesce(feedback_round, ordinal) AS ordinal FROM issue_rounds WHERE job_id = ? AND ordinal = ? AND ordinal < ?").get(id, change.startRound.feedbackFrom, ordinal) as { ordinal: number } | undefined;
+          if (!source || feedback.length) throw new Error("publication repair must inherit an existing round's feedback");
+          feedbackRound = source.ordinal;
+        }
+        db.prepare("INSERT INTO issue_rounds (job_id, ordinal, kind, started_at, base_sha, cause, target_json, feedback_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, ordinal, kind, now, baseSha, change.startRound.cause ?? kind, change.startRound.target ? JSON.stringify(change.startRound.target) : null, feedbackRound);
         const send = db.prepare("UPDATE issue_feedback SET round = ? WHERE job_id = ? AND kind = ? AND github_id = ? AND round IS NULL");
         for (const ref of feedback) {
           if (send.run(ordinal, id, ref.kind, ref.id).changes !== 1) throw new Error(`issue job ${id}: ${ref.kind} ${ref.id} is not pending feedback`);

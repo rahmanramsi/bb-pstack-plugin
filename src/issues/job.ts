@@ -150,6 +150,7 @@ export const MAX_REPAIRS = 5;
 const BACKOFF_MS = [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
 
 export type EffectOutcome =
+  | { kind: "publication-diverged"; remoteSha: Sha; reason: "stale-remote" | "not-descendant" }
   | { kind: "changed-target"; target: ReviewTarget }
   /** It happened, now or earlier (the probe found it). */
   | { kind: "done"; patch: EffectPatch }
@@ -262,13 +263,15 @@ export type Control = {
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
   objectRepair: { sha: Sha } | null;
   idleObservation: { since: number; remindedAt: number } | null;
+  publicationRepair: { acceptedSha: Sha; remoteSha: Sha; remaining: readonly Effect[]; attempts: number } | null;
+  workerContext: { round: number; text: string; recoveryReason: string | null } | null;
   prerequisites: readonly { issue: number; branch: BranchName; sha: Sha }[];
   policyLimitation: string | null;
   disposition: "merged" | "closed" | "no-change" | "failure" | "stopped" | null;
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -314,7 +317,7 @@ export type Job = {
  * A round's start, written with the job in one transaction: the round's history row, and every listed feedback item
  * marked as sent in it. Items that arrive later stay pending for the next round.
  */
-export type RoundStart = { ordinal: number; kind: "initial" | "feedback"; cause?: "initial" | "feedback" | "ci" | "conflict"; target?: ReviewTarget; baseSha: Sha | null; feedback: readonly FeedbackRef[] };
+export type RoundStart = { ordinal: number; kind: "initial" | "feedback"; cause?: "initial" | "feedback" | "ci" | "conflict" | "publication"; target?: ReviewTarget; baseSha: Sha | null; feedback: readonly FeedbackRef[]; feedbackFrom?: number };
 
 /** The write vocabulary for an existing job. `phase` replaces state, outbox and bookkeeping together. */
 export type Change = {
@@ -570,7 +573,7 @@ export function rejectReport(job: Job, reasons: readonly string[]): Change {
 export function recover(job: Job, reason: string): Change {
   if (job.control.recoveries >= MAX_RECOVERIES) return stick(job, `automatic recovery exhausted: ${reason}; work is preserved in ${job.control.workspace?.path ?? "the original worker environment"}`);
   const epoch = job.control.epoch + 1;
-  return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null, idleObservation: null }, nudges: 0, deadline: null, error: reason };
+  return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null, idleObservation: null, workerContext: { round: job.round, text: job.control.workerContext?.text ?? "", recoveryReason: reason } }, nudges: 0, deadline: null, error: reason };
 }
 
 export type ReviewFact =
@@ -615,7 +618,7 @@ function checkReview(job: Job, facts: Facts): Action | null {
   if (attempts > MAX_REPAIRS) return { type: "change", change: stick(job, `repair exhausted for ${cause}: ${review.reasons.join("; ") || "fresh head-bound local verification is missing"}`) };
   const ordinal = job.round + 1;
   const text = [workerInstructionsForRepair(job, target, review.reasons), `Report round ${ordinal - 1} with replies [] and checks you ran in this worker.`].join("\n");
-  return { type: "change", change: { phase: enter("repairing", [{ op: "set-draft", key: `repair-draft:${job.id}:${ordinal}`, target, draft: true }, { op: "send-round", key: `repair:${job.id}:${ordinal}`, text }]), startRound: { ordinal, kind: "feedback", cause: review.reasons.some((reason) => reason.includes("conflicting")) ? "conflict" : "ci", target, baseSha: target.head, feedback: [] }, roundBase: target.head, control: { ...job.control, readiness: null, repair: { cause, attempts, counts: { ...counts, [cause]: attempts } } }, nudges: 0, rejections: 0, error: null } };
+  return { type: "change", change: { phase: enter("repairing", [{ op: "set-draft", key: `repair-draft:${job.id}:${ordinal}`, target, draft: true }, { op: "send-round", key: `repair:${job.id}:${ordinal}`, text }]), startRound: { ordinal, kind: "feedback", cause: review.reasons.some((reason) => reason.includes("conflicting")) ? "conflict" : "ci", target, baseSha: target.head, feedback: [] }, roundBase: target.head, control: { ...job.control, readiness: null, workerContext: { round: ordinal, text, recoveryReason: null }, repair: { cause, attempts, counts: { ...counts, [cause]: attempts } } }, nudges: 0, rejections: 0, error: null } };
 }
 
 function workerInstructionsForRepair(job: Job, target: ReviewTarget, reasons: readonly string[]): string {
@@ -665,7 +668,8 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
       // On the way to stuck or stopped the error is the reason, so it outlives the effects.
       const ending = phase.state === "sticking" || phase.state === "stopping";
       if (phase.state === "readifying" && outcome.patch.control?.readiness === null) return { phase: { state: "checking" }, ...outcome.patch };
-      return { phase: phase.state === "recovering" && rest.length === 0 && job.round > 1 ? { state: "addressing" } : enter(phase.state, rest), ...outcome.patch, ...(ending ? {} : { error: null }) };
+      const completedPublication = rest.length === 0 && (phase.state === "publishing" || phase.state === "republishing" || phase.state === "replying");
+      return { phase: phase.state === "recovering" && rest.length === 0 && job.pr ? { state: "addressing" } : enter(phase.state, rest), ...outcome.patch, ...(completedPublication && job.control.publicationRepair ? { control: { ...(outcome.patch.control ?? job.control), publicationRepair: null } } : {}), ...(ending ? {} : { error: null }) };
     }
     case "absent": {
       const { recovery } = EFFECT_POLICY[head.op];
@@ -678,9 +682,29 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
       return { phase: { ...phase, leaseUntil: null, nextAt: backoff() }, error: outcome.error };
     case "retry":
       return { phase: { ...phase, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
+    case "publication-diverged": {
+      if (head.op !== "push") throw new Error("publication divergence requires a pinned push");
+      const attempts = (job.control.publicationRepair?.attempts ?? 0) + 1;
+      if (attempts > MAX_REPAIRS) return stick(job, `publication divergence exhausted after ${MAX_REPAIRS} repairs; accepted commit ${head.sha} and remote ${outcome.remoteSha} are preserved`);
+      const ordinal = job.round + 1;
+      const control = { ...job.control, readiness: null, localEvidence: null, publicationRepair: { acceptedSha: head.sha, remoteSha: outcome.remoteSha, remaining: phase.effects.slice(1), attempts } };
+      const current = { ...job, control, round: ordinal, roundBase: outcome.remoteSha };
+      const text = publicationRepairPrompt(current);
+      const effects: Effect[] = [
+        ...(job.pr && job.control.localEvidence ? [{ op: "set-draft", key: `publication-draft:${job.id}:${ordinal}`, target: { pr: job.pr.number, head: outcome.remoteSha, base: job.control.localEvidence.base }, draft: true } as const] : []),
+        { op: "send-round", key: `publication-repair:${job.id}:${ordinal}`, text },
+      ];
+      return { phase: enter("recovering", effects), startRound: { ordinal, kind: "feedback", cause: "publication", baseSha: outcome.remoteSha, feedback: [], feedbackFrom: job.round }, roundBase: outcome.remoteSha, control: { ...control, workerContext: { round: ordinal, text, recoveryReason: null } }, nudges: 0, rejections: 0, error: `publication requires reconciliation with ${outcome.remoteSha}: ${outcome.reason}` };
+    }
     case "fail":
       return head.op === "send-round" ? recover(job, outcome.error) : stick(job, outcome.error);
   }
+}
+
+export function publicationRepairPrompt(job: Job): string {
+  const repair = job.control.publicationRepair;
+  if (!repair) return "";
+  return [`Preserve accepted commit ${repair.acceptedSha}. The current remote head of ${job.branch} is ${repair.remoteSha}.`, `Fetch with bb pstack gh fetch in this worker. Integrate both commits without overwriting collaborator work. Merge only when ancestry requires it. Preserve dirty and untracked files. Run the relevant checks again in this worker.`, `Submit a fresh report for round ${job.round - 1}, including every assigned feedback reply. Report changes when HEAD adds work beyond the remote, or no-change with fresh verification when the remote already contains the accepted work. Never execute supplied verification descriptions.`, ...(job.report && "replies" in job.report ? [`Assigned feedback replies retained from the accepted report: ${JSON.stringify(job.report.replies)}`] : [])].join("\n");
 }
 
 /** queued → starting: label the issue, then spawn the worker. Starts the round's clock. */
@@ -708,7 +732,7 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
     error: null,
   } as const;
   const draft: Effect[] = job.control.readiness ? [{ op: "set-draft", key: `feedback-draft:${job.id}:${ordinal}`, target: job.control.readiness, draft: true }] : [];
-  const control = { ...job.control, readiness: null, feedbackRounds: job.control.feedbackRounds + 1 };
+  const control = { ...job.control, readiness: null, feedbackRounds: job.control.feedbackRounds + 1, workerContext: { round: ordinal, text, recoveryReason: null } };
   if (!respawn) return { phase: enter("sending", [...draft, relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round, control };
   if (!job.worker) return stick(job, "the worker thread is gone and the job has no worker settings to start another");
   return { ...recover({ ...job, control }, "the feedback worker is unavailable"), ...round };
@@ -886,6 +910,7 @@ export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts)
     const milestone = !job.control.milestones.includes("verified-change");
     verdict.change.control = { ...(verdict.change.control ?? job.control), localEvidence: { head: facts.worktree.headSha, base: facts.baseSha }, invalid: 0, bestReasons: null, ...(milestone ? { milestones: [...job.control.milestones, "verified-change"], recoveries: 0 } : {}) };
   }
+  if (verdict.ok && verdict.change.phase?.state === "checking" && job.control.publicationRepair) verdict.change.control = { ...(verdict.change.control ?? job.control), publicationRepair: null };
   return { ...verdict, change: rounded(job, verdict.change) };
 }
 
@@ -909,8 +934,20 @@ function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts
 
 function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
   const base = roundBase(job)!;
-  if (facts.remoteHead !== null && facts.remoteHead !== base) return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead } };
+  if (facts.remoteHead !== null && facts.remoteHead !== base) {
+    if (job.control.publicationRepair) {
+      const repair = { ...job.control.publicationRepair, remoteSha: facts.remoteHead, attempts: job.control.publicationRepair.attempts + 1 };
+      if (repair.attempts > MAX_REPAIRS) return { ok: false, reasons: ["publication divergence exhausted"], change: stick(job, "publication divergence exhausted while the worker was reconciling remote changes; accepted work is preserved") };
+      const current = { ...job, roundBase: facts.remoteHead, control: { ...job.control, publicationRepair: repair } };
+      return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead, control: { ...current.control, workerContext: { round: job.round, text: publicationRepairPrompt(current), recoveryReason: null } } } };
+    }
+    return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead } };
+  }
   const reasons = commitProblems(job, report.outcome, facts.worktree, `${base.slice(0, 7)}, the head of \`${job.branch}\``);
+  if (job.control.publicationRepair && report.outcome !== "failure") {
+    if (!containsSha(facts.worktree, job.control.publicationRepair.acceptedSha)) reasons.push(`HEAD must preserve accepted commit ${job.control.publicationRepair.acceptedSha}`);
+    if (!facts.gate.pass) reasons.push(`\`bb pstack gate pr\` fails: ${facts.gate.reason}`);
+  }
   if (report.outcome !== "failure" && !containsSha(facts.worktree, base)) {
     reasons.push(`HEAD does not contain ${base.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`bb pstack gh fetch\`, merge \`origin/${job.branch}\`, and report again`);
   }
@@ -934,7 +971,7 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
     if (length > COMMENT_MAX) reasons.push(`${where} is ${length} characters as posted; GitHub's limit is ${COMMENT_MAX}`);
   }
   const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted, ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, disposition: "failure" as const } } : {}) }));
+  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted, ...(job.control.publicationRepair && report.outcome === "no-change" ? { pushedSha: facts.worktree.headSha } : {}), ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, disposition: "failure" as const } } : {}) }));
 }
 
 /**
@@ -943,6 +980,22 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
  */
 function republication(job: Job, report: RoundReport & AcceptedReport, listed: readonly Feedback[]): [TransitState, Effect[]] {
   if (report.outcome === "failure") return ["sticking", endingEffects(job, "stick")];
+  if (job.control.publicationRepair) {
+    const remaining = job.control.publicationRepair.remaining.map((effect): Effect => {
+      if (effect.op === "reply") {
+        const reply = report.replies.find((reply) => reply.kind === effect.target.kind && reply.commentId === effect.target.id);
+        const item = listed.find((item) => item.kind === effect.target.kind && item.id === effect.target.id);
+        return reply && item ? replyEffect(job, reply, item) : effect;
+      }
+      if ((effect.op === "open-pr" || effect.op === "edit-pr") && report.outcome === "changes" && report.pr) return { ...effect, body: prBody(report.pr.body, job.issue) };
+      return effect;
+    });
+    if (job.pr && report.outcome === "changes" && report.pr && !remaining.some((effect) => effect.op === "edit-pr")) remaining.push({ op: "edit-pr", key: `edit-pr:${job.id}:${job.round}`, body: prBody(report.pr.body, job.issue) });
+    return [job.pr ? "republishing" : "publishing", [
+      ...(report.outcome === "changes" ? [{ op: "push", key: `push:${job.id}:${job.round}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: roundBase(job) } as const] : []),
+      ...remaining,
+    ]];
+  }
   const replies: Effect[] = report.replies.map((reply) => replyEffect(job, reply, listed.find((item) => refKey(item) === refKey({ kind: reply.kind, id: reply.commentId }))!));
   const reviewers = [...new Set(listed.map((item) => item.author))];
   const after: Effect[] = [

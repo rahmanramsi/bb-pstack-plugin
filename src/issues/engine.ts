@@ -32,6 +32,7 @@ import { acceptSync,
   awaitingThread,
   containsSha,
   integrationPrerequisites,
+  publicationRepairPrompt,
   isTransit,
   TRANSIT,
   command,
@@ -179,7 +180,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   function recoveryPrompt(job: Job): string {
-    return [`Continue issue #${job.issue} in the existing workspace. Preserve dirty/untracked files and all local commits.`, `The previous worker stopped after ${job.error ?? "incomplete delivery"}.`, ...(job.control.bestReasons ?? []), job.round > 1 ? roundPrompt(job, job.round, store.roundFeedback(job.id, job.round), store.roundSummaries(job.id), job.roundBase ?? job.pushedSha!) : workerPrompt(job), workerInstructions(job)].join("\n");
+    return [`Continue issue #${job.issue} in the existing workspace. Preserve dirty/untracked files and all local commits.`, `The previous worker stopped after ${job.control.workerContext?.recoveryReason ?? job.error ?? "incomplete delivery"}.`, ...(job.control.bestReasons ?? []), job.control.workerContext?.text ?? "", publicationRepairPrompt(job), job.round > 1 ? roundPrompt(job, job.round, store.roundFeedback(job.id, job.round), store.roundSummaries(job.id), job.roundBase ?? job.pushedSha!) : workerPrompt(job), workerInstructions(job)].join("\n");
   }
 
   function reviewObservation(job: Job, snapshot: NonNullable<Awaited<ReturnType<RepoClient["reviewSnapshot"]>>>): ReviewFact {
@@ -333,8 +334,10 @@ export function createIssues(deps: IssuesDeps): Issues {
           const result = await deps.hostPush(job.hostId, input, until(deadline - REVOKE_MS));
           if (result.status === "pushed") return done({ pushedSha: effect.sha });
           // A claim whose lease ran out may still be pushing the same commit, and its push can land first.
-          if (result.status === "rejected" && result.reason === "stale-remote" && (await repo.branchSha(job.branch)) === effect.sha) {
-            return done({ pushedSha: effect.sha });
+          if (result.status === "rejected" && (result.reason === "stale-remote" || result.reason === "not-descendant")) {
+            const remoteSha = await repo.branchSha(job.branch);
+            if (remoteSha === effect.sha) return done({ pushedSha: effect.sha });
+            return remoteSha ? { kind: "publication-diverged", remoteSha, reason: result.reason } : { kind: "fail", error: "the publication branch disappeared; accepted work is preserved" };
           }
           if (result.status === "rejected") return { kind: "fail", error: `push rejected (${result.reason}): ${result.detail}` };
           return { kind: "unknown", error: `push failed: ${result.detail}` };
@@ -750,7 +753,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub`, disposition: "fail" };
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       const comparisonSha = job.round === 1 ? capabilities.defaultHead : job.roundBase ?? remoteHead ?? capabilities.defaultHead;
-      const ancestorShas = [...new Set([...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : [])])];
+      const ancestorShas = [...new Set([...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : []), ...(job.control.publicationRepair ? [job.control.publicationRepair.acceptedSha] : [])])];
       const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha, ancestorShas });
       if (inspected.kind !== "inspected") return { unavailable: `missing local commit object ${inspected.sha}`, disposition: "worker", sha: inspected.sha as Sha };
       if (ancestorShas.some((sha) => !inspected.ancestry?.some((proof) => proof.sha === sha))) return { unavailable: "the host did not establish the requested Git ancestry", disposition: "retry" };
@@ -873,7 +876,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (facts.disposition === "worker" && facts.sha) {
         if (job.control.objectRepair?.sha !== facts.sha) {
           const text = `Your report is saved and bound to ${submission.intendedSha}. Fetch the missing object ${facts.sha} with bb pstack gh fetch in this worker, incorporate the current base if needed, and run the relevant checks. If HEAD changes, submit a fresh report with the actual verification results. No human retry is needed.`;
-          store.write(job.id, job.version, { phase: enter("recovering", [{ op: "send-round", key: `fetch-object:${job.id}:${job.round}:${facts.sha}`, text }]), control: { ...job.control, objectRepair: { sha: facts.sha } }, error: facts.unavailable }, clock());
+          store.write(job.id, job.version, { phase: enter("recovering", [{ op: "send-round", key: `fetch-object:${job.id}:${job.round}:${facts.sha}`, text }]), control: { ...job.control, objectRepair: { sha: facts.sha }, workerContext: { round: job.round, text, recoveryReason: null } }, error: facts.unavailable }, clock());
         }
         return reject("worker-action", "Report saved. The worker is fetching the missing Git object and verifying the current base.");
       }

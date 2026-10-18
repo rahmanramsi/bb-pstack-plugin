@@ -2,6 +2,140 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { harness, GOOD, MIN, SHA1, SHA2, SHA3, REPO } from "./engine-harness.ts";
 
+test("publication divergence preserves accepted work and requires a fresh merged report", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  const held = h.holdAt("push:before", "sdk");
+  await h.report(job.threadId!, GOOD);
+  await held.hit;
+  h.gh().refs.set(job.branch, SHA3);
+  held.free();
+  await h.settle();
+  const repairing = await h.only();
+  assert.equal(repairing.state, "working");
+  assert.equal(h.store.get(job.id)!.report!.headSha, SHA2);
+  assert.match(h.sent.at(-1)!.input[0].text, new RegExp(SHA3));
+  assert.equal(h.gh().refs.get(job.branch), SHA3);
+  h.restart(); await h.settle();
+  assert.equal(h.pushes.length, 1, "the old SHA is never retried with the changed lease");
+  const fresh = { outcome: "changes", round: repairing.round - 1, replies: [], summary: "Integrated collaborator changes.", verification: ["integration tests passed"] };
+  const missingAccepted = await h.report(job.threadId!, fresh, { headSha: "4".repeat(40), ancestors: [SHA3], commits: ["4".repeat(40), SHA3], ahead: 2 });
+  assert.match(missingAccepted.stderr!, /preserve accepted commit/);
+  const missingRemote = await h.report(job.threadId!, fresh, { headSha: "5".repeat(40), ancestors: [SHA2], commits: ["5".repeat(40), SHA2], ahead: 2 });
+  assert.match(missingRemote.stderr!, /does not contain/);
+  const accepted = await h.report(job.threadId!, fresh, { headSha: "6".repeat(40), ancestors: [SHA2, SHA3], commits: ["6".repeat(40)], ahead: 3 });
+  assert.equal(accepted.exitCode, 0, accepted.stderr);
+  await h.settle();
+  const ready = await h.only();
+  assert.equal(ready.outcome, "ready");
+  assert.equal(h.pushes[1]!.sha, "6".repeat(40));
+  assert.equal(h.pushes[1]!.expectedRemoteSha, SHA3);
+  assert.equal(h.gh().issues.get(ready.pr!.number)!.pr!.title, GOOD.pr.title);
+  assert.match(h.gh().issues.get(ready.pr!.number)!.pr!.body, /footer covered/);
+  assert.equal(h.store.get(job.id)!.control.publicationRepair, null);
+});
+
+test("an already-contained publication needs fresh no-change verification without an empty commit", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  const held = h.holdAt("push:before", "sdk");
+  await h.report(job.threadId!, GOOD); await held.hit;
+  h.gh().refs.set(job.branch, SHA3);
+  held.free(); await h.settle();
+  const repair = await h.only();
+  const report = { outcome: "no-change", round: repair.round - 1, replies: [], summary: "The collaborator commit includes the implementation.", verification: ["full tests passed at the remote head"] };
+  h.failures.gate = "verification is incomplete";
+  const invalid = await h.report(job.threadId!, report, { headSha: SHA3, ancestors: [SHA2], commits: [SHA3], ahead: 2 });
+  assert.match(invalid.stderr!, /gate pr/);
+  h.failures.gate = null;
+  const response = await h.report(job.threadId!, report, { headSha: SHA3, ancestors: [SHA2], commits: [SHA3], ahead: 2 });
+  assert.equal(response.exitCode, 0, response.stderr);
+  await h.settle();
+  assert.equal((await h.only()).outcome, "ready");
+  assert.equal((await h.only()).pushedSha, SHA3);
+  assert.equal(h.pushes.length, 1);
+});
+
+test("feedback publication repair retains body intent, assigned replies, and original round evidence", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const feedback = h.review(pr, { body: "Fix the layout." });
+  h.clock.now += 2 * MIN; await h.settle();
+  const held = h.holdAt("push:before", "sdk");
+  await h.report(job.threadId!, { outcome: "changes", round: 1, replies: [{ kind: "review", commentId: feedback.id, body: "The layout is fixed." }], pr: { body: "## Why\nLayout fixes preserve footer space." }, summary: "Fixed review request.", verification: ["layout tests passed"] }, { headSha: SHA3 });
+  await held.hit;
+  h.gh().refs.set(job.branch, "4".repeat(40));
+  held.free(); await h.settle();
+  h.restart(); await h.settle();
+  const repair = await h.only();
+  assert.equal(repair.state, "addressing");
+  assert.deepEqual(h.store.roundFeedback(job.id, repair.round).map((item) => item.id), [feedback.id]);
+  const missing = await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [], summary: "Merged changes.", verification: ["tests passed"] }, { headSha: "5".repeat(40), ancestors: [SHA3, "4".repeat(40)], ahead: 3 });
+  assert.match(missing.stderr!, /reply to every listed/);
+  await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [{ kind: "review", commentId: feedback.id, body: "The merged layout is verified." }], summary: "Merged changes.", verification: ["tests passed"] }, { headSha: "5".repeat(40), ancestors: [SHA3, "4".repeat(40)], ahead: 3 });
+  await h.settle();
+  assert.equal((await h.only()).outcome, "ready");
+  assert.match(h.gh().issues.get(pr)!.pr!.body, /Layout fixes preserve footer space/);
+  assert.ok(h.gh().comments.get(pr)!.some((comment) => comment.body.includes("The merged layout is verified")));
+  assert.ok(h.gh().pulls.get(pr)!.requested.has("maya"));
+  const previous = h.db.prepare("SELECT report_json, finished_at FROM issue_rounds WHERE job_id = ? AND ordinal = 2").get(job.id) as { report_json: string; finished_at: number | null };
+  assert.equal(JSON.parse(previous.report_json).headSha, SHA3);
+  assert.notEqual(previous.finished_at, null);
+});
+
+test("publication ancestry failures recover a gone worker while denials remain terminal", async () => {
+  for (const reason of ["not-descendant", "denied"] as const) {
+    const h = harness();
+    h.label(41); await h.settle();
+    const job = await h.only();
+    const worker = h.threads.get(job.threadId!)!;
+    const held = h.holdAt("push:before", "sdk");
+    await h.report(job.threadId!, GOOD); await held.hit;
+    h.failures.pushRejected = reason;
+    h.gh().refs.set(job.branch, SHA3);
+    worker.archivedAt = h.clock.now;
+    held.free(); await h.settle();
+    if (reason === "denied") {
+      assert.equal((await h.only()).outcome, "failure");
+      assert.equal(h.spawned.length, 1);
+      assert.equal(h.store.get(job.id)!.report!.headSha, SHA2);
+    } else {
+      assert.equal((await h.only()).state, "working");
+      assert.equal(h.spawned[1]!.environment.type, "reuse");
+      assert.equal(h.spawned[1]!.environment.environmentId, worker.environmentId);
+      assert.match(h.spawned[1]!.prompt, new RegExp(SHA2));
+      assert.match(h.spawned[1]!.prompt, new RegExp(SHA3));
+      assert.match(h.spawned[1]!.prompt, /repair worker is unavailable/);
+    }
+  }
+});
+
+test("repeated publication divergence has a durable cause budget despite new commit SHAs", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  let acceptedSha = SHA2;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const remote = (10 + attempt * 2).toString(16).padStart(40, "0");
+    const head = (11 + attempt * 2).toString(16).padStart(40, "0");
+    const held = h.holdAt("push:before", "sdk");
+    const current = await h.only();
+    await h.report(current.threadId!, attempt === 0 ? GOOD : { outcome: "changes", round: current.round - 1, replies: [], summary: "Integrated the observed remote change.", verification: ["integration tests passed"] }, attempt === 0 ? { headSha: SHA2, ahead: 1 } : { headSha: head, ancestors: [acceptedSha, h.gh().refs.get(job.branch)!], ahead: 3 });
+    await held.hit;
+    acceptedSha = attempt === 0 ? SHA2 : head;
+    h.gh().refs.set(job.branch, remote);
+    held.free(); await h.settle();
+    h.restart(); await h.settle();
+    assert.equal(h.gh().refs.get(job.branch), remote);
+  }
+  assert.equal((await h.only()).outcome, "failure");
+  assert.match((await h.only()).error!, /publication divergence exhausted/);
+  assert.equal(h.store.get(job.id)!.report!.headSha, acceptedSha);
+  assert.equal(h.pushes.length, 6);
+});
+
 test("an asynchronous rejection wakes its idle worker after outage and restart", async () => {
   const h = harness();
   h.label(41); await h.settle();
@@ -303,6 +437,8 @@ test("CI repair recovers a gone published worker in the preserved environment", 
   assert.notEqual(repairing.threadId, job.threadId);
   assert.equal(h.spawned[1]!.environment.type, "reuse");
   assert.equal(h.store.get(job.id)!.control.repair?.cause.includes("conflicting"), true);
+  assert.match(h.spawned[1]!.prompt, /mergeability is conflicting/);
+  assert.match(h.spawned[1]!.prompt, /repair worker is unavailable/);
 });
 
 test("a missing fresh base object asks the authorized worker to fetch and resumes the saved report", async () => {

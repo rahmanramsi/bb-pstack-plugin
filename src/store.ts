@@ -437,6 +437,7 @@ CREATE TABLE issue_jobs_unattended (
    WHERE state = 'done' AND json_extract(control_json, '$.disposition') IS NULL
      AND ((SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) IN ('merged','closed')
        OR json_extract(report_json, '$.outcome') = 'no-change')`,
+  `ALTER TABLE issue_rounds ADD COLUMN feedback_round INTEGER`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

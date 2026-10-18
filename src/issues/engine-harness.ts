@@ -311,7 +311,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null };
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
@@ -488,6 +488,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
           });
         }
         await held("push:before");
+        if (failures.pushRejected) return { status: "rejected", reason: failures.pushRejected, detail: "push rejected by fixture" };
         if ((gh.refs.get(input.branch) ?? null) !== input.expectedRemoteSha) return { status: "rejected", reason: "stale-remote", detail: "[rejected] (stale info)" };
         gh.refs.set(input.branch, input.sha);
         await held("push");
