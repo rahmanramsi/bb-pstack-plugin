@@ -292,7 +292,6 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND issue = ? AND state NOT IN (${placeholders(TERMINAL_LIST)})`)
       .get(repo, issue, ...TERMINAL_LIST) as JobRow | undefined;
 
-  /** `terminatedAt` is when the job turned terminal, which moves an already delivered status to the daily audit. */
   function projectStatus(job: Job, terminatedAt: number | null = null): void {
     if (job.phase.state === "ignored") return;
     const body = statusBody(job);

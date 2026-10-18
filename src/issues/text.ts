@@ -337,6 +337,8 @@ const ISSUE_STAGE: Record<Job["phase"]["state"], string> = {
 };
 
 const TRUNCATED = "[Truncated to fit GitHub's comment limit.]";
+const MAX_ISSUE_TEXT_GROWTH = 2;
+const CLIP_GAP = "\n\n";
 
 export function statusMarker(repo: Job["repo"], issue: number): string {
   return `<!-- pstack:issue-status:${repo}:${issue} -->`;
@@ -347,7 +349,6 @@ export function statusComment(body: string, revision: number, marker: string): s
   return `${body.trimEnd()}\n\n<!-- pstack:status-revision:${revision} -->\n${marker}`;
 }
 
-/** Shares `room` among the lengths, smallest first, so short fields stay whole. */
 function allocate(lengths: readonly number[], room: number): number[] {
   const limits = lengths.map(() => 0);
   const order = lengths.map((_, index) => index).sort((a, b) => lengths[a]! - lengths[b]!);
@@ -361,7 +362,11 @@ function allocate(lengths: readonly number[], room: number): number[] {
 function clipped(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const end = /[\uD800-\uDBFF]/.test(text[limit - 1] ?? "") ? limit - 1 : limit;
-  return `${text.slice(0, end)}\n\n${TRUNCATED}`;
+  return `${text.slice(0, end)}${CLIP_GAP}${TRUNCATED}`;
+}
+
+function rawProseRoom(normalizedRoom: number, blockCount: number): number {
+  return Math.max(0, Math.floor((normalizedRoom - blockCount * CLIP_GAP.length) / MAX_ISSUE_TEXT_GROWTH));
 }
 
 /**
@@ -404,9 +409,8 @@ export function statusBody(job: Job): string {
   const full = render(prose);
   const budget = COMMENT_MAX - statusComment("", Number.MAX_SAFE_INTEGER, statusMarker(job.repo, job.issue)).length;
   if (full.length <= budget) return full;
-  // Normalizing at most doubles text (a neutralized mention gains two backticks), so half the room always fits.
   const fixed = render(prose.map((text) => text && TRUNCATED)).length;
-  const room = Math.max(0, Math.floor((budget - fixed) / 2) - prose.length);
+  const room = rawProseRoom(budget - fixed, prose.length);
   const limits = allocate(prose.map((text) => text?.length ?? 0), room);
   return render(prose.map((text, index) => text && clipped(text, limits[index]!)));
 }
