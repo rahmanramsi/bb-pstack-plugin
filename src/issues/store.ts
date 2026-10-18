@@ -121,7 +121,8 @@ export type DurableDelivery = {
   deferReview(job: Job, nextAt: number): void;
   decorate(job: Job, effect: Effect): void;
   claimDecoration(status: IssueStatus, key: string, now: number): number | null;
-  settleDecoration(status: IssueStatus, key: string, error: string | null, nextAt: number, now: number): void;
+  /** A `notBefore` from GitHub holds the whole issue's delivery, comment and decorations, until then. */
+  settleDecoration(status: IssueStatus, key: string, error: string | null, nextAt: number, now: number, notBefore?: number): void;
 };
 export type IssueStore = IssueReads & IssueWrites & DurableDelivery;
 
@@ -529,14 +530,14 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       return { pending: row.revision > row.delivered_revision || decorations.length > 0, error: row.error ?? decorations.find((item) => item.error)?.error ?? null };
     },
     statuses(now) {
-      return (db.prepare(`SELECT * FROM issue_status WHERE coalesce(lease_until,0) <= ? AND (
-        (next_at <= ? AND retry_not_before <= ?) OR EXISTS (SELECT 1 FROM json_each(decorations_json) WHERE json_extract(value,'$.nextAt') <= ?)) ORDER BY next_at, repo, issue`).all(now, now, now, now) as StatusRow[]).map(statusFromRow);
+      return (db.prepare(`SELECT * FROM issue_status WHERE coalesce(lease_until,0) <= ? AND retry_not_before <= ? AND (
+        next_at <= ? OR EXISTS (SELECT 1 FROM json_each(decorations_json) WHERE json_extract(value,'$.nextAt') <= ?)) ORDER BY next_at, repo, issue`).all(now, now, now, now) as StatusRow[]).map(statusFromRow);
     },
     claimStatus(status, now) {
       const leaseUntil = now + 60_000;
       const owner = randomUUID();
-      const claimed = db.prepare(`UPDATE issue_status SET lease_until = ?, lease_owner = ? WHERE repo = ? AND issue = ? AND revision = ? AND coalesce(lease_until,0) <= ? AND (
-        (next_at <= ? AND retry_not_before <= ?) OR EXISTS (SELECT 1 FROM json_each(decorations_json) WHERE json_extract(value,'$.nextAt') <= ?))
+      const claimed = db.prepare(`UPDATE issue_status SET lease_until = ?, lease_owner = ? WHERE repo = ? AND issue = ? AND revision = ? AND coalesce(lease_until,0) <= ? AND retry_not_before <= ? AND (
+        next_at <= ? OR EXISTS (SELECT 1 FROM json_each(decorations_json) WHERE json_extract(value,'$.nextAt') <= ?))
         AND (SELECT count(*) FROM issue_status WHERE lease_until > ?) < ?`).run(leaseUntil, owner, status.repo, status.issue, status.revision, now, now, now, now, now, STATUS_CONCURRENCY).changes === 1;
       if (claimed) { status.leaseUntil = leaseUntil; status.leaseOwner = owner; }
       return claimed;
@@ -546,7 +547,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
         .run(input.notBefore, status.repo, status.issue, status.leaseOwner, input.now);
       db.prepare(`UPDATE issue_status SET delivered_revision = CASE WHEN ? IS NULL THEN max(delivered_revision,?) ELSE delivered_revision END,
         lease_until = CASE WHEN ? THEN NULL ELSE lease_until END, lease_owner = CASE WHEN ? THEN NULL ELSE lease_owner END,
-        next_at = ?, retry_not_before = ?, error = ? WHERE repo = ? AND issue = ? AND job_id = ? AND revision = ? AND lease_owner = ? AND lease_until > ?`)
+        next_at = ?, retry_not_before = max(retry_not_before,?), error = ? WHERE repo = ? AND issue = ? AND job_id = ? AND revision = ? AND lease_owner = ? AND lease_until > ?`)
         .run(input.error, status.revision, input.release === false ? 0 : 1, input.release === false ? 0 : 1, input.nextAt, input.notBefore ?? 0, input.error, status.repo, status.issue, status.jobId, status.revision, status.leaseOwner, input.now);
       if (input.release !== false) db.prepare("UPDATE issue_status SET lease_until = NULL, lease_owner = NULL WHERE repo = ? AND issue = ? AND lease_owner = ? AND lease_until > ?")
         .run(status.repo, status.issue, status.leaseOwner, input.now);
@@ -570,8 +571,8 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), job.repo, job.issue);
     }),
     claimDecoration: db.transaction((status: IssueStatus, key: string, now: number): number | null => {
-      const row = db.prepare("SELECT decorations_json FROM issue_status WHERE repo = ? AND issue = ? AND job_id = ? AND revision = ? AND lease_owner = ? AND lease_until > ?").get(status.repo, status.issue, status.jobId, status.revision, status.leaseOwner, now) as { decorations_json: string } | undefined;
-      if (!row) return null;
+      const row = db.prepare("SELECT decorations_json, retry_not_before FROM issue_status WHERE repo = ? AND issue = ? AND job_id = ? AND revision = ? AND lease_owner = ? AND lease_until > ?").get(status.repo, status.issue, status.jobId, status.revision, status.leaseOwner, now) as { decorations_json: string; retry_not_before: number } | undefined;
+      if (!row || row.retry_not_before > now) return null;
       const decorations = JSON.parse(row.decorations_json) as Decoration[];
       const item = decorations.find((candidate) => candidate.effect.key === key);
       if (!item || item.nextAt > now) return null;
@@ -581,12 +582,12 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), status.repo, status.issue);
       return previous;
     }),
-    settleDecoration: db.transaction((status: IssueStatus, key: string, error: string | null, nextAt: number, now: number) => {
+    settleDecoration: db.transaction((status: IssueStatus, key: string, error: string | null, nextAt: number, now: number, notBefore = 0) => {
       const row = db.prepare("SELECT decorations_json FROM issue_status WHERE repo = ? AND issue = ? AND job_id = ? AND lease_owner = ? AND lease_until > ?").get(status.repo, status.issue, status.jobId, status.leaseOwner, now) as { decorations_json: string } | undefined;
       if (!row) return;
       const current = JSON.parse(row.decorations_json) as Decoration[];
       const decorations = current.flatMap((item) => item.effect.key !== key ? [item] : error === null ? [] : [{ ...item, error, nextAt }]);
-      db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), status.repo, status.issue);
+      db.prepare("UPDATE issue_status SET decorations_json = ?, retry_not_before = max(retry_not_before,?) WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), notBefore, status.repo, status.issue);
     }),
   };
   return { ...reads, ...notifying(writes, onChange), ...deliveries };

@@ -54,8 +54,8 @@ export function createStatusDelivery({ store, github, clock, runEffect }: Delive
             if (attempts === null) continue;
             const outcome = await runEffect(job, item.effect, attempts > 0 && EFFECT_POLICY[item.effect.op].recovery.kind === "probe" ? "probe-then-perform" : "perform", status.leaseUntil! - SETTLE_MARGIN_MS);
             const error = outcome.kind === "done" ? null : "error" in outcome ? outcome.error : "delivery unconfirmed";
-            const nextAt = Math.max(clock() + DELIVERY_RETRY_MS, outcome.kind === "retry" ? outcome.notBefore ?? 0 : 0);
-            store.settleDecoration(status, item.effect.key, error, nextAt, clock());
+            const notBefore = outcome.kind === "retry" ? outcome.notBefore ?? 0 : 0;
+            store.settleDecoration(status, item.effect.key, error, Math.max(clock() + DELIVERY_RETRY_MS, notBefore), clock(), notBefore);
           }
         } finally {
           store.releaseStatus(status, clock());

@@ -21,7 +21,7 @@ async function fixture(t: TestContext) {
   const clock = { now: Date.parse("2026-10-18T12:00:00Z") };
   const requests: { method: string; path: string; body: unknown; at: number }[] = [];
   const comments = new Map<number, { id: number; body: string; issue_url: string; created_at: string; updated_at: string; user: { login: string; type: string }; performed_via_github_app: { id: number } }>();
-  const failures = { labels: 0, status: 0, retrySeconds: 600 };
+  const failures = { labels: 0, status: 0, statusFault: 0, retrySeconds: 600 };
   let next = 1;
   let base = "";
   const server = createServer(async (request, response) => {
@@ -42,6 +42,7 @@ async function fixture(t: TestContext) {
     }
     if (body && typeof body === "object" && "body" in body && typeof body.body === "string" && body.body.length > COMMENT_MAX) return send(422, { message: "body is too long (maximum is 65536 characters)" });
     if (path.includes("/issues/") && path.endsWith("/comments")) {
+      if (failures.statusFault-- > 0) return send(502, { message: "bad gateway" });
       if (failures.status-- > 0) {
         response.setHeader("retry-after", String(failures.retrySeconds));
         return send(429, { message: "status cooldown" });
@@ -120,6 +121,9 @@ test("new desired labels supersede failed labels and delivered audits do not rew
   await h.build()();
   job = h.store.write(job.id, job.version, { phase: { state: "review" }, threadId: "thread", pushedSha: SHA, pr: { number: 5, url: "https://github.test/pull/5" }, control: { ...job.control, readiness: { pr: 5, head: SHA, base: SHA } } }, h.clock.now)!;
   await h.build()();
+  assert.equal(h.labelPosts().length, 1);
+  h.clock.now += 600_000;
+  await h.build()();
   assert.deepEqual(h.labelPosts().map((request) => request.body), [{ labels: [LABEL.working] }, { labels: [LABEL.review] }]);
   h.clock.now += STATUS_AUDIT_MS;
   await h.build()();
@@ -155,22 +159,61 @@ test("terminal audits stay quiet while independent decoration and newer outcome 
   assert.ok(repaired.body.includes("Closed without merging"));
 });
 
-test("unrelated decoration never bypasses a future comment cooldown even after restart", async (t) => {
+test("an ordinary comment fault leaves an unrelated decoration independent", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  await h.build()();
+  job = h.store.write(job.id, job.version, { phase: { state: "done" }, pr: { number: 42, url: "https://github.test/pull/42" } }, h.clock.now)!;
+  h.store.decorate(job, { op: "reply", target: { kind: "pr-comment", id: 1 }, key: "separate", body: "Independent reply." });
+  h.failures.statusFault = 1;
+  h.clock.now += 60_000;
+  await h.build()();
+  assert.match(h.store.delivery(REPO, 41).error ?? "", /502/);
+  assert.ok([...h.comments.values()].some((comment) => comment.body === "Independent reply."));
+  h.clock.now += 60_000;
+  await h.build()();
+  assert.ok(h.status().some((comment) => comment.body.includes("Outcome unknown")));
+});
+
+test("a rate-limited status comment holds every decoration until its cooldown, across revisions and restart", async (t) => {
   const h = await fixture(t);
   let job = h.insert();
   h.failures.status = 1;
   await h.build()();
-  const reads = h.statusReads().length;
+  assert.equal(h.labelPosts().length, 0);
   job = h.store.write(job.id, job.version, { phase: { state: "done" }, pr: { number: 42, url: "https://github.test/pull/42" } }, h.clock.now)!;
-  h.store.decorate(job, { op: "reply", target: { kind: "pr-comment", id: 1 }, key: "separate", body: "Independent reply." });
+  h.store.decorate(job, { op: "reply", target: { kind: "pr-comment", id: 1 }, key: "separate", body: "Held reply." });
   h.restart();
+  const before = h.requests.length;
+  for (let minute = 1; minute < 10; minute++) { h.clock.now += 60_000; await h.build()(); }
+  assert.equal(h.requests.length, before);
+  assert.equal(h.store.delivery(REPO, 41).pending, true);
   h.clock.now += 60_000;
   await h.build()();
-  assert.equal(h.statusReads().length, reads);
-  assert.ok([...h.comments.values()].some((comment) => comment.body === "Independent reply."));
-  h.clock.now += 9 * 60_000;
+  assert.ok(h.status().some((comment) => comment.body.includes("Outcome unknown")));
+  assert.ok([...h.comments.values()].some((comment) => comment.body === "Held reply."));
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
+});
+
+test("a rate-limited decoration stops later decorations and the comment until its cooldown", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  job = h.store.write(job.id, job.version, { pr: { number: 42, url: "https://github.test/pull/42" } }, h.clock.now)!;
+  h.store.decorate(job, { op: "reply", target: { kind: "pr-comment", id: 1 }, key: "later", body: "Later reply." });
+  h.failures.labels = 1;
   await h.build()();
-  assert.ok([...h.comments.values()].some((comment) => comment.body.includes("Outcome unknown")));
+  assert.equal(h.labelPosts().length, 1);
+  assert.ok(![...h.comments.values()].some((comment) => comment.body === "Later reply."));
+  job = h.store.write(job.id, job.version, { phase: { state: "done" } }, h.clock.now)!;
+  h.restart();
+  const before = h.requests.length;
+  for (let minute = 1; minute < 10; minute++) { h.clock.now += 60_000; await h.build()(); }
+  assert.equal(h.requests.length, before);
+  h.clock.now += 60_000;
+  await h.build()();
+  assert.ok([...h.comments.values()].some((comment) => comment.body === "Later reply."));
+  assert.ok(h.status().some((comment) => comment.body.includes("Outcome unknown")));
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
 });
 
 test("delivery bounds concurrent issues", async (t) => {
@@ -274,12 +317,11 @@ test("new generations retain the live issue lease and old responses cannot ackno
   h.store.settleDecoration(claimed, oldKey, null, 0, h.clock.now);
   h.store.settleStatus(claimed, { error: "cooldown", nextAt: h.clock.now + 600_000, notBefore: h.clock.now + 600_000, now: h.clock.now });
   await h.build()();
-  assert.equal(h.statusReads().length, 0);
-  assert.equal(h.labelPosts().length, 1);
-  assert.deepEqual(h.labelPosts()[0]!.body, { labels: [LABEL.working] });
+  assert.equal(h.requests.length, 0);
   assert.equal(h.store.delivery(REPO, 41).pending, true);
   h.clock.now += 600_000;
   await h.build()();
+  assert.deepEqual(h.labelPosts().map((request) => request.body), [{ labels: [LABEL.working] }]);
   assert.equal(h.store.delivery(REPO, 41).pending, false);
   assert.equal([...h.comments.values()].filter((comment) => comment.body.includes("pstack:issue-status")).length, 1);
   assert.deepEqual(h.db.prepare("SELECT count(*) AS n FROM issue_status WHERE issue = 41").get(), { n: 1 });
