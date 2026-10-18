@@ -309,9 +309,36 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
   ].join("\n");
 }
 
+const ISSUE_STAGE: Record<Job["phase"]["state"], string> = {
+  queued: "Queued",
+  starting: "Starting the worker",
+  working: "Implementing and verifying",
+  publishing: "Publishing changes",
+  checking: "Checking CI",
+  review: "Checking CI",
+  addressing: "Addressing feedback",
+  tracking: "Tracking sub-issues",
+  updating: "Updating sub-issue progress",
+  recovering: "Recovering work",
+  repairing: "Repairing CI or conflicts",
+  readifying: "Preparing review",
+  drafting: "Returning the pull request to draft",
+  closing: "Recording the result",
+  stopping: "Stopping work",
+  sticking: "Recording failure",
+  sending: "Sending feedback to the worker",
+  respawning: "Starting a replacement worker",
+  republishing: "Publishing verified updates",
+  replying: "Replying to feedback",
+  ignored: "Trigger ignored",
+  done: "Outcome unknown",
+  stopped: "Stopped",
+  stuck: "Failed",
+};
+
 export function statusBody(job: Job): string {
   const result = job.control.disposition;
-  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : job.phase.state === "done" ? "Outcome unknown" : job.phase.state === "review" || job.phase.state === "checking" ? "Checking CI" : job.phase.state === "addressing" ? "Addressing feedback" : job.phase.state === "recovering" ? "Recovering work" : job.phase.state;
+  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : ISSUE_STAGE[job.phase.state];
   const failure = job.control.publicFailure;
   let reason: string | null = null;
   if (result === "failure") {
