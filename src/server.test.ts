@@ -127,7 +127,7 @@ function queuedJob(id: string, issue: number, eventId: number): NewJob {
   };
 }
 
-test("the app's issue board is the board `bb pstack issues list --json` prints, and a worker thread's board holds its job", async () => {
+test("the app's issue board retains CLI jobs when the GitHub catalog fails, and a worker thread's board holds its job", async () => {
   const { bb, harness } = createFakePluginHost({ pluginId: "pstack", settings: ISSUE_SETUP });
   await plugin(bb);
   const store = openIssueStore(bb.storage.database(), () => {});
@@ -138,12 +138,38 @@ test("the app's issue board is the board `bb pstack issues list --json` prints, 
   const listed = async (...flags: string[]) => JSON.parse((await harness.runCli(["issues", "list", "--json", ...flags], { cwd: "/tmp" })).stdout);
 
   const open = await harness.callRpc("pstackIssueBoard", { all: false });
-  assert.deepEqual(open, await listed());
+  assert.deepEqual((open as { jobs: unknown[] }).jobs, (await listed()).jobs);
+  assert.deepEqual((open as { issues: unknown[] }).issues, []);
+  assert.ok((open as { repos: { error: string | null }[] }).repos.every((repo) => repo.error?.includes("private key")));
   assert.deepEqual((open as { repos: { repo: string }[] }).repos.map((repo) => repo.repo), ["acme/web", "acme/api"]);
-  assert.deepEqual(await harness.callRpc("pstackIssueBoard", { all: true }), await listed("--all"));
+  assert.deepEqual((await harness.callRpc("pstackIssueBoard", { all: true }) as { jobs: unknown[] }).jobs, (await listed("--all")).jobs);
   const worker = (await harness.callRpc("pstackIssueBoard", { threadId: "thr_worker" })) as { jobs: { id: string; title: string }[] };
   assert.deepEqual(worker.jobs.map((job) => [job.id, job.title]), [[working.id, "Issue 41"]]);
   assert.deepEqual(await harness.callRpc("pstackIssueBoard", { threadId: "thr_person" }), { repos: [], jobs: [] });
+  await harness.dispose();
+});
+
+test("the issue board uses the GitHub plugin catalog across mapped and unmapped repositories", async () => {
+  const { bb, harness } = createFakePluginHost({ pluginId: "pstack", settings: ISSUE_SETUP });
+  const items = [
+    { repo: "acme/web", number: 41, kind: "issue", title: "Fix navigation", url: "https://github.com/acme/web/issues/41", state: "open", author: "maya", body: "", labels: [], assignees: [], updatedAt: "2026-10-18T00:00:00Z" },
+    { repo: "acme/extra", number: 7, kind: "issue", title: "Update docs", url: "https://github.com/acme/extra/issues/7", state: "closed", author: "maya", body: "", labels: ["docs"], assignees: [], updatedAt: "2026-10-17T00:00:00Z" },
+  ];
+  harness.sdk.stub("plugins.callRpc", async ({ pluginId, method, input }) => {
+    assert.equal(pluginId, "github");
+    assert.equal(method, "listItems");
+    assert.deepEqual(input, { kind: "issue" });
+    return { items };
+  });
+  await plugin(bb);
+  const board = await harness.callRpc("pstackIssueBoard", { all: false }) as { issues: { repo: string; issue: number; startError: string | null }[]; repos: { repo: string }[]; jobs: unknown[] };
+  assert.deepEqual(board.issues.map(({ repo, issue }) => [repo, issue]), [["acme/web", 41], ["acme/extra", 7]]);
+  assert.equal(board.issues[0]!.startError, null);
+  assert.match(board.issues[1]!.startError!, /issueRepos/);
+  assert.ok(board.repos.some(({ repo }) => repo === "acme/extra"));
+  assert.deepEqual(board.jobs, []);
+  await assert.rejects(harness.callRpc("pstackStartIssue", { repo: "acme/extra", issue: 7 }), /not configured/);
+  await assert.rejects(harness.callRpc("pstackStartIssue", { repo: "acme/web", issue: -1 }));
   await harness.dispose();
 });
 

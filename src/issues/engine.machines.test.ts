@@ -58,6 +58,16 @@ test("with no eligible machine the job stays queued with each machine's reason, 
   assert.match((await h.engine().run(["issues", "show", started.id])).stdout!, /machine {7}host_mini \(picked automatically\)\n/);
 });
 
+test("an issue started from the app on a repository without a pinned machine gets a picked one", async () => {
+  const h = automatic({ host_server: { limit: 16 }, host_mini: { limit: 2 }, host_studio: { limit: 4 } });
+  h.label(41);
+  h.unlabel(41);
+  await h.engine().issues.start(REPO, 41);
+  await h.settle();
+  assert.equal((await h.only()).state, "working");
+  assert.deepEqual(spawnedOn(h), ["host_studio"]);
+});
+
 test("a failure to read the machines leaves the job queued with the reason", async () => {
   const h = automatic({ host_worker: {} });
   h.failures.machines = "bb is restarting";

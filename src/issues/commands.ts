@@ -54,7 +54,7 @@ export const ISSUE_SETTINGS = {
     type: "string",
     label: "Issue repositories",
     description:
-      "One `owner/name project=<projectId> [host=<hostId>]` line per repository whose `agent`-labeled issues pstack works on. Without `host=`, or with `host=auto`, each job runs on the machine with the most free slots among those with a checkout of the project and the issue worker's model, never the bb server's machine.",
+      "One `owner/name project=<projectId> [host=<hostId>]` line per repository where pstack runs issue workers. Without `host=`, or with `host=auto`, each job runs on the machine with the most free slots among those with a checkout of the project and the issue worker's model, never the bb server's machine. The agent label starts work automatically; open issues can also be started from the Issues panel.",
     experimental_multiline: true,
     experimental_schema: z.string().superRefine((value, ctx) => {
       const parsed = parseIssueRepos(value);

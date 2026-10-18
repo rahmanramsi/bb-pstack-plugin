@@ -138,3 +138,56 @@ test("a push the remote refuses is rejected with the remote's reason, not retrie
   assert.equal(f.remoteHead(), null);
   await f.harness.experimental_dispose();
 });
+
+test("pushBranch pushes any plain branch name and still never rewrites it", async () => {
+  const f = fixture();
+  const call = (sha: string, expectedRemoteSha: string | null, branch: string) =>
+    f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch, sha, expectedRemoteSha, token: TOKEN });
+  const first = commit(f.worktree, "a.txt", "one\n");
+  assert.deepEqual(await call(first, null, "feat/thing"), { status: "pushed", sha: first });
+  assert.equal(sh(f.root, "--git-dir", f.remote, "rev-parse", "refs/heads/feat/thing"), first);
+  assert.deepEqual(readdirSync(f.loot), [], "the planted pre-push hook and credential helper never ran");
+  assert.deepEqual(filesContaining(f.root, TOKEN), []);
+
+  const stale = await call(commit(f.worktree, "b.txt", "two\n"), null, "feat/thing");
+  assert.equal(stale.status === "rejected" && stale.reason, "stale-remote");
+
+  sh(f.worktree, "checkout", "-q", "--detach", "HEAD~2");
+  const rebased = commit(f.worktree, "r.txt", "rebased\n");
+  const diverged = await call(rebased, first, "feat/thing");
+  assert.equal(diverged.status === "rejected" && diverged.reason, "not-descendant");
+  const leased = (expected: string) => f.harness.experimental_call("pushBranch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: "feat/thing", sha: rebased, expectedRemoteSha: expected, token: TOKEN, rewrite: true });
+  assert.equal(((await leased("c".repeat(40))) as { reason?: string }).reason, "stale-remote", "a rewrite still needs the remote at the expected commit");
+  assert.deepEqual(await leased(first), { status: "pushed", sha: rebased });
+  assert.equal(sh(f.root, "--git-dir", f.remote, "rev-parse", "refs/heads/feat/thing"), rebased);
+  for (const branch of ["-x", "a..b", "refs/heads/x/", "x.lock", "a b", "x@{1}"]) await assert.rejects(call(first, null, branch), branch);
+  await f.harness.experimental_dispose();
+});
+
+test("inspect reads origin from the repository's own config", async () => {
+  const f = fixture();
+  assert.deepEqual(await f.harness.experimental_call("inspect", { worktreePath: f.worktree }), { originUrl: null });
+  sh(f.worktree, "remote", "add", "origin", "https://github.com/acme/web.git");
+  assert.deepEqual(await f.harness.experimental_call("inspect", { worktreePath: f.worktree }), { originUrl: "https://github.com/acme/web.git" });
+  await f.harness.experimental_dispose();
+});
+
+test("fetch brings remote branches into origin/* without the worktree's config, hooks or credential helper", async () => {
+  const f = fixture();
+  const other = join(f.root, "other");
+  sh(f.root, "clone", "-q", f.remote, other);
+  const upstream = commit(other, "up.txt", "from upstream\n");
+  sh(other, "push", "-q", "origin", "HEAD:refs/heads/feature");
+  writeFileSync(join(f.root, "hooks", "reference-transaction"), `#!/bin/sh\necho ran > ${join(f.loot, "reference-transaction")}\n`);
+  chmodSync(join(f.root, "hooks", "reference-transaction"), 0o755);
+
+  const result = await f.harness.experimental_call("fetch", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, token: TOKEN });
+  assert.deepEqual(result, { status: "fetched", refs: [{ branch: "feature", sha: upstream }] });
+  assert.equal(sh(f.worktree, "rev-parse", "refs/remotes/origin/feature"), upstream);
+  assert.equal(sh(f.worktree, "cat-file", "-t", upstream), "commit", "the fetched objects are in the worktree's store");
+  assert.equal(sh(f.worktree, "cat-file", "-p", `${upstream}:up.txt`), "from upstream");
+  assert.deepEqual(readdirSync(f.loot), [], "no hook or credential helper ran");
+  assert.deepEqual(filesContaining(f.root, TOKEN), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});

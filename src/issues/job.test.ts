@@ -101,10 +101,9 @@ test("a queued job starts only with resolved worker settings, labelling before i
   const offline = { error: "the host is offline", permanent: false };
   assert.deepEqual(plan(queued, facts({ worker: offline })), { type: "change", change: { error: "the host is offline" } });
   assert.equal(plan(job({ error: "the host is offline" }), facts({ worker: offline })), null);
-  assert.deepEqual(plan(queued, facts({ worker: { error: "no model for issue worker", permanent: true } })), {
-    type: "change",
-    change: { phase: { state: "stuck" }, deadline: null, error: "no model for issue worker" },
-  });
+  const unconfigured = { error: "no model for issue worker", permanent: true };
+  assert.deepEqual(plan(queued, facts({ worker: unconfigured })), { type: "change", change: { error: "no model for issue worker" } }, "a problem only an operator can fix waits too");
+  assert.equal(plan(job({ error: "no model for issue worker" }), facts({ worker: unconfigured })), null);
 
   const action = plan(queued, facts({ worker: WORKER }));
   assert.equal(action?.type, "change");
@@ -246,12 +245,18 @@ test("retry backs off and honours the server's notBefore; fail sticks the job", 
   assert.equal(failed.error, "the remote branch moved");
 });
 
-test("a working job sticks on timeout or a lost worker, nudges an idle one twice, then sticks", () => {
+test("a working job waits through a failed or idle worker, nudges an idle one twice, and sticks only when its thread is gone", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w", deadline: NOW + 30 * MIN, updatedAt: NOW - MIN });
-  assert.deepEqual(plan(working, facts({ thread: { kind: "active" } })), { type: "sleep", until: NOW + 30 * MIN });
-  assert.equal((plan({ ...working, deadline: NOW }, facts({ thread: { kind: "active" } })) as { change: Change }).change.phase?.state, "sticking");
+  assert.equal(plan(working, facts({ thread: { kind: "active" } })), null);
+  assert.equal(plan({ ...working, deadline: NOW }, facts({ thread: { kind: "active" } })), null, "a worker past its deadline keeps working");
   assert.equal((plan(working, facts({ thread: { kind: "gone" } })) as { change: Change }).change.phase?.state, "sticking");
-  assert.equal((plan(working, facts({ thread: { kind: "failed", error: "provider crashed" } })) as { change: Change }).change.error, "the worker thread failed: provider crashed");
+
+  const failed = plan(working, facts({ thread: { kind: "failed", error: "provider crashed" } })) as { change: Change };
+  assert.equal(failed.change.phase, undefined, "a failed thread may recover, so the job waits");
+  assert.match(failed.change.error!, /waiting for it to recover: provider crashed/);
+  const waiting = apply(working, failed.change);
+  assert.equal(plan(waiting, facts({ thread: { kind: "failed", error: "provider crashed" } })), null);
+  assert.deepEqual((plan(waiting, facts({ thread: { kind: "active" } })) as { change: Change }).change, { error: null }, "the thread came back");
 
   const nudge = plan(working, facts({ thread: { kind: "idle", since: NOW - 10 } }));
   assert.equal(nudge?.type, "nudge");
@@ -260,7 +265,9 @@ test("a working job sticks on timeout or a lost worker, nudges an idle one twice
 
   const nudged = apply(working, (nudge as { change: Change }).change);
   assert.equal(plan(nudged, facts({ thread: { kind: "idle", since: NOW - 10 } })), null, "no second nudge until the worker idles again");
-  assert.equal(plan({ ...nudged, nudges: 2 }, facts({ thread: { kind: "idle", since: NOW + 10 } }))?.type, "change");
+  const silent = plan({ ...nudged, nudges: 2 }, facts({ thread: { kind: "idle", since: NOW + 10 } })) as { change: Change };
+  assert.equal(silent.change.phase, undefined, "a worker silent after every reminder waits for a person");
+  assert.match(silent.change.error!, /stopped without reporting after every reminder/);
 });
 
 test("stop replaces a pending outbox, stops a worker that may exist, and is null once the job has ended", () => {
@@ -325,7 +332,7 @@ test("needs-info and no-change reports post on the issue and must not add commit
   assert.match(reasonsOf(closing)[0]!, /must not add commits/);
 });
 
-test("a report is rejected with every reason, and the second rejection sticks the job", () => {
+test("a report is rejected with every reason, however many times, without ending the job", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
   const bad = first({
     outcome: "changes",
@@ -342,7 +349,7 @@ test("a report is rejected with every reason, and the second rejection sticks th
   assert.deepEqual(verdict.change, { rejections: 1, error: `report rejected: ${reasonsOf(verdict).join("; ")}` });
 
   const second = acceptReport({ ...working, rejections: 1 }, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true, ahead: 1, commits: [HEAD] } }));
-  assert.equal(second.change.phase?.state, "sticking");
+  assert.equal(second.change.phase, undefined);
   assert.equal(second.change.rejections, 2);
 });
 
@@ -555,12 +562,12 @@ test("a merged or closed pull request ends the job from review or from a running
   assert.equal(plan(inReview(), facts({ ...pending([inline(1, NOW - 5 * MIN)]), pr: null })), null, "an unknown pull request state starts nothing");
 });
 
-test("a running round times out, nudges and sticks like the first one", () => {
+test("a running round waits and nudges like the first one", () => {
   const addressing = inReview({ phase: { state: "addressing" }, round: 2, deadline: NOW + 30 * MIN, updatedAt: NOW - MIN });
   const open = { pr: { state: "open" as const } };
-  assert.deepEqual(plan(addressing, facts({ ...open, thread: { kind: "active" } })), { type: "sleep", until: NOW + 30 * MIN });
+  assert.equal(plan(addressing, facts({ ...open, thread: { kind: "active" } })), null);
   assert.equal(plan(addressing, facts({ ...open, thread: { kind: "idle", since: NOW - 10 } }))?.type, "nudge");
-  assert.equal((plan({ ...addressing, deadline: NOW }, facts({ ...open, thread: { kind: "active" } })) as { change: Change }).change.phase?.state, "sticking");
+  assert.equal(plan({ ...addressing, deadline: NOW }, facts({ ...open, thread: { kind: "active" } })), null);
 });
 
 const ROUND_FACTS = (overrides: Partial<ReportFacts> = {}) => reportFacts({ worktree: { headSha: NEXT, dirty: false, ahead: 2, commits: [NEXT, PUSHED] }, remoteHead: PUSHED, listed: [reviewBody, inline(1, NOW - 5 * MIN)], gate: { pass: false, reason: "3 open steps" }, ...overrides });
@@ -631,8 +638,7 @@ test("a round ends when the job leaves it: back in review, waiting for an answer
   const publishing = inReview({ phase: transit("publishing", [pushEffect, labelEffect], { tries: 1 }) });
   assert.equal(settle(publishing, { kind: "done", patch: { pushedSha: HEAD } }, NOW).finishRound, undefined, "effects are still owed");
 
-  const addressing = inReview({ phase: { state: "addressing" }, round: 2, deadline: NOW });
-  assert.equal((plan(addressing, facts({ pr: { state: "open" }, thread: { kind: "active" } })) as { change: Change }).change.finishRound, true, "a timeout ends the round");
+  const addressing = inReview({ phase: { state: "addressing" }, round: 2 });
   assert.equal(stop(addressing, "maya")?.finishRound, true);
 
   const merged = plan(inReview(), facts({ ...pending([]), pr: { state: "merged" } }));

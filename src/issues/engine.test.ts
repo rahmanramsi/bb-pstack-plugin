@@ -4,6 +4,43 @@ import type { EffectHandler } from "./engine.ts";
 import { GOOD, MIN, REPO, SHA1, SHA2, harness, type FakeThread, type Hold } from "./engine-harness.ts";
 import { EFFECT_POLICY } from "./job.ts";
 
+test("the board lists unlabeled and closed issues without starting them; manual start is idempotent", async () => {
+  const h = harness();
+  h.label(41);
+  h.unlabel(41);
+  h.label(42);
+  h.unlabel(42);
+  h.gh().issues.get(42)!.closed = true;
+  h.label(43);
+  const board = await h.engine().issues.board({ all: false });
+  assert.deepEqual(board.issues?.map((issue) => [issue.issue, issue.state]), [[41, "open"], [42, "closed"], [43, "open"]]);
+  assert.equal(board.jobs.length, 0);
+  assert.equal(h.spawned.length, 0);
+  await h.engine().issues.sweep();
+  assert.deepEqual((await h.views()).map((job) => job.issue), [43], "only the labeled issue starts automatically");
+  const ids = await Promise.all([h.engine().issues.start(REPO, 41), h.engine().issues.start(REPO, 41)]);
+  assert.equal(ids[0], ids[1]);
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "working");
+  assert.equal(h.spawned.length, 2);
+  assert.ok(!h.gh().issues.get(41)!.labels.has("agent"));
+  await assert.rejects(h.engine().issues.start(REPO, 42), /Only an open/);
+  await assert.rejects(h.engine().issues.start("other/repo", 41), /not configured/);
+});
+
+test("a manually started parent tracks its sub-issues without an agent label", async () => {
+  const h = harness();
+  h.label(41);
+  h.unlabel(41);
+  h.label(42);
+  h.unlabel(42);
+  h.gh().issues.get(41)!.subIssues = [42];
+  await h.engine().issues.start(REPO, 41);
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "tracking");
+  assert.equal((await h.byIssue(42)).state, "working");
+});
+
 test("label to draft pull request: spawn a worker, accept its report, push the reported commit, open and label the PR", async () => {
   const h = harness();
   h.label(41);
@@ -191,7 +228,7 @@ test("a rejected report lists every reason and leaves the job working; a fixed r
 
   const rejected = await h.report(working.threadId!, { ...GOOD, pr: { ...GOOD.pr, body: "Ran the playbook." } }, { headSha: SHA2, ahead: 1, dirty: true });
   assert.equal(rejected.exitCode, 1);
-  assert.match(rejected.stderr!, /Report rejected \(1 of 2\)[\s\S]*uncommitted[\s\S]*gate pr` fails: 3 open steps[\s\S]*describes the process \("playbook"\)/);
+  assert.match(rejected.stderr!, /Report rejected:[\s\S]*uncommitted[\s\S]*gate pr` fails: 3 open steps[\s\S]*describes the process \("playbook"\)/);
   const still = await h.only();
   assert.equal(still.state, "working");
   assert.equal(h.pushes.length, 0);
@@ -203,23 +240,23 @@ test("a rejected report lists every reason and leaves the job working; a fixed r
   assert.equal((await h.only()).state, "review");
 });
 
-test("a second rejected report sticks the job, stops the worker and removes the working label", async () => {
+test("repeated rejected reports keep the job working with its worker, and a fixed report still opens the pull request", async () => {
   const h = harness();
   h.label(41);
   await h.engine().issues.sweep();
   const working = await h.only();
-  await h.report(working.threadId!, GOOD, { headSha: SHA1, ahead: 0 });
-  const second = await h.report(working.threadId!, GOOD, { headSha: SHA1, ahead: 0 });
-  assert.match(second.stderr!, /needs a new commit[\s\S]*ended as stuck/);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const rejected = await h.report(working.threadId!, GOOD, { headSha: SHA1, ahead: 0 });
+    assert.match(rejected.stderr!, /needs a new commit[\s\S]*Fix every reason and report again/);
+  }
   await h.settle();
-  const stuck = await h.only();
-  assert.equal(stuck.state, "stuck");
-  assert.deepEqual(h.stopped, [working.threadId]);
-  assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
-  assert.equal(h.engine().issues.instructions(working.threadId!), null);
+  assert.equal((await h.only()).state, "working");
+  assert.deepEqual(h.stopped, []);
 
-  const late = await h.report(working.threadId!, GOOD);
-  assert.match(late.stderr!, /is stuck, not waiting for a report/);
+  const accepted = await h.report(working.threadId!, GOOD);
+  assert.equal(accepted.exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).state, "review");
 });
 
 test("re-labelling an issue after its job ended starts a new job on a -2 branch", async () => {
@@ -267,7 +304,7 @@ test("labels from users without write access, and repositories mapped to the ser
   assert.match(shown.stdout!, /repo error {4}host host_server is the bb server's machine/);
 });
 
-test("an idle worker that has not reported is reminded twice, then the job sticks", async () => {
+test("an idle worker that has not reported is reminded twice, then the job waits with the reason shown", async () => {
   const h = harness();
   h.label(41);
   await h.engine().issues.sweep();
@@ -287,7 +324,10 @@ test("an idle worker that has not reported is reminded twice, then the job stick
   Object.assign(thread, { updatedAt: h.clock.now });
   h.clock.now += 1;
   await h.settle();
-  assert.equal((await h.only()).state, "stuck");
+  const waiting = await h.only();
+  assert.equal(waiting.state, "working");
+  assert.match(waiting.error!, /stopped without reporting after every reminder/);
+  assert.equal(h.sent.length, 2, "no third reminder");
 });
 
 test("a worker cannot stop jobs, and a thread naming a job that is not waiting for it is stopped", async () => {
@@ -309,14 +349,14 @@ test("a worker cannot stop jobs, and a thread naming a job that is not waiting f
   assert.deepEqual(h.stopped, ["thr_dup"]);
 });
 
-test("a worker role bb cannot run sticks the job at once with the reason, before any label or spawn", async () => {
+test("a worker role bb cannot run keeps the job queued with the reason, before any label or spawn", async () => {
   for (const [role, reason] of [["codex/gpt-6.1-sol/extreme", /reasoning level "extreme"/], ["codex/gpt-missing/high", /codex\/gpt-missing\/high: not in the host's catalog/]] as const) {
     const h = harness();
     h.setWorkerRole(role);
     h.label(41);
     await h.engine().issues.sweep();
     const job = await h.only();
-    assert.equal(job.state, "stuck");
+    assert.equal(job.state, "queued");
     assert.match(job.error!, reason);
     assert.equal(h.spawned.length, 0);
     assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
@@ -434,7 +474,7 @@ test("in the service, one job's slow push does not hold back another job", { tim
   const service = new AbortController();
   const serving = h.serviceStarts.get("pstack-issues")!(service.signal);
   try {
-    while ((await issue(42)).state !== "stuck") await new Promise((resolve) => setTimeout(resolve, 5));
+    while (!(await issue(42)).error?.includes("waiting for it to recover")) await new Promise((resolve) => setTimeout(resolve, 5));
   } finally {
     service.abort();
     pushing.free();

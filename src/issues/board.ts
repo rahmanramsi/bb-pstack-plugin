@@ -14,8 +14,10 @@ export type IssueBoard = { repos: RepoView[]; jobs: ListedJob[] };
 const JOB_STATES = [...RESTING_STATES, ...Object.keys(TRANSIT)] as [JobState, ...JobState[]];
 const EFFECT_OPS = Object.keys(EFFECT_POLICY) as [EffectOp, ...EffectOp[]];
 const Poll = { polledAt: z.number().nullable(), error: z.string().nullable() };
+export const IssueSummarySchema = z.object({ repo: z.string(), issue: z.number().int().positive(), title: z.string(), issueUrl: z.string(), state: z.enum(["open", "closed"]), labels: z.array(z.string()), updatedAt: z.number(), body: z.string().default(""), author: z.string().default(""), assignees: z.array(z.string()).default([]) });
 
 export const IssueBoardSchema = z.object({
+  issues: z.array(IssueSummarySchema.extend({ startError: z.string().nullable() })).optional(),
   repos: z.array(z.object({ repo: z.string(), ...Poll })),
   jobs: z.array(
     z.object({
