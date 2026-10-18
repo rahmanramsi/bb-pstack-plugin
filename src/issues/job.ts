@@ -649,7 +649,8 @@ function close(job: Job): Change {
 
 /**
  * Whether the job's outbox still owes a spawn: `starting`, or `respawning` before its spawn settled. Such a row counts
- * against its machine until the spawned thread shows up as running, so jobs starting together spread out.
+ * against its machine until the spawn settles, and from then its thread counts as running, so jobs starting together
+ * spread out.
  */
 export function owesSpawn(job: Job): boolean {
   return "effects" in job.phase && job.phase.effects.some((effect) => effect.op === "spawn");
@@ -937,6 +938,8 @@ export type JobView = {
   next: { state: RestingState; op: EffectOp; tries: number; retryAt: number | null } | null;
   triggeredBy: string;
   branch: BranchName;
+  /** The worker's machine: `id` is null until an automatic job first starts. */
+  host: { id: string | null; pinned: boolean };
   threadId: string | null;
   pr: { number: number; url: string } | null;
   pushedSha: Sha | null;
@@ -964,6 +967,7 @@ export function toView(job: Job): JobView {
         : null,
     triggeredBy: job.trigger.actor,
     branch: job.branch,
+    host: { id: job.host.id, pinned: job.host.pinned },
     threadId: job.threadId,
     pr: job.pr,
     pushedSha: job.pushedSha,
@@ -973,4 +977,10 @@ export function toView(job: Job): JobView {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
+}
+
+/** How `bb pstack issues list` and the app name a job's machine. `host auto` matches the setting until a pick. */
+export function machineLabel(host: JobView["host"]): string {
+  if (host.id === null) return "host auto";
+  return host.pinned ? `on ${host.id}` : `on ${host.id} (auto)`;
 }

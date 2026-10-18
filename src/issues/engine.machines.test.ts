@@ -40,6 +40,9 @@ test("with no eligible machine the job stays queued with each machine's reason, 
   );
   assert.equal(h.spawned.length, 0);
   assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
+  assert.deepEqual(waiting.host, { id: null, pinned: false });
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, new RegExp(`#41 {2}queued {2}host auto {2}${waiting.id} {2}0m ago {2}no machine is eligible: host_server`));
+  assert.match((await h.engine().run(["issues", "show", waiting.id])).stdout!, /machine {7}picked when the job starts\n/);
 
   h.clock.now += 30 * MIN;
   await h.settle();
@@ -51,6 +54,9 @@ test("with no eligible machine the job stays queued with each machine's reason, 
   const started = await h.only();
   assert.deepEqual([started.state, started.error], ["working", null]);
   assert.deepEqual(spawnedOn(h), ["host_mini"]);
+  assert.deepEqual(started.host, { id: "host_mini", pinned: false });
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}working {2}on host_mini \(auto\) {2}thr_/);
+  assert.match((await h.engine().run(["issues", "show", started.id])).stdout!, /machine {7}host_mini \(picked automatically\)\n/);
 });
 
 test("a failure to read the machines leaves the job queued with the reason", async () => {
@@ -91,6 +97,7 @@ test("a gone worker's replacement gets a newly picked machine, and its feedback 
   assert.equal(waiting.state, "review");
   assert.equal(waiting.error, "no machine is eligible: host_server: the bb server's machine; host_mini: disconnected; host_studio: no checkout of this project");
   assert.equal(h.spawned.length, 1);
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, new RegExp(`#41 {2}review {2}on host_mini \\(auto\\) {2}PR #${pr} .* {2}no machine is eligible: host_server`));
 
   h.fleet.set("host_studio", { limit: 2 });
   h.clock.now += MIN;
@@ -114,6 +121,10 @@ test("a pinned repository's job runs on its machine even when another has more r
   h.fleet.set("host_big", { limit: 64 });
   h.label(41);
   await h.engine().issues.sweep();
-  assert.equal((await h.only()).state, "working");
+  const job = await h.only();
+  assert.equal(job.state, "working");
   assert.deepEqual(spawnedOn(h), ["host_worker"]);
+  assert.deepEqual(job.host, { id: "host_worker", pinned: true });
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}working {2}on host_worker {2}thr_/);
+  assert.match((await h.engine().run(["issues", "show", job.id])).stdout!, /machine {7}host_worker \(pinned by issueRepos\)\n/);
 });

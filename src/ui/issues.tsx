@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useBbNavigate, useRpc, type PluginNavPanelProps } from "@get-bb/plugin-sdk/app";
 import { Button } from "../../components/ui/button.tsx";
-import { TERMINAL, canStop } from "../issues/job.ts";
+import { TERMINAL, canStop, machineLabel } from "../issues/job.ts";
 import type { rpcContract } from "../rpc.ts";
 import { formatAge, issueNext, issueStates, type IssueJob, type IssueRepo } from "./layout.ts";
 import { useIssueBoard } from "./live.ts";
@@ -63,7 +63,7 @@ function IssueRow({ job, now, onThread, refresh }: { job: IssueJob; now: number;
   return <li className="ps-issue">
     <div className="ps-issue-line"><span className="ps-issue-title"><strong>#{job.issue}</strong> {job.title}</span><span className="ps-status" data-state={state.tone}>{state.label}</span></div>
     {next === null ? null : <p className="ps-muted">{next}</p>}
-    <p className="ps-muted"><code>{job.branch}</code> · updated {formatAge(job.updatedAt, now)}</p>
+    <p className="ps-muted"><code>{job.branch}</code> · {machineLabel(job.host)} · updated {formatAge(job.updatedAt, now)}</p>
     <div className="ps-issue-links">
       {onThread === null || threadId === null ? null
         : <Button type="button" variant="ghost" size="sm" className="ps-action" aria-label={`Open the worker thread for #${job.issue}`} onClick={() => onThread(threadId)}>Thread</Button>}

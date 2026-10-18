@@ -5,7 +5,7 @@ import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand } f
 import { z } from "zod";
 import { readThreadFile } from "../thread-files.ts";
 import { issueBoard, listed, repoView, type ListedJob, type RepoView } from "./board.ts";
-import { JOB_ID, MAX_FEEDBACK_ROUNDS, type JobId, type JobView, type RepoName } from "./job.ts";
+import { JOB_ID, MAX_FEEDBACK_ROUNDS, machineLabel, type JobId, type JobState, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
 /** `hostId` null: each job's machine is picked when the job starts. */
@@ -85,6 +85,9 @@ function stateLabel(job: JobView): string {
   return `${job.state} → ${job.next.state}: ${job.next.op}${job.next.tries > 0 ? `, try ${job.next.tries + 1}` : ""}${retry}`;
 }
 
+/** States whose error a list row shows: why the job ended, or why it waits, such as for an eligible machine. */
+const ROW_ERRORS: ReadonlySet<JobState> = new Set(["ignored", "stuck", "queued", "review"]);
+
 function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now: number): string {
   if (repos.length === 0 && jobs.length === 0) return "No issue jobs.";
   return repos
@@ -93,8 +96,8 @@ function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now:
       const rows = jobs
         .filter((job) => job.repo === repo)
         .map((job) => {
-          const parts = [`#${job.issue}`, stateLabel(job), job.pr ? `PR #${job.pr.number}` : null, job.threadId, job.id, age(job.createdAt, now)];
-          const detail = job.state === "ignored" || job.state === "stuck" ? job.error : null;
+          const parts = [`#${job.issue}`, stateLabel(job), machineLabel(job.host), job.pr ? `PR #${job.pr.number}` : null, job.threadId, job.id, age(job.createdAt, now)];
+          const detail = ROW_ERRORS.has(job.state) ? job.error : null;
           const row = `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
           return job.poll.error ? `${row}\n    poll error: ${job.poll.error}` : row;
         });
@@ -109,6 +112,7 @@ function formatShow(job: ListedJob, repo: RepoView, now: number): string {
     ["issue", job.issueUrl],
     ["triggered by", `@${job.triggeredBy}`],
     ["branch", job.branch],
+    ["machine", job.host.id === null ? "picked when the job starts" : `${job.host.id} (${job.host.pinned ? "pinned by issueRepos" : "picked automatically"})`],
     ["thread", job.threadId],
     ["pull request", job.pr?.url ?? null],
     ["pushed", job.pushedSha],
