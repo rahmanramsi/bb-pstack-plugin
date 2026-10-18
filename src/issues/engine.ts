@@ -41,6 +41,7 @@ import {
   type EffectMode,
   type EffectOp,
   type EffectOutcome,
+  type ChildFact,
   type Facts,
   type Feedback,
   type GateFact,
@@ -50,6 +51,7 @@ import {
   type RepoName,
   type ReportFacts,
   type Sha,
+  type SubIssue,
   type WorkerProblem,
   type WorkerSettings,
 } from "./job.ts";
@@ -321,6 +323,22 @@ export function createIssues(deps: IssuesDeps): Issues {
         return done();
       },
     },
+    status: {
+      async perform(job, effect, deadline) {
+        const repo = github.repo(job.repo, until(deadline));
+        const body = commentBody(effect.body, effect.key);
+        const found = await repo.findComment(job.issue, effectMarker(effect.key), job.createdAt);
+        if (found) await repo.editComment(found.id, body);
+        else await repo.comment(job.issue, body);
+        return done();
+      },
+    },
+    "close-issue": {
+      async perform(job, _effect, deadline) {
+        await github.repo(job.repo, until(deadline)).closeIssue(job.issue);
+        return done();
+      },
+    },
     "stop-thread": {
       async perform(job, _effect, deadline) {
         const signal = until(deadline);
@@ -386,12 +404,16 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function gather(job: Job): Promise<Facts> {
-    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
       const { prState } = store.jobPoll(job.id);
       facts.pr = prState ? { state: prState } : null;
+    }
+    if (first.includes("children")) facts.children = childFacts(job);
+    if (first.includes("blockers") && job.parentId) {
+      facts.blockers = store.polledChildren(job.parentId)?.find((child) => child.number === job.issue)?.blockedBy ?? [];
     }
     const wanted = [...first, ...moreFacts(job, facts)];
     if (wanted.includes("rounds")) facts.rounds = store.roundSummaries(job.id);
@@ -414,6 +436,16 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (wanted.includes("gate")) facts.gate = deps.prGate(threadId);
     }
     return facts;
+  }
+
+  function childFacts(parent: Job): ChildFact[] | null {
+    const polled = store.polledChildren(parent.id);
+    if (!polled) return null;
+    const created = store.children(parent.id);
+    return polled.map((child) => {
+      const job = store.open(parent.repo, child.number) ?? created.find((row) => row.issue === child.number);
+      return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged" } : null };
+    });
   }
 
   async function apply(job: Job, action: Exclude<Action, { type: "sleep" }>): Promise<void> {
@@ -588,6 +620,9 @@ export function createIssues(deps: IssuesDeps): Issues {
     });
     if (!written) return false;
     background(tick(id));
+    for (const child of store.children(id)) {
+      if (!TERMINAL.has(child.phase.state)) await stop(child.id, `parent ${id}`);
+    }
     return true;
   }
 
@@ -635,11 +670,51 @@ export function createIssues(deps: IssuesDeps): Issues {
           }
           store.recordPoll(job.id, { cursor: result.next, prState: result.pull?.state ?? null, feedback }, clock());
           if (stopper) await stop(job.id, `@${stopper} on GitHub`);
+          else if (job.phase.state === "tracking" || job.phase.state === "updating") await pollChildren(repo, job);
         } catch (error) {
           store.recordPollError(job.id, message(error), clock());
         }
       }),
     );
+  }
+
+  /**
+   * A parent's sub-issues and their blockers. Stops the parent when its issue lost the label or closed, and inserts a
+   * job for each open sub-issue that has neither an open job nor one this parent created.
+   */
+  async function pollChildren(repo: RepoClient, parent: Job): Promise<void> {
+    const issue = await repo.issue(parent.issue);
+    if (!issue.open || !issue.labels.includes(LABEL.trigger)) {
+      await stop(parent.id, issue.open ? `removing the ${LABEL.trigger} label` : "closing the issue");
+      return;
+    }
+    const listed = await repo.subIssues(parent.issue);
+    const children: SubIssue[] = await Promise.all(
+      listed.map(async ({ number, title, url, state }) => ({ number, title, url, state, blockedBy: state === "open" ? await repo.blockedBy(number) : [] })),
+    );
+    store.saveChildren(parent.id, children, clock());
+    const created = new Set(store.children(parent.id).map((job) => job.issue));
+    const baseBranch = await repo.defaultBranch();
+    const { title, body, url } = parent.snapshot;
+    for (const child of listed) {
+      if (child.state !== "open" || created.has(child.number) || store.open(parent.repo, child.number)) continue;
+      store.insert(
+        {
+          id: `psi_${randomUUID()}` as JobId,
+          repo: parent.repo,
+          issue: child.number,
+          trigger: { eventId: null, actor: parent.trigger.actor, at: parent.trigger.at },
+          snapshot: { title: child.title, body: child.body, url: child.url, author: child.author, parent: { number: parent.issue, title, body, url } },
+          parentId: parent.id,
+          projectId: parent.projectId,
+          hostId: parent.hostId,
+          baseBranch,
+          state: "queued",
+          error: null,
+        },
+        clock(),
+      );
+    }
   }
 
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
@@ -686,7 +761,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           projectId: mapping.projectId,
           hostId: mapping.hostId,
           baseBranch,
-          state: refusal ? "ignored" : "queued",
+          state: refusal ? "ignored" : issue.subIssues > 0 ? "tracking" : "queued",
           error: refusal,
         },
         now,

@@ -46,7 +46,10 @@ export class GitHubSetupError extends Error {}
 export type Permission = "admin" | "maintain" | "write" | "triage" | "read" | "none";
 export const CAN_TRIGGER: ReadonlySet<Permission> = new Set(["admin", "maintain", "write"]);
 
-export type LabeledIssue = { number: number; title: string; body: string; url: string; author: string; updatedAt: number };
+/** `subIssues` counts the issue's sub-issues, open or closed. */
+export type LabeledIssue = { number: number; title: string; body: string; url: string; author: string; updatedAt: number; subIssues: number };
+/** A sub-issue in this repository, without its blockers. */
+export type ListedSubIssue = { number: number; title: string; body: string; url: string; author: string; state: "open" | "closed" };
 export type LabelEvent = { id: number; actor: string; at: number };
 /** Opaque to callers, who store it and hand it back. */
 export type PollCursor = { readonly __brand: "PollCursor" };
@@ -87,6 +90,14 @@ export type RepoClient = {
     target: { issue: number; since: number; pr: number | null },
     cursor: ActivityCursor | null,
   ): Promise<{ issueComments: PolledComment[]; pull: { state: PullState; items: PolledFeedback[] } | null; next: ActivityCursor }>;
+  /** An issue's state and labels. */
+  issue(issue: number): Promise<{ open: boolean; labels: string[] }>;
+  /** The issue's sub-issues in this repository; ones in another repository are left out. */
+  subIssues(issue: number): Promise<ListedSubIssue[]>;
+  /** The issue's open blockers, as `#n` in this repository or `owner/repo#n` in another. */
+  blockedBy(issue: number): Promise<string[]>;
+  closeIssue(issue: number): Promise<void>;
+  editComment(id: number, body: string): Promise<void>;
   addLabels(issue: number, labels: readonly string[]): Promise<void>;
   /** A label that is not on the issue is success. */
   removeLabel(issue: number, label: string): Promise<void>;
@@ -120,6 +131,9 @@ type PullCursor = {
   pull: { etag: string | null; state: PullState } | null;
 };
 type Cached<T> = { value: T; until: number };
+type RawLinkedIssue = { number: number; title: string; body?: string | null; user?: RawUser; html_url: string; state: string; repository_url?: string; repository?: { full_name: string } };
+/** "owner/name" lowercased, from the issue's repository or its API URL. */
+const repoOf = (item: RawLinkedIssue) => (item.repository?.full_name ?? item.repository_url?.replace(/^.*\/repos\//, "") ?? "").toLowerCase();
 
 type RawUser = { login: string } | null;
 type RawReviewComment = { id: number; body: string; user: RawUser; path: string; line: number | null; original_line?: number | null; diff_hunk: string; in_reply_to_id?: number; pull_request_review_id: number | null; created_at: string; updated_at: string };
@@ -407,12 +421,12 @@ export function createGitHub(options: GitHubOptions): GitHub {
       name,
       appLogin,
       async labeledIssues(label, cursor) {
-        type RawIssue = { number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; pull_request?: unknown };
+        type RawIssue = { number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; pull_request?: unknown; sub_issues_summary?: { total: number } };
         const read = await list<RawIssue>(auth, `${base}/issues`, { labels: label, state: "open", sort: "updated", direction: "asc" }, cursor as unknown as Cursor | null, true);
         if (!read) return { changed: false };
         const issues = read.items
           .filter((item) => item.pull_request === undefined)
-          .map((item) => ({ number: item.number, title: item.title, body: item.body ?? "", url: item.html_url, author: item.user.login, updatedAt: Date.parse(item.updated_at) }));
+          .map((item) => ({ number: item.number, title: item.title, body: item.body ?? "", url: item.html_url, author: item.user.login, updatedAt: Date.parse(item.updated_at), subIssues: item.sub_issues_summary?.total ?? 0 }));
         return { changed: true, issues, next: read.next as unknown as PollCursor };
       },
       async latestLabelEvent(issue, label) {
@@ -473,6 +487,26 @@ export function createGitHub(options: GitHubOptions): GitHub {
         const pull = target.pr === null ? null : await pullActivity(target.pr, was.pull);
         const next: JobCursor = { issue: issue?.next ?? was.issue, pull: pull?.next ?? was.pull };
         return { issueComments, pull: pull && { state: pull.state, items: pull.items }, next: next as unknown as ActivityCursor };
+      },
+      async issue(issue) {
+        const { json } = await call<{ state: string; labels: ({ name: string } | string)[] }>(auth, "GET", `${base}/issues/${issue}`);
+        return { open: json.state === "open", labels: json.labels.map((label) => (typeof label === "string" ? label : label.name)) };
+      },
+      async subIssues(issue) {
+        const items = await pages<RawLinkedIssue>(auth, `${base}/issues/${issue}/sub_issues?per_page=100`);
+        return items
+          .filter((item) => repoOf(item) === name)
+          .map((item) => ({ number: item.number, title: item.title, body: item.body ?? "", url: item.html_url, author: item.user?.login ?? "ghost", state: item.state === "open" ? ("open" as const) : ("closed" as const) }));
+      },
+      async blockedBy(issue) {
+        const items = await pages<RawLinkedIssue>(auth, `${base}/issues/${issue}/dependencies/blocked_by?per_page=100`);
+        return items.filter((item) => item.state === "open").map((item) => (repoOf(item) === name ? `#${item.number}` : `${repoOf(item)}#${item.number}`));
+      },
+      async closeIssue(issue) {
+        await call(auth, "PATCH", `${base}/issues/${issue}`, { body: { state: "closed", state_reason: "completed" } });
+      },
+      async editComment(id, body) {
+        await call(auth, "PATCH", `${base}/issues/comments/${id}`, { body: { body } });
       },
       async addLabels(issue, labels) {
         await call(auth, "POST", `${base}/issues/${issue}/labels`, { body: { labels } });

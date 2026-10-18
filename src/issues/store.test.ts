@@ -230,3 +230,23 @@ test("a round start whose list misses feedback that arrived while the round was 
   assert.equal(store.get(job.id)!.version, job.version);
   assert.deepEqual(store.pendingFeedback(job.id).map((item) => item.id), [1, 2]);
 });
+
+test("the sub-issue migration keeps existing jobs, and a parent gets at most one child job per sub-issue", () => {
+  const db = new Database(":memory:");
+  const rebuild = MIGRATIONS.lastIndexOf(MIGRATIONS.filter((statement) => statement.startsWith("CREATE TABLE issue_jobs_next")).at(-1)!);
+  for (const statement of MIGRATIONS.slice(0, rebuild)) db.exec(statement);
+  db.prepare(
+    `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch, state, created_at, updated_at)
+     VALUES ('psi_old', ?, 40, 1, 7, 'maya', 1, '{"title":"t","body":"b","url":"u","author":"maya"}', 'prj_1', 'host_1', 'main', 'agent/issue-40-t', 'queued', 5, 5)`,
+  ).run(REPO);
+  for (const statement of MIGRATIONS.slice(rebuild)) db.exec(statement);
+  const store = openIssueStore(db);
+  const old = store.get("psi_old" as JobId)!;
+  assert.deepEqual([old.phase.state, old.trigger.eventId, old.parentId, old.progress], ["queued", 7, null, null]);
+  const parent = store.insert(newJob({ state: "tracking" }), 10)!;
+  const child = { issue: 51, trigger: { eventId: null, actor: "maya", at: 1 }, parentId: parent.id };
+  const first = store.insert(newJob(child), 11)!;
+  store.write(first.id, 0, { phase: { state: "stopped" } }, 12);
+  assert.equal(store.insert(newJob(child), 13), null, "a stopped child is not recreated");
+  assert.deepEqual(store.children(parent.id).map((job) => job.issue), [51]);
+});

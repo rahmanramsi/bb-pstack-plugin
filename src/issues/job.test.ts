@@ -65,13 +65,15 @@ function job(overrides: Partial<Job> = {}): Job {
     round: 1,
     roundBase: null,
     worker: null,
+    parentId: null,
+    progress: null,
     createdAt: NOW - MIN,
     updatedAt: NOW - MIN,
     ...overrides,
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);

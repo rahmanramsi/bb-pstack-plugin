@@ -41,6 +41,7 @@ Daily use happens on GitHub:
 | CI | Fails on a commit the App pushed | The worker starts a round to fix it. |
 | GitHub | Reports a merge conflict | The worker merges the base branch and resolves the conflict. |
 | A user with write access | Comments `@pstack-agent stop`, or removes the `agent` label | The worker stops and the job ends. |
+| A user with write access | Adds the `agent` label to an issue that has sub-issues | Each open sub-issue gets its own worker, with the parent issue as context. A sub-issue blocked by an open issue waits until that issue closes. The parent gets one status comment that the service edits, and closes once every sub-issue is closed. Stopping the parent, removing its label, or closing it stops the unfinished sub-issue jobs. |
 
 Operators inspect jobs from bb:
 
