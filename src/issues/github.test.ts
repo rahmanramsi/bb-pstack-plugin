@@ -109,6 +109,24 @@ test("labeled issues drop pull requests, follow pagination, and a 304 reports no
   assert.equal(seen.at(-1)!.headers["if-none-match"], 'W/"v1"');
 });
 
+test("the issue catalog includes all labels and states, follows pages, drops PRs and refreshes its cache", async () => {
+  const { repo, clock } = setup();
+  const issue = (number: number, extra = {}) => ({ number, title: `Issue ${number}`, body: null, html_url: `https://github.com/acme/web/issues/${number}`, user: { login: "maya" }, updated_at: new Date(NOW).toISOString(), state: "open", labels: [], ...extra });
+  routes["GET /repos/acme/web/issues"] = (request) => request.path.includes("page=2")
+    ? { status: 200, json: [issue(3, { state: "closed", labels: [{ name: "bug" }] })] }
+    : { status: 200, json: [issue(1), issue(2, { pull_request: {} })], headers: { link: `<${base}/repos/acme/web/issues?page=2>; rel="next"` } };
+  assert.deepEqual((await repo.repositoryIssues()).map((item) => [item.number, item.state, item.labels]), [[1, "open", []], [3, "closed", ["bug"]]]);
+  assert.ok(seen.some((request) => request.path.includes("state=all") && !request.path.includes("labels=")));
+  const requests = seen.length;
+  await repo.repositoryIssues();
+  assert.equal(seen.length, requests);
+  await repo.repositoryIssues(true);
+  assert.equal(seen.length, requests + 2);
+  clock.now += 60_000;
+  await repo.repositoryIssues();
+  assert.equal(seen.length, requests + 4);
+});
+
 test("a 401 drops the cached token and retries once with a fresh one", async () => {
   const { repo } = setup();
   let calls = 0;

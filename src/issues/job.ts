@@ -1,5 +1,5 @@
 /**
- * The issue job: one durable row per `agent` label event, and every decision about it. Pure: no I/O, clocks or ids.
+ * The issue job: a durable row for a label event, manual start or sub-issue, and every decision about it. Pure: no I/O, clocks or ids.
  *
  * A job is in a resting state or a transit state. A transit state carries its outbox: a non-empty list of effects.
  * The head effect runs, and when the last one succeeds the job enters TRANSIT[state]. plan() returns one action at a
@@ -246,7 +246,7 @@ export type Job = {
   repo: RepoName;
   issue: number;
   generation: number;
-  /** `eventId` is null for a sub-issue's job, which its parent's label event started. */
+  /** `eventId` is null for a manual start or a sub-issue started by its parent. */
   trigger: { eventId: number | null; actor: string; at: number };
   snapshot: IssueSnapshot;
   parentId: JobId | null;

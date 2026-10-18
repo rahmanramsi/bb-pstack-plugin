@@ -4,6 +4,43 @@ import type { EffectHandler } from "./engine.ts";
 import { GOOD, MIN, REPO, SHA1, SHA2, harness, type FakeThread, type Hold } from "./engine-harness.ts";
 import { EFFECT_POLICY } from "./job.ts";
 
+test("the board lists unlabeled and closed issues without starting them; manual start is idempotent", async () => {
+  const h = harness();
+  h.label(41);
+  h.unlabel(41);
+  h.label(42);
+  h.unlabel(42);
+  h.gh().issues.get(42)!.closed = true;
+  h.label(43);
+  const board = await h.engine().issues.board({ all: false });
+  assert.deepEqual(board.issues?.map((issue) => [issue.issue, issue.state]), [[41, "open"], [42, "closed"], [43, "open"]]);
+  assert.equal(board.jobs.length, 0);
+  assert.equal(h.spawned.length, 0);
+  await h.engine().issues.sweep();
+  assert.deepEqual((await h.views()).map((job) => job.issue), [43], "only the labeled issue starts automatically");
+  const ids = await Promise.all([h.engine().issues.start(REPO, 41), h.engine().issues.start(REPO, 41)]);
+  assert.equal(ids[0], ids[1]);
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "working");
+  assert.equal(h.spawned.length, 2);
+  assert.ok(!h.gh().issues.get(41)!.labels.has("agent"));
+  await assert.rejects(h.engine().issues.start(REPO, 42), /Only an open/);
+  await assert.rejects(h.engine().issues.start("other/repo", 41), /not configured/);
+});
+
+test("a manually started parent tracks its sub-issues without an agent label", async () => {
+  const h = harness();
+  h.label(41);
+  h.unlabel(41);
+  h.label(42);
+  h.unlabel(42);
+  h.gh().issues.get(41)!.subIssues = [42];
+  await h.engine().issues.start(REPO, 41);
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "tracking");
+  assert.equal((await h.byIssue(42)).state, "working");
+});
+
 test("label to draft pull request: spawn a worker, accept its report, push the reported commit, open and label the PR", async () => {
   const h = harness();
   h.label(41);

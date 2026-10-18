@@ -6,7 +6,6 @@ import { openChecklistStore } from "./checklist-store.ts";
 import { evidenceFreshnessError } from "./checklist.ts";
 import { ISSUES_CHANNEL, STATE_CHANNEL } from "./contract.ts";
 import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
-import { issueBoard } from "./issues/board.ts";
 import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
 import { createIssues } from "./issues/engine.ts";
 import { GitHubSetupError, createGitHub, decodePrivateKey } from "./issues/github.ts";
@@ -231,6 +230,13 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),
     repos: issueRepos,
+    catalog: async () => {
+      const { items } = await bb.sdk.plugins.callRpc({
+        pluginId: "github", method: "listItems", input: { kind: "issue" },
+        outputSchema: z.object({ items: z.array(z.object({ repo: z.string(), number: z.number().int().positive(), title: z.string(), url: z.string(), state: z.enum(["open", "closed"]), labels: z.array(z.string()), updatedAt: z.iso.datetime({ offset: true }), body: z.string().default(""), author: z.string().default(""), assignees: z.array(z.string()).default([]) })) }),
+      });
+      return items.map((item) => ({ repo: item.repo, issue: item.number, title: item.title, issueUrl: item.url, state: item.state, labels: item.labels, updatedAt: Date.parse(item.updatedAt), body: item.body, author: item.author, assignees: item.assignees }));
+    },
     resolveRole,
     prGate: (threadId) => {
       const state = checklistStore.checklist(threadId);
@@ -306,7 +312,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
     pstackStopRun: async ({ threadId, runId }) => ({ stopped: await runner.stop(runId as RunId, threadId) }),
     pstackCheckoutProof: async ({ formId }) => ({ sent: checkouts.publishProof(formId) }),
-    pstackIssueBoard: async (filter) => issueBoard(issueStore, issueRepos().map((mapping) => mapping.repo), filter),
+    pstackIssueBoard: async (filter) => issues.board(filter),
+    pstackStartIssue: async ({ repo, issue }) => ({ id: await issues.start(repo, issue) }),
     pstackStopIssueJob: async ({ id }) => ({ stopped: await issues.stop(id as JobId, "the bb app") }),
   });
 
