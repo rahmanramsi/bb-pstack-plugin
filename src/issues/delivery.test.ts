@@ -394,3 +394,26 @@ test("mention-dense prose in every field stays within the limit for the longest 
   assert.match(body, new RegExp(`Reported commit: ${SHA}`));
   assert.doesNotMatch(body, /(^|[^`])@a\b/);
 });
+
+test("an old generation's rate-limited decoration still holds the issue after a new generation projects", async (t) => {
+  const h = await fixture(t);
+  const oldJob = h.insert();
+  h.store.write(oldJob.id, oldJob.version, { phase: { state: "done" }, control: { ...oldJob.control, disposition: "no-change" } }, h.clock.now);
+  const claimed = h.store.statuses(h.clock.now)[0]!;
+  assert.equal(h.store.claimStatus(claimed, h.clock.now), true);
+  const oldKey = claimed.decorations[0]!.effect.key;
+  assert.equal(h.store.claimDecoration(claimed, oldKey, h.clock.now), 0);
+  const latest = h.insert();
+  assert.equal(latest.generation, 2);
+  const projected = h.db.prepare("SELECT decorations_json FROM issue_status WHERE issue = 41").get();
+  h.store.settleDecoration(claimed, oldKey, "slow down", h.clock.now + 600_000, h.clock.now, h.clock.now + 600_000);
+  assert.deepEqual(h.db.prepare("SELECT decorations_json FROM issue_status WHERE issue = 41").get(), projected);
+  h.store.releaseStatus(claimed, h.clock.now);
+  h.restart();
+  for (let minute = 1; minute < 10; minute++) { h.clock.now += 60_000; await h.build()(); }
+  assert.equal(h.requests.length, 0);
+  h.clock.now += 60_000;
+  await h.build()();
+  assert.deepEqual(h.labelPosts().map((request) => request.body), [{ labels: [LABEL.working] }]);
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
+});

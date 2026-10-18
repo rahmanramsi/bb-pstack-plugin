@@ -583,11 +583,13 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       return previous;
     }),
     settleDecoration: db.transaction((status: IssueStatus, key: string, error: string | null, nextAt: number, now: number, notBefore = 0) => {
+      if (notBefore) db.prepare("UPDATE issue_status SET retry_not_before = max(retry_not_before,?) WHERE repo = ? AND issue = ? AND lease_owner = ? AND lease_until > ?")
+        .run(notBefore, status.repo, status.issue, status.leaseOwner, now);
       const row = db.prepare("SELECT decorations_json FROM issue_status WHERE repo = ? AND issue = ? AND job_id = ? AND lease_owner = ? AND lease_until > ?").get(status.repo, status.issue, status.jobId, status.leaseOwner, now) as { decorations_json: string } | undefined;
       if (!row) return;
       const current = JSON.parse(row.decorations_json) as Decoration[];
       const decorations = current.flatMap((item) => item.effect.key !== key ? [item] : error === null ? [] : [{ ...item, error, nextAt }]);
-      db.prepare("UPDATE issue_status SET decorations_json = ?, retry_not_before = max(retry_not_before,?) WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), notBefore, status.repo, status.issue);
+      db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), status.repo, status.issue);
     }),
   };
   return { ...reads, ...notifying(writes, onChange), ...deliveries };
