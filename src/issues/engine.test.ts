@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { EffectHandler } from "./engine.ts";
-import { GOOD, MIN, REPO, SHA1, SHA2, harness, type FakeThread, type Hold } from "./engine-harness.ts";
-import { EFFECT_POLICY } from "./job.ts";
+import { GOOD, MIN, REPO, SHA1, SHA2, SHA3, harness, type FakeThread, type Hold } from "./engine-harness.ts";
+import { EFFECT_POLICY, FEEDBACK_QUIET_MS, ROUND_MS } from "./job.ts";
 
 test("the board lists unlabeled and closed issues without starting them; manual start is idempotent", async () => {
   const h = harness();
@@ -304,7 +304,7 @@ test("labels from users without write access, and repositories mapped to the ser
   assert.match(shown.stdout!, /repo error {4}host host_server is the bb server's machine/);
 });
 
-test("an idle worker that has not reported is reminded twice, then the job waits with the reason shown", async () => {
+test("an idle worker that has not reported is reminded twice, then replaced once from the base branch, and the job ends when the replacement leaves nothing either", async () => {
   const h = harness();
   h.label(41);
   await h.engine().issues.sweep();
@@ -324,10 +324,90 @@ test("an idle worker that has not reported is reminded twice, then the job waits
   Object.assign(thread, { updatedAt: h.clock.now });
   h.clock.now += 1;
   await h.settle();
-  const waiting = await h.only();
-  assert.equal(waiting.state, "working");
-  assert.match(waiting.error!, /stopped without reporting after every reminder/);
+  const restarted = await h.only();
+  assert.equal(restarted.state, "working", restarted.error ?? "");
+  assert.notEqual(restarted.threadId, working.threadId);
   assert.equal(h.sent.length, 2, "no third reminder");
+  assert.deepEqual(h.stopped, [working.threadId]);
+  assert.equal(h.spawned.length, 2);
+  assert.equal(h.spawned[1]!.environment.workspace.baseBranch.name, "origin/main");
+  assert.equal(h.spawned[1]!.prompt, h.spawned[0]!.prompt);
+
+  h.threads.delete(restarted.threadId!);
+  await h.settle();
+  const ended = await h.only();
+  assert.equal(ended.state, "stuck");
+  assert.match(ended.error!, /nothing to publish after a restart: the worker thread was archived or deleted/);
+  assert.equal(h.spawned.length, 2, "one restart only");
+  const [comment] = h.gh().comments.get(41)!;
+  assert.match(comment!.body, /^Work on this issue stopped without a pull request[\s\S]*add it again to start a new job\.\n\n<!-- pstack:comment:psi_[^:]+:abandon -->$/);
+  assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
+});
+
+test("a first round past its 4 hours is published as a draft labeled agent:stuck, and a completed feedback round clears the label", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  h.commit(working.threadId!, { headSha: SHA2, ahead: 1 });
+  h.clock.now += ROUND_MS;
+  await h.settle();
+
+  const review = await h.only();
+  assert.equal(review.state, "review", review.error ?? "");
+  assert.equal(review.pushedSha, SHA2);
+  assert.deepEqual(h.stopped, [working.threadId]);
+  const pr = h.gh().issues.get(review.pr!.number)!;
+  assert.equal(pr.pr!.draft, true);
+  assert.equal(pr.pr!.title, "Submit button hides behind the footer");
+  assert.match(pr.pr!.body, /^## Unfinished\n\nThis draft was published before the work was finished: the worker did not report within 4 hours\.[\s\S]*verify the change before merging\.\n\nCloses #41$/);
+  assert.deepEqual([...pr.labels], ["agent", "agent:stuck"]);
+  assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", "agent:review"]);
+
+  const { comments } = h.review(review.pr!.number, { author: "maya", body: "", comments: ["Finish the footer fix."] });
+  h.clock.now += FEEDBACK_QUIET_MS;
+  await h.settle();
+  const round = { outcome: "changes", round: 1, replies: [{ kind: "review-comment", commentId: comments[0]!, body: "Finished it in 3333333." }], verification: ["npm test: 15 passed"], summary: "Finished the fix." };
+  assert.equal((await h.report(review.threadId!, round, { headSha: SHA3 })).exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).state, "review");
+  assert.deepEqual([...pr.labels], ["agent"]);
+});
+
+test("a worker thread archived before it reported has its commits published without stopping it", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  h.commit(working.threadId!, { headSha: SHA2, ahead: 1 });
+  h.threads.get(working.threadId!)!.archivedAt = h.clock.now;
+  await h.settle();
+  const review = await h.only();
+  assert.equal(review.state, "review", review.error ?? "");
+  assert.deepEqual(h.stopped, []);
+  assert.match(h.gh().issues.get(review.pr!.number)!.pr!.body, /the worker thread was archived or deleted before it reported/);
+});
+
+test("a second report rejected only for its quality is accepted as a draft labeled agent:stuck that lists what is unresolved", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  h.failures.gate = "3 open steps block the pr gate.";
+  const rejected = await h.report(working.threadId!, GOOD);
+  assert.equal(rejected.exitCode, 1);
+  const published = await h.report(working.threadId!, GOOD);
+  assert.equal(published.exitCode, 0, published.stderr);
+  assert.match(published.stdout!, /Report accepted with unresolved problems[\s\S]*labeled agent:stuck[\s\S]*- `bb pstack gate pr` fails: 3 open steps/);
+  await h.settle();
+
+  const review = await h.only();
+  assert.equal(review.state, "review", review.error ?? "");
+  assert.deepEqual(h.stopped, [], "the worker stays for feedback rounds");
+  const pr = h.gh().issues.get(review.pr!.number)!;
+  assert.equal(pr.pr!.title, GOOD.pr.title);
+  assert.match(pr.pr!.body, /^## Why\n[\s\S]*## Unfinished\n\nThis draft was published before the work was finished: the report was still rejected after one correction\.\n\n- `bb pstack gate pr` fails: 3 open steps/);
+  assert.deepEqual([...pr.labels], ["agent", "agent:stuck"]);
 });
 
 test("a worker cannot stop jobs, and a thread naming a job that is not waiting for it is stopped", async () => {

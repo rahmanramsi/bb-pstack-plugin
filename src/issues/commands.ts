@@ -174,7 +174,7 @@ export function issueCommands(deps: {
     "issues report": cliCommand({
       summary: "Issue workers only: hand your result to pstack, which pushes your commit and opens the pull request",
       description:
-        "Write the report JSON to a file on this machine and pass its path. A rejected report exits 1 with every reason; fix them and report again. The second rejection ends the job.",
+        "Write the report JSON to a file on this machine and pass its path. A rejected report exits 1 with every reason; fix them and report again. When a first-round report with a new commit is rejected a second time, pstack publishes that commit as a draft pull request labeled agent:stuck that lists the reasons.",
       options: {
         file: { type: "string", description: "Report JSON on this thread's machine; a relative path resolves against the current directory" },
       },

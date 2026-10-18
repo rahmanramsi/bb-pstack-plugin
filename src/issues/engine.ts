@@ -54,6 +54,7 @@ import { acceptSync,
   type SubIssue,
   type WorkerProblem,
   type WorkerSettings,
+  type WorktreeFact,
 } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 import { commentBody, effectMarker, mergeNote, workerInstructions } from "./text.ts";
@@ -409,8 +410,19 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  /** Null while the worktree cannot be read yet; `empty` once it never can, with its thread or environment gone. */
+  async function worktreeFact(job: Job): Promise<WorktreeFact | null> {
+    try {
+      const tree = await worktree(job);
+      if (!tree.ok) return tree.transient ? null : { kind: "empty" };
+      return tree.ahead > 0 ? { kind: "commits", headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead } : { kind: "empty" };
+    } catch (error) {
+      return isMissing(error) ? { kind: "empty" } : null;
+    }
+  }
+
   async function gather(job: Job): Promise<Facts> {
-    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, worktree: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
@@ -441,6 +453,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       if (wanted.includes("gate")) facts.gate = deps.prGate(threadId);
     }
+    // A stalled worker shows only in its thread's facts, so the worktree is asked for after them.
+    if (moreFacts(job, facts).includes("worktree")) facts.worktree = await worktreeFact(job);
     return facts;
   }
 
@@ -634,6 +648,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (parsed.round === "feedback") {
       const push = parsed.report.outcome === "changes" ? `pushes ${sha} to ${bound.branch}, ` : "";
       return { ok: true, message: `Report accepted. pstack ${push}posts your replies, and asks the reviewers to look again.` };
+    }
+    if (outcome.unresolved) {
+      return {
+        ok: true,
+        message: [`Report accepted with unresolved problems. pstack pushes ${sha} to ${bound.branch} and opens a draft pull request labeled ${LABEL.stuck} that lists them:`, ...outcome.unresolved.map((reason) => `- ${reason}`)].join("\n"),
+      };
     }
     const messages = {
       changes: `Report accepted. pstack pushes ${sha} to ${bound.branch} and opens a draft pull request.`,

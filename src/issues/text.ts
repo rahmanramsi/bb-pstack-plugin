@@ -75,6 +75,26 @@ export function prBody(body: string, issue: number): string {
   return `${outsideCode(neutralizeMentions(unmarked(body)), (text) => text.replace(CLOSING_KEYWORD, "")).trim()}\n\nCloses #${issue}`;
 }
 
+/**
+ * The body of a draft published before its worker finished: the worker's own body when it wrote one, then why the
+ * work stopped and what is left.
+ */
+export function stuckBody(reason: string, unfinished: readonly string[], body: string | null): string {
+  return [
+    ...(body?.trim() ? [body.trim(), ""] : []),
+    "## Unfinished",
+    "",
+    `This draft was published before the work was finished: ${reason}.`,
+    ...(unfinished.length > 0 ? ["", ...unfinished.map((item) => `- ${item}`)] : []),
+    ...(body === null ? ["", "The worker did not report its checks; verify the change before merging."] : []),
+  ].join("\n");
+}
+
+/** Posted on the issue when its job ends with nothing to publish, even from a fresh worker. */
+export function abandonText(reason: string): string {
+  return issueText(`Work on this issue stopped without a pull request: ${reason}, and no commits were left to publish, also after one restart. Remove the \`agent\` label and add it again to start a new job.`);
+}
+
 /** Text posted in a comment (questions, the no-change reason, replies) with markers and mentions neutralized. */
 export function issueText(text: string): string {
   return neutralizeMentions(unmarked(text)).trim();

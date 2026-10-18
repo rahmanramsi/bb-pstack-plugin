@@ -4,6 +4,7 @@ import { AGENT_BRANCH } from "../host-contract.ts";
 import {
   EFFECT_POLICY,
   MAX_EFFECT_TRIES,
+  MAX_NUDGES,
   InitialReport,
   RoundReport,
   parseReport,
@@ -17,6 +18,7 @@ import {
   counts,
   enter,
   isReasoningLevel,
+  moreFacts,
   plan,
   settle,
   stop,
@@ -66,6 +68,7 @@ function job(overrides: Partial<Job> = {}): Job {
     round: 1,
     roundBase: null,
     worker: null,
+    restarted: false,
     parentId: null,
     progress: null,
     createdAt: NOW - MIN,
@@ -74,7 +77,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, worktree: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);
@@ -213,11 +216,17 @@ test("retry backs off and honours the server's notBefore without running out of 
   assert.equal(failed.error, "the remote branch moved");
 });
 
-test("a working job waits through a failed or idle worker, nudges an idle one twice, and sticks only when its thread is gone", () => {
+test("a working job waits through a failed or idle worker, nudges an idle one twice, and reads its worktree once the round stalls", () => {
   const working = job({ phase: { state: "working" }, threadId: "thr_w", deadline: NOW + 30 * MIN, updatedAt: NOW - MIN });
   assert.equal(plan(working, facts({ thread: { kind: "active" } })), null);
-  assert.equal(plan({ ...working, deadline: NOW }, facts({ thread: { kind: "active" } })), null, "a worker past its deadline keeps working");
-  assert.equal((plan(working, facts({ thread: { kind: "gone" } })) as { change: Change }).change.phase?.state, "sticking");
+  assert.deepEqual(moreFacts(working, facts({ thread: { kind: "active" } })), [], "a working round reads no worktree");
+  for (const [stalled, why] of [[{ ...working, deadline: NOW }, facts({ thread: { kind: "active" } })], [working, facts({ thread: { kind: "gone" } })]] as const) {
+    assert.deepEqual(moreFacts(stalled, why), ["worktree"]);
+    const action = plan(stalled, why) as { change: Change };
+    assert.equal(action.change.phase, undefined, "nothing ends before the worktree is read");
+    assert.match(action.change.error!, /^waiting to read the worker's worktree: the worker (did not report within 4 hours|thread was archived or deleted)/);
+    assert.equal(plan(apply(stalled, action.change), why), null, "the wait is written once");
+  }
 
   const failed = plan(working, facts({ thread: { kind: "failed", error: "provider crashed" } })) as { change: Change };
   assert.equal(failed.change.phase, undefined, "a failed thread may recover, so the job waits");
@@ -233,9 +242,116 @@ test("a working job waits through a failed or idle worker, nudges an idle one tw
 
   const nudged = apply(working, (nudge as { change: Change }).change);
   assert.equal(plan(nudged, facts({ thread: { kind: "idle", since: NOW - 10 } })), null, "no second nudge until the worker idles again");
-  const silent = plan({ ...nudged, nudges: 2 }, facts({ thread: { kind: "idle", since: NOW + 10 } })) as { change: Change };
-  assert.equal(silent.change.phase, undefined, "a worker silent after every reminder waits for a person");
-  assert.match(silent.change.error!, /stopped without reporting after every reminder/);
+  const idle = facts({ thread: { kind: "idle", since: NOW + 10 }, waiting: false, gate: { pass: false, reason: "2 open steps" } });
+  assert.equal(plan({ ...nudged, nudges: MAX_NUDGES }, { ...idle, waiting: true }), null, "a worker waiting on its own runs has not stopped");
+  const silent = { ...nudged, nudges: MAX_NUDGES };
+  const quiet = apply(silent, (plan(silent, idle) as { change: Change }).change);
+  assert.match(quiet.error!, /worktree: the worker stopped without reporting after every reminder/);
+  assert.deepEqual(moreFacts(quiet, idle), ["worktree"], "the stall outlives the write that records the wait");
+  const salvaged = (plan(quiet, { ...idle, worktree: { kind: "commits", headSha: HEAD, dirty: false, ahead: 1 } }) as { change: Change }).change;
+  assert.ok(salvaged.phase && "effects" in salvaged.phase);
+  const openPr = salvaged.phase.effects.find((effect) => effect.op === "open-pr");
+  assert.match(openPr?.op === "open-pr" ? openPr.body : "", /- `bb pstack gate pr` fails: 2 open steps/, "the failing gate is listed as unfinished");
+  assert.equal(plan({ ...quiet, error: null }, facts({ thread: { kind: "active" } })), null);
+  assert.deepEqual((plan(quiet, facts({ thread: { kind: "active" } })) as { change: Change }).change, { error: null }, "the worker came back");
+});
+
+const STALLED = { thread: { kind: "active" }, worktree: { kind: "commits", headSha: HEAD, dirty: false, ahead: 2 } } as const;
+const stalledJob = (overrides: Partial<Job> = {}) => job({ phase: { state: "working" }, threadId: "thr_w", worker: WORKER, deadline: NOW, ...overrides });
+
+/** Settles every effect of a transit job as done, as the engine would one claim at a time. */
+function drain(current: Job, patch: (effect: Effect) => Partial<Job> = () => ({})): Job {
+  while ("effects" in current.phase) {
+    const head = current.phase.effects[0];
+    const claimed = { ...current, phase: { ...current.phase, tries: 1, firstAt: NOW } } as Job;
+    current = apply(claimed, settle(claimed, { kind: "done", patch: patch(head) as never }, NOW));
+  }
+  return current;
+}
+
+test("a first round past its 4 hours publishes the worker's commits as a draft labeled agent:stuck and ends in review", () => {
+  const stalled = stalledJob();
+  const publishing = apply(stalled, (plan(stalled, facts(STALLED)) as { change: Change }).change);
+  assert.ok("effects" in publishing.phase);
+  assert.equal(publishing.phase.state, "publishing");
+  const [stopThread, push, openPr, prLabels, issueLabels] = publishing.phase.effects;
+  assert.deepEqual(stopThread, { op: "stop-thread", key: `stop-thread:${stalled.id}:salvage` });
+  assert.deepEqual(push, { op: "push", key: `push:${stalled.id}:${HEAD}`, sha: HEAD, expectedRemoteSha: null });
+  assert.equal(openPr?.op === "open-pr" && openPr.title, "Submit button hides behind the footer");
+  assert.equal(
+    openPr?.op === "open-pr" && openPr.body,
+    "## Unfinished\n\nThis draft was published before the work was finished: the worker did not report within 4 hours.\n\nThe worker did not report its checks; verify the change before merging.\n\nCloses #41",
+  );
+  assert.deepEqual(prLabels, { op: "labels", key: `labels:${stalled.id}:pr`, on: "pr", add: ["agent", "agent:stuck"], remove: [] });
+  assert.deepEqual(issueLabels, { op: "labels", key: `labels:${stalled.id}:review`, on: "issue", add: ["agent:review"], remove: ["agent:working"] });
+  assert.equal(publishing.deadline, null);
+  assert.match(publishing.error!, /published as an unfinished draft: the worker did not report within 4 hours/);
+
+  const review = drain(publishing, (effect) => (effect.op === "push" ? { pushedSha: HEAD } : effect.op === "open-pr" ? { pr: PR } : {}));
+  assert.deepEqual(review.phase, { state: "review" });
+  assert.equal(review.pushedSha, HEAD);
+  assert.deepEqual(review.pr, PR);
+
+  const dirty = (plan(stalled, facts({ ...STALLED, worktree: { ...STALLED.worktree, dirty: true } })) as { change: Change }).change;
+  assert.ok(dirty.phase && "effects" in dirty.phase);
+  const dirtyPr = dirty.phase.effects.find((effect) => effect.op === "open-pr");
+  assert.match(dirtyPr?.op === "open-pr" ? dirtyPr.body : "", /- the worktree had uncommitted changes, which this pull request does not include/);
+});
+
+test("a gone worker thread with commits is salvaged without stopping it", () => {
+  const stalled = stalledJob({ deadline: NOW + MIN });
+  const change = (plan(stalled, facts({ ...STALLED, thread: { kind: "gone" } })) as { change: Change }).change;
+  assert.ok(change.phase && "effects" in change.phase);
+  assert.deepEqual(change.phase.effects.map((effect) => effect.op), ["push", "open-pr", "labels", "labels"]);
+  assert.match(change.error!, /archived or deleted before it reported/);
+});
+
+test("a stalled first round with no commits starts one fresh worker from the base branch, then ends with a comment on the issue", () => {
+  const stalled = stalledJob();
+  const empty = facts({ ...STALLED, worktree: { kind: "empty" } });
+  const restart = (plan(stalled, empty) as { change: Change }).change;
+  assert.equal(restart.restarted, true);
+  assert.equal(restart.deadline, NOW + ROUND_MS);
+  assert.ok(restart.phase && "effects" in restart.phase);
+  assert.equal(restart.phase.state, "starting");
+  const [stopThread, spawn] = restart.phase.effects;
+  assert.deepEqual(stopThread, { op: "stop-thread", key: `stop-thread:${stalled.id}:restart` });
+  assert.ok(spawn?.op === "spawn");
+  assert.equal(spawn.key, `spawn:${stalled.id}:restart`);
+  assert.deepEqual(spawn.spec, { ...WORKER, title: "acme/web#41: Submit button hides behind the footer", prompt: workerPrompt(stalled), baseRef: "origin/main" });
+
+  const working = drain(apply(stalled, restart), (effect) => (effect.op === "spawn" ? { threadId: "thr_w2" } : {}));
+  assert.deepEqual(working.phase, { state: "working" });
+  assert.equal(working.threadId, "thr_w2");
+  assert.equal(working.restarted, true);
+  assert.equal(plan(working, facts({ thread: { kind: "active" } })), null, "the fresh worker has its own 4 hours");
+
+  const again = { ...working, deadline: NOW };
+  const abandon = (plan(again, empty) as { change: Change }).change;
+  assert.ok(abandon.phase && "effects" in abandon.phase);
+  assert.equal(abandon.phase.state, "sticking");
+  assert.deepEqual(abandon.phase.effects.map((effect) => effect.op), ["comment", "stop-thread", "labels"]);
+  const comment = abandon.phase.effects[0];
+  assert.equal(comment.op === "comment" && comment.key, `comment:${stalled.id}:abandon`);
+  assert.match(comment.op === "comment" ? comment.body : "", /did not report within 4 hours, and no commits were left to publish[\s\S]*Remove the `agent` label and add it again/);
+  assert.match(abandon.error!, /nothing to publish after a restart: the worker did not report within 4 hours/);
+  assert.equal(drain(apply(again, abandon)).phase.state, "stuck");
+});
+
+test("a stalled first round whose worktree cannot be read yet waits with the reason, then salvages once it can", () => {
+  const stalled = stalledJob();
+  const unread = facts({ thread: { kind: "active" } });
+  const waiting = apply(stalled, (plan(stalled, unread) as { change: Change }).change);
+  assert.equal(waiting.phase.state, "working");
+  assert.equal(waiting.error, "waiting to read the worker's worktree: the worker did not report within 4 hours");
+  assert.equal(plan(waiting, unread), null);
+  assert.equal((plan(waiting, facts(STALLED)) as { change: Change }).change.phase?.state, "publishing");
+});
+
+test("a later round never stalls: its pull request already exists", () => {
+  const addressing = job({ phase: { state: "addressing" }, round: 2, threadId: "thr_w", pr: { number: 7, url: "u" }, deadline: NOW });
+  assert.deepEqual(moreFacts(addressing, facts({ pr: { state: "open" }, thread: { kind: "gone" } })), []);
+  assert.equal(plan(addressing, facts({ pr: { state: "open" }, thread: { kind: "active" } })), null);
 });
 
 test("stop replaces a pending outbox, stops a worker that may exist, and is null once the job has ended", () => {
@@ -316,9 +432,41 @@ test("a report is rejected with every reason, however many times, without ending
   }
   assert.deepEqual(verdict.change, { rejections: 1, error: `report rejected: ${reasonsOf(verdict).join("; ")}` });
 
-  const second = acceptReport({ ...working, rejections: 1 }, bad, reportFacts({ worktree: { headSha: HEAD, dirty: true, ahead: 1, commits: [HEAD] } }));
-  assert.equal(second.change.phase, undefined);
-  assert.equal(second.change.rejections, 2);
+  const unchanged = reportFacts({ worktree: { headSha: HEAD, dirty: false, ahead: 0, commits: [] } });
+  for (const rejections of [1, 4]) {
+    const again = acceptReport({ ...working, rejections }, first(REPORT), unchanged);
+    assert.equal(again.ok, false, "with no new commit there is nothing to publish");
+    assert.equal(again.change.phase, undefined);
+    assert.equal(again.change.rejections, rejections + 1);
+  }
+});
+
+test("a second rejection of a new commit for quality alone publishes it as a draft that lists the unresolved reasons", () => {
+  const working = job({ phase: { state: "working" }, threadId: "thr_w", rejections: 1, deadline: NOW + MIN });
+  const sloppy = first({ ...REPORT, pr: { title: "Fixed it", body: "Moved the footer below the button.\n\nRan the playbook." } });
+  const verdict = acceptReport(working, sloppy, reportFacts({ worktree: { headSha: HEAD, dirty: true, ahead: 1, commits: [HEAD] }, gate: { pass: false, reason: "2 open steps" } }));
+  assert.ok(verdict.ok);
+  assert.ok(verdict.unresolved);
+  for (const expected of [/uncommitted/, /gate pr` fails: 2 open steps/, /10 to 72/, /Conventional Commits/, /describes the process \("playbook"\)/]) {
+    assert.ok(verdict.unresolved.some((reason) => expected.test(reason)), String(expected));
+  }
+  const publishing = apply(working, verdict.change);
+  assert.ok("effects" in publishing.phase);
+  assert.equal(publishing.phase.state, "publishing");
+  assert.equal(publishing.report?.headSha, HEAD);
+  assert.equal(publishing.rejections, 0);
+  assert.deepEqual(publishing.phase.effects.map((effect) => effect.op), ["push", "open-pr", "labels", "labels"], "the worker keeps its thread for feedback rounds");
+  const openPr = publishing.phase.effects[1];
+  assert.ok(openPr.op === "open-pr");
+  assert.equal(openPr.title, "Fixed it");
+  assert.match(openPr.body, /^Moved the footer below the button\.\n\nRan the playbook\.\n\n## Unfinished\n\nThis draft was published before the work was finished: the report was still rejected after one correction\.\n\n- /);
+  assert.doesNotMatch(openPr.body, /did not report its checks/);
+  assert.deepEqual(publishing.phase.effects[2], { op: "labels", key: `labels:${working.id}:pr`, on: "pr", add: ["agent", "agent:stuck"], remove: [] });
+
+  const firstTime = acceptReport({ ...working, rejections: 0 }, sloppy, reportFacts());
+  assert.equal(firstTime.ok, false, "the first rejection goes back to the worker");
+  const question = acceptReport(working, first({ outcome: "needs-info", questions: ["Should the agent move it?"], verification: ["read it"] }), reportFacts({ worktree: { headSha: HEAD, dirty: false, ahead: 0, commits: [] } }));
+  assert.equal(question.ok, false, "only a changes report is published");
 });
 
 test("process phrases are rejected but ordinary words that contain them pass", () => {
@@ -566,6 +714,7 @@ test("a feedback round's changes report pushes on top of the pushed commit, answ
     { op: "reply", key: `reply:${addressing.id}:2:review-comment:1`, target: { kind: "review-comment", id: 1, thread: 1 }, body: "Renamed to `parseInput` in ccccccc, cc `@lee`." },
     { op: "edit-pr", key: `edit-pr:${addressing.id}:2`, body: "## Why\nRenamed helpers.\n\nCloses #41" },
     { op: "request-review", key: `request-review:${addressing.id}:2`, reviewers: ["lee", "maya"] },
+    { op: "labels", key: `labels:${addressing.id}:unstuck:2`, on: "pr", add: [], remove: ["agent:stuck"] },
     { op: "labels", key: `labels:${addressing.id}:review:2`, on: "issue", add: ["agent:review"], remove: ["agent:working"] },
   ]);
   assert.equal(TRANSIT_OF(republishing), "review");
@@ -578,7 +727,8 @@ test("a feedback round's changes report pushes on top of the pushed commit, answ
   const replying = apply(addressing, noChange.change);
   assert.ok("effects" in replying.phase);
   assert.equal(replying.phase.state, "replying");
-  assert.deepEqual(replying.phase.effects.map((effect) => effect.op), ["reply", "reply", "request-review", "labels"]);
+  assert.deepEqual(replying.phase.effects.map((effect) => effect.op), ["reply", "reply", "request-review", "labels", "labels"]);
+  assert.deepEqual(replying.phase.effects[3], { op: "labels", key: `labels:${addressing.id}:unstuck:2`, on: "pr", add: [], remove: ["agent:stuck"] }, "a completed round clears agent:stuck");
 });
 
 test("a feedback round's report must answer exactly the listed items, add a commit only with changes, and follow the round's contract", () => {

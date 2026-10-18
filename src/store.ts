@@ -348,6 +348,7 @@ export const MIGRATIONS: readonly string[] = [
      WHERE state NOT IN ('ignored','done','stopped','stuck')`,
   `CREATE INDEX issue_jobs_due ON issue_jobs (state, created_at)`,
   `CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL`,
+  `ALTER TABLE issue_jobs ADD COLUMN restarted INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

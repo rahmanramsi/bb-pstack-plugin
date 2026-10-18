@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, abandonText, bodyProblems, commentBody, issueText, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, stuckBody, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -24,6 +24,8 @@ export const LABEL = {
   working: "agent:working",
   needsInfo: "agent:needs-info",
   review: "agent:review",
+  /** On a pull request published before its worker finished; a completed feedback round removes it. */
+  stuck: "agent:stuck",
 } as const;
 export type Label = (typeof LABEL)[keyof typeof LABEL];
 /** The labels that show a job's progress. An ending job removes all of them, whichever one it was showing. */
@@ -275,6 +277,8 @@ export type Job = {
   roundBase: Sha | null;
   /** The worker's settings from the start, so a replacement worker runs the same model. */
   worker: WorkerSettings | null;
+  /** The first round already replaced a worker that stopped with nothing to publish. */
+  restarted: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -302,6 +306,7 @@ export type Change = {
   roundBase?: Sha;
   worker?: WorkerSettings;
   progress?: string;
+  restarted?: true;
 };
 
 export type ThreadFact =
@@ -318,6 +323,15 @@ export type ThreadFact =
 export type WorkerProblem = { error: string; permanent: boolean };
 
 export type GateFact = { pass: true } | { pass: false; reason: string };
+
+/**
+ * The worker's worktree, read only once the first round has stalled. `empty` when nothing is ahead of the base branch,
+ * or when the worktree is gone for good with its thread or environment.
+ */
+export type WorktreeFact = { kind: "commits"; headSha: Sha; dirty: boolean; ahead: number } | { kind: "empty" };
+
+/** Why a first round cannot finish, and what a draft published from it leaves undone. */
+export type Stall = { reason: string; unfinished: readonly string[] };
 
 export type PullState = "open" | "merged" | "closed";
 
@@ -350,6 +364,8 @@ export type Facts = {
   children: readonly ChildFact[] | null;
   /** For a sub-issue's queued job: its open blockers as its parent last polled them. */
   blockers: readonly string[] | null;
+  /** For a stalled first round; null until read, or while it cannot be read yet. */
+  worktree: WorktreeFact | null;
 };
 
 export type FactName = Exclude<keyof Facts, "now">;
@@ -386,6 +402,7 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
+  if (stall(job, facts)) return ["worktree"];
   if (job.phase.state !== "review" || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.round > MAX_FEEDBACK_ROUNDS) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
 }
@@ -418,6 +435,7 @@ export type Action =
 export const MAX_NUDGES = 2;
 const THREAD_FAILED = "the worker thread failed, waiting for it to recover: ";
 const IDLE_WORKER = "the worker stopped without reporting after every reminder; message its thread or stop the job";
+const WAITING_WORKTREE = "waiting to read the worker's worktree: ";
 export const ROUND_MS = 4 * 60 * 60_000;
 
 /** States a round runs through, from its start until the job rests in review or needs-info, or heads to an end. */
@@ -484,6 +502,8 @@ function next(job: Job, facts: Facts): Action | null {
     case "addressing":
     case "working": {
       if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job) };
+      const stalled = stall(job, facts);
+      if (stalled) return rescue(job, facts, stalled, now);
       const thread = facts.thread;
       if (!thread) return null;
       switch (thread.kind) {
@@ -502,7 +522,7 @@ function next(job: Job, facts: Facts): Action | null {
           }
           return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
         case "active":
-          return job.error?.startsWith(THREAD_FAILED) || job.error === IDLE_WORKER ? { type: "change", change: { error: null } } : null;
+          return job.error?.startsWith(THREAD_FAILED) || job.error?.startsWith(WAITING_WORKTREE) || job.error === IDLE_WORKER ? { type: "change", change: { error: null } } : null;
       }
     }
     case "tracking":
@@ -510,6 +530,70 @@ function next(job: Job, facts: Facts): Action | null {
     default:
       return null;
   }
+}
+
+/**
+ * Why a first round cannot end in a report: its time ran out, its thread is gone, or its worker stopped after every
+ * reminder. Later rounds already have a pull request, so they keep waiting.
+ */
+function stall(job: Job, facts: Facts): Stall | null {
+  if (job.phase.state !== "working" || job.round !== 1) return null;
+  if (job.deadline !== null && facts.now >= job.deadline) return { reason: `the worker did not report within ${ROUND_MS / 3_600_000} hours`, unfinished: [] };
+  const { thread, gate } = facts;
+  if (thread?.kind === "gone") return { reason: "the worker thread was archived or deleted before it reported", unfinished: [] };
+  // Writing the wait for the worktree moves updatedAt past the idle, so the wait itself marks the stall as still on.
+  const idleAgain = thread?.kind === "idle" && (thread.since > job.updatedAt || job.error?.startsWith(WAITING_WORKTREE));
+  if (idleAgain && facts.waiting === false && job.nudges >= MAX_NUDGES) {
+    return { reason: "the worker stopped without reporting after every reminder", unfinished: gate && !gate.pass ? [`\`bb pstack gate pr\` fails: ${gate.reason}`] : [] };
+  }
+  return null;
+}
+
+/** A stalled first round: publish its commits, else start one fresh worker, else end the job. */
+function rescue(job: Job, facts: Facts, stalled: Stall, now: number): Action | null {
+  const tree = facts.worktree;
+  if (!tree) {
+    const error = `${WAITING_WORKTREE}${stalled.reason}`;
+    return job.error === error ? null : { type: "change", change: { error } };
+  }
+  if (tree.kind === "commits" && tree.ahead > 0) {
+    const unfinished = tree.dirty ? [...stalled.unfinished, "the worktree had uncommitted changes, which this pull request does not include"] : stalled.unfinished;
+    return { type: "change", change: salvage(job, tree.headSha, { ...stalled, unfinished }, null, facts.thread?.kind !== "gone") };
+  }
+  return { type: "change", change: job.restarted ? abandon(job, stalled.reason) : restart(job, now) };
+}
+
+/**
+ * working → publishing with a commit the worker did not get accepted: push it and open a draft pull request labeled
+ * `agent:stuck`, whose body says what is unfinished. The worker's title and body are used when it reported them.
+ */
+function salvage(job: Job, sha: Sha, stalled: Stall, pr: { title: string; body: string } | null, stopWorker: boolean): Change {
+  const title = pr?.title.trim().split(/\r?\n/, 1)[0] || job.snapshot.title.trim().slice(0, 72);
+  const effects: Effect[] = [
+    ...(stopWorker ? [{ op: "stop-thread", key: `stop-thread:${job.id}:salvage` } as const] : []),
+    { op: "push", key: `push:${job.id}:${sha}`, sha, expectedRemoteSha: job.pushedSha },
+    ...(job.pr === null ? [{ op: "open-pr", key: `pr:${job.id}`, title, body: prBody(stuckBody(stalled.reason, stalled.unfinished, pr?.body ?? null), job.issue) } as const] : []),
+    { op: "labels", key: `labels:${job.id}:pr`, on: "pr", add: [LABEL.trigger, LABEL.stuck], remove: [] },
+    { op: "labels", key: `labels:${job.id}:review`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
+  ];
+  return { phase: enter("publishing", effects), deadline: null, nudges: 0, rejections: 0, error: `published as an unfinished draft: ${stalled.reason}` };
+}
+
+/** working → starting with a fresh worker, once per job, when the first one stopped with nothing to publish. */
+function restart(job: Job, now: number): Change {
+  if (!job.worker) return stick(job, "the worker stopped with nothing to publish and the job has no worker settings to start another");
+  const baseRef = job.pushedSha ? `origin/${job.branch}` : `origin/${job.baseBranch}`;
+  const effects: Effect[] = [
+    ...(job.threadId ? [{ op: "stop-thread", key: `stop-thread:${job.id}:restart` } as const] : []),
+    { op: "spawn", key: `spawn:${job.id}:restart`, spec: { ...job.worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef } },
+  ];
+  return { phase: enter("starting", effects), restarted: true, deadline: now + ROUND_MS, nudges: 0, rejections: 0, error: null };
+}
+
+/** working → sticking after the fresh worker also stopped with nothing to publish, saying so on the issue. */
+function abandon(job: Job, reason: string): Change {
+  const comment: Effect = { op: "comment", key: `comment:${job.id}:abandon`, body: abandonText(reason) };
+  return { phase: enter("sticking", [comment, ...endingEffects(job, "stick")]), deadline: null, error: `nothing to publish after a restart: ${reason}` };
 }
 
 /** A parent's next step, from its sub-issues and their jobs. */
@@ -714,7 +798,8 @@ export type ReportFacts = {
 };
 
 export type Verdict =
-  | { ok: true; change: Change }
+  /** `unresolved`: the problems a draft published anyway still has. */
+  | { ok: true; change: Change; unresolved?: readonly string[] }
   | { ok: false; reasons: readonly string[]; change: Change }
   /** The branch moved on GitHub during the round. Not counted: the worker merges `moved` and reports again. */
   | { ok: false; moved: Sha; change: Change };
@@ -732,12 +817,15 @@ export function containsSha(worktree: { headSha: Sha; commits: readonly Sha[] },
   return worktree.headSha === sha || worktree.commits.includes(sha);
 }
 
-function commitProblems(job: Job, outcome: Report["outcome"], worktree: ReportFacts["worktree"], base: string): string[] {
-  const problems: string[] = [];
-  if (worktree.dirty) problems.push("the worktree has uncommitted or untracked changes: commit or remove every change before reporting");
+/** `blocking` problems leave no commit to publish; `quality` ones leave a commit a reviewer can still judge. */
+type Problems = { blocking: string[]; quality: string[] };
+
+function commitProblems(job: Job, outcome: Report["outcome"], worktree: ReportFacts["worktree"], base: string): Problems {
+  const problems: Problems = { blocking: [], quality: [] };
+  if (worktree.dirty) problems.quality.push("the worktree has uncommitted or untracked changes: commit or remove every change before reporting");
   const added = newCommit(job, worktree);
-  if (outcome === "changes" && !added) problems.push(`outcome \`changes\` needs a new commit on top of ${base}`);
-  if (outcome !== "changes" && added) problems.push(`outcome \`${outcome}\` must not add commits; report \`changes\` instead`);
+  if (outcome === "changes" && !added) problems.blocking.push(`outcome \`changes\` needs a new commit on top of ${base}`);
+  if (outcome !== "changes" && added) problems.blocking.push(`outcome \`${outcome}\` must not add commits; report \`changes\` instead`);
   return problems;
 }
 
@@ -760,27 +848,33 @@ export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts)
 }
 
 function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts): Verdict {
-  const reasons = commitProblems(job, report.outcome, facts.worktree, "the base branch");
+  const { blocking, quality } = commitProblems(job, report.outcome, facts.worktree, "the base branch");
   switch (report.outcome) {
     case "changes":
-      if (!facts.gate.pass) reasons.push(`\`bb pstack gate pr\` fails: ${facts.gate.reason}`);
-      reasons.push(...titleProblems(report.pr.title, facts.titleConvention), ...bodyProblems(report.pr.body));
+      if (!facts.gate.pass) quality.push(`\`bb pstack gate pr\` fails: ${facts.gate.reason}`);
+      quality.push(...titleProblems(report.pr.title, facts.titleConvention), ...bodyProblems(report.pr.body));
       break;
     case "needs-info":
-      reasons.push(...phraseProblems(report.questions, "text posted on the issue"));
+      quality.push(...phraseProblems(report.questions, "text posted on the issue"));
       break;
     case "no-change":
-      reasons.push(...phraseProblems([report.summary], "text posted on the issue"));
+      quality.push(...phraseProblems([report.summary], "text posted on the issue"));
       break;
   }
   const accepted: AcceptedReport = { ...report, headSha: facts.worktree.headSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted }));
+  // A second rejection of a new commit publishes it as a draft: another correction is unlikely to come.
+  if (report.outcome === "changes" && blocking.length === 0 && quality.length > 0 && job.rejections >= 1) {
+    const stalled = { reason: "the report was still rejected after one correction", unfinished: quality };
+    return { ok: true, unresolved: quality, change: { ...salvage(job, accepted.headSha, stalled, report.pr, false), report: accepted } };
+  }
+  return verdict(job, [...blocking, ...quality], () => ({ phase: enter(...publication(job, accepted)), report: accepted }));
 }
 
 function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
   const base = roundBase(job)!;
   if (facts.remoteHead !== null && facts.remoteHead !== base) return { ok: false, moved: facts.remoteHead, change: { roundBase: facts.remoteHead } };
-  const reasons = commitProblems(job, report.outcome, facts.worktree, `${base.slice(0, 7)}, the head of \`${job.branch}\``);
+  const { blocking, quality } = commitProblems(job, report.outcome, facts.worktree, `${base.slice(0, 7)}, the head of \`${job.branch}\``);
+  const reasons = [...blocking, ...quality];
   if (!containsSha(facts.worktree, base)) {
     reasons.push(`HEAD does not contain ${base.slice(0, 7)}, the head of \`${job.branch}\` on GitHub: run \`bb pstack gh fetch\`, merge \`origin/${job.branch}\`, and report again`);
   }
@@ -816,6 +910,7 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
     ...replies,
     ...(report.outcome === "changes" && report.pr ? [{ op: "edit-pr", key: `edit-pr:${job.id}:${job.round}`, body: prBody(report.pr.body, job.issue) } as const] : []),
     ...(reviewers.length > 0 ? [{ op: "request-review", key: `request-review:${job.id}:${job.round}`, reviewers } as const] : []),
+    { op: "labels", key: `labels:${job.id}:unstuck:${job.round}`, on: "pr", add: [], remove: [LABEL.stuck] },
     { op: "labels", key: `labels:${job.id}:review:${job.round}`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
   ];
   if (report.outcome !== "changes") return ["replying", after];

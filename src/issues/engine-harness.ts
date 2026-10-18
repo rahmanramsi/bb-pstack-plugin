@@ -474,10 +474,14 @@ export function harness() {
     assert.equal(all.length, 1);
     return all[0]!;
   };
-  /** The worker commits and reports through the CLI. */
-  const report = async (threadId: string, value: unknown, tree: Partial<Worktree> = { headSha: SHA2, ahead: 1 }) => {
+  /** The worker commits without reporting. */
+  const commit = (threadId: string, tree: Partial<Worktree>) => {
     const environmentId = threads.get(threadId)!.environmentId;
     worktrees.set(environmentId, { ...worktrees.get(environmentId)!, ...tree });
+  };
+  /** The worker commits and reports through the CLI. */
+  const report = async (threadId: string, value: unknown, tree: Partial<Worktree> = { headSha: SHA2, ahead: 1 }) => {
+    commit(threadId, tree);
     files.set("/worktrees/x/report.json", JSON.stringify(value));
     return current.run(["issues", "report", "--file", "report.json"], threadId);
   };
@@ -559,6 +563,7 @@ export function harness() {
     label,
     unlabel,
     toReview,
+    commit,
     review,
     converse,
     answerInThread,
