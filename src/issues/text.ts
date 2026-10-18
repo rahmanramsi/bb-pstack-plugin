@@ -183,7 +183,7 @@ export function workerPrompt(job: Job): string {
     "```",
     "",
     "`outcome` is `changes` (with `pr`), `no-change` (the issue needs no code change; `summary` is the reason posted on the issue), or `needs-info` (with `questions` posted on the issue). Every outcome lists `verification`: each check you ran and its result.",
-    "A rejected report exits 1 with every reason. Fix them and report again. A second rejection ends the job.",
+    "A rejected report exits 1 with every reason. Fix them and report again.",
   ].join("\n");
 }
 
@@ -260,7 +260,7 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     "",
     `\`round\` is ${round}, this message's round.`,
     "`outcome` is `changes` when you added commits, or `no-change` when the replies answer everything without a code change. `replies` has one entry for each item above, with its `kind` and `commentId`. Set `pr.body` only to replace a pull request description the change made wrong. Every outcome lists `verification`: each check you ran and its result.",
-    "A rejected report exits 1 with every reason. Fix them and report again. A second rejection ends the job.",
+    "A rejected report exits 1 with every reason. Fix them and report again.",
   ].join("\n");
 }
 
@@ -285,6 +285,6 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
     "You stopped without reporting. Write your report JSON to a file and run:",
     "`bb pstack issues report --file <path>`",
     ...(gate && !gate.pass && job.pushedSha === null ? [`A \`changes\` report needs \`bb pstack gate pr\` to pass, and it fails: ${gate.reason}`] : []),
-    `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}. If the worker stops again without reporting, the job ends as stuck.`,
+    `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}.`,
   ].join("\n");
 }

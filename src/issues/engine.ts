@@ -19,7 +19,6 @@ import {
   EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
-  MAX_REJECTIONS,
   REPORTING,
   TERMINAL,
   acceptReport,
@@ -591,15 +590,10 @@ export function createIssues(deps: IssuesDeps): Issues {
       };
     }
     if (!outcome.ok) {
-      const ended = !REPORTING.has(written.job.phase.state);
       return {
         ok: false,
         code: "rejected",
-        message: [
-          `Report rejected (${written.job.rejections} of ${MAX_REJECTIONS}):`,
-          ...outcome.reasons.map((reason) => `- ${reason}`),
-          ended ? "The job has ended as stuck." : "Fix every reason and report again.",
-        ].join("\n"),
+        message: ["Report rejected:", ...outcome.reasons.map((reason) => `- ${reason}`), "Fix every reason and report again."].join("\n"),
       };
     }
     const sha = short(facts.worktree.headSha);

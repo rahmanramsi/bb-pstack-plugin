@@ -416,7 +416,8 @@ export type Action =
   | { type: "sleep"; until: number };
 
 export const MAX_NUDGES = 2;
-export const MAX_REJECTIONS = 2;
+const THREAD_FAILED = "the worker thread failed, waiting for it to recover: ";
+const IDLE_WORKER = "the worker stopped without reporting after every reminder; message its thread or stop the job";
 export const ROUND_MS = 4 * 60 * 60_000;
 
 /** States a round runs through, from its start until the job rests in review or needs-info, or heads to an end. */
@@ -459,7 +460,7 @@ function next(job: Job, facts: Facts): Action | null {
       if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
       if (!facts.worker) return null;
       if ("error" in facts.worker) {
-        if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
+        // Even a problem only an operator can fix waits: the job starts once the role or the host is fixed.
         return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
       }
       return { type: "change", change: start(job, facts.worker, now) };
@@ -483,22 +484,25 @@ function next(job: Job, facts: Facts): Action | null {
     case "addressing":
     case "working": {
       if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job) };
-      if (job.deadline !== null && job.deadline <= now) {
-        return { type: "change", change: stick(job, `the worker did not report within ${ROUND_MS / 3_600_000} hours`) };
-      }
       const thread = facts.thread;
       if (!thread) return null;
       switch (thread.kind) {
         case "gone":
           return { type: "change", change: stick(job, "the worker thread was archived or deleted before it reported") };
-        case "failed":
-          return { type: "change", change: stick(job, `the worker thread failed: ${thread.error}`) };
+        case "failed": {
+          // bb retries provider errors such as an exhausted quota, so a failed thread may come back and report.
+          const error = `${THREAD_FAILED}${thread.error}`;
+          return job.error === error ? null : { type: "change", change: { error } };
+        }
         case "idle":
+          if (job.error?.startsWith(THREAD_FAILED)) return { type: "change", change: { error: null } };
           if (thread.since <= job.updatedAt || facts.waiting) return null;
-          if (job.nudges >= MAX_NUDGES) return { type: "change", change: stick(job, "the worker stopped without reporting") };
+          if (job.nudges >= MAX_NUDGES) {
+            return job.error === IDLE_WORKER ? null : { type: "change", change: { error: IDLE_WORKER } };
+          }
           return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1 } };
         case "active":
-          return job.deadline === null ? null : { type: "sleep", until: job.deadline };
+          return job.error?.startsWith(THREAD_FAILED) || job.error === IDLE_WORKER ? { type: "change", change: { error: null } } : null;
       }
     }
     case "tracking":
@@ -745,12 +749,8 @@ function phraseProblems(texts: readonly string[], where: string): string[] {
 
 function verdict(job: Job, reasons: readonly string[], accepted: () => Change): Verdict {
   if (reasons.length === 0) return { ok: true, change: { ...accepted(), rejections: 0, nudges: 0, deadline: null, error: null } };
-  const rejections = job.rejections + 1;
-  const change =
-    rejections >= MAX_REJECTIONS
-      ? { ...stick(job, `${rejections} reports were rejected: ${reasons.join("; ")}`), rejections }
-      : { rejections, error: `report rejected: ${reasons.join("; ")}` };
-  return { ok: false, reasons, change };
+  // A rejected report goes back to the worker to fix, however many times: ending the job would throw its work away.
+  return { ok: false, reasons, change: { rejections: job.rejections + 1, error: `report rejected: ${reasons.join("; ")}` } };
 }
 
 export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts): Verdict {
