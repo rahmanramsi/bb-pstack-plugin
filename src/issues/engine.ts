@@ -14,6 +14,7 @@ import { z } from "zod";
 import type { HostPush } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
+import { issueBoard, type BoardFilter, type IssueBoardSchema, type IssueSummarySchema } from "./board.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
 import {
   EFFECT_POLICY,
@@ -74,6 +75,8 @@ export type IssuesDeps = {
   hostPush: HostPush;
   /** Configured repositories; empty while issue workers are not set up. */
   repos: () => readonly RepoMapping[];
+  /** The GitHub plugin's issue catalog, when available. Worker execution still requires a repository mapping. */
+  catalog?: () => Promise<z.infer<typeof IssueSummarySchema>[]>;
   resolveRole: (role: string) => readonly ModelChoice[];
   prGate: (threadId: string) => GateFact;
   /**
@@ -87,6 +90,8 @@ export type IssuesDeps = {
 };
 
 export type Issues = {
+  board(filter: BoardFilter): Promise<z.infer<typeof IssueBoardSchema>>;
+  start(repo: string, issue: number): Promise<JobId>;
   /** `bb pstack issues …`, spread into the plugin's single CLI. */
   commands: Record<string, PluginCliCommand>;
   /** Thread events and the `pstack-issues` service. */
@@ -680,7 +685,7 @@ export function createIssues(deps: IssuesDeps): Issues {
    */
   async function pollChildren(repo: RepoClient, parent: Job): Promise<void> {
     const issue = await repo.issue(parent.issue);
-    if (!issue.open || !issue.labels.includes(LABEL.trigger)) {
+    if (!issue.open || (parent.trigger.eventId !== null && !issue.labels.includes(LABEL.trigger))) {
       await stop(parent.id, issue.open ? `removing the ${LABEL.trigger} label` : "closing the issue");
       return;
     }
@@ -802,6 +807,56 @@ export function createIssues(deps: IssuesDeps): Issues {
   };
 
   return {
+    async board(filter) {
+      const mappings = deps.repos();
+      const board = issueBoard(store, mappings.map(({ repo }) => repo), filter);
+      if ("threadId" in filter) return board;
+      if (deps.catalog) {
+        try {
+          const items = (await deps.catalog()).filter((item) => !filter.repo || item.repo === filter.repo);
+          for (const item of items) {
+            if (!board.repos.some(({ repo }) => repo === item.repo)) board.repos.push({ repo: item.repo as RepoName, polledAt: null, error: null });
+          }
+          return { ...board, issues: items.map((item) => ({ ...item, startError: mappings.some(({ repo }) => repo === item.repo) ? null : "Set a project and worker host for this repository in the issueRepos setting to start a worker." })) };
+        } catch (error) {
+          bb.log.warn(`pstack issues: GitHub plugin catalog unavailable: ${message(error)}`);
+        }
+      }
+      const issues: NonNullable<z.infer<typeof IssueBoardSchema>["issues"]> = [];
+      await Promise.all(board.repos.map(async (view) => {
+        if (!mappings.some(({ repo }) => repo === view.repo)) return;
+        try {
+          const items = await github.repo(view.repo).repositoryIssues();
+          issues.push(...items.map((item) => ({ repo: view.repo, issue: item.number, title: item.title, issueUrl: item.url, state: item.state, labels: item.labels, updatedAt: item.updatedAt, startError: null, body: item.body, author: item.author, assignees: [] })));
+        } catch (error) {
+          view.error = [view.error, message(error)].filter(Boolean).join("; ");
+        }
+      }));
+      return { ...board, issues };
+    },
+    async start(name, number) {
+      const mapping = deps.repos().find(({ repo }) => repo === name);
+      if (!mapping) throw new Error("This repository is not configured for issue workers.");
+      const existing = store.open(mapping.repo, number);
+      if (existing) return existing.id;
+      const { primaryHostId } = await bb.sdk.system.config();
+      if (mapping.hostId === primaryHostId) throw new Error("Map this repository to a worker host before starting an issue.");
+      const repo = github.repo(mapping.repo);
+      const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
+      if (!issue || issue.state !== "open") throw new Error("Only an open GitHub issue can be started.");
+      const baseBranch = await repo.defaultBranch();
+      const now = clock();
+      const job = store.insert({
+        id: `psi_${randomUUID()}` as JobId, repo: mapping.repo, issue: number,
+        trigger: { eventId: null, actor: "the bb app", at: now },
+        snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
+        projectId: mapping.projectId, hostId: mapping.hostId, baseBranch,
+        state: issue.subIssues > 0 ? "tracking" : "queued", error: null,
+      }, now) ?? store.open(mapping.repo, number);
+      if (!job) throw new Error("The issue could not be started. Refresh and try again.");
+      background(tick(job.id));
+      return job.id;
+    },
     commands: issueCommands({ bb, store, repos: deps.repos, clock, report, stop }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {

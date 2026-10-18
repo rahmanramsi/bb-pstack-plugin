@@ -95,7 +95,7 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
   if (method === "GET" && path === "/repos/acme/web/issues") {
     const since = url.searchParams.get("since");
     const items = [...gh.issues.values()]
-      .filter((issue) => !issue.closed && issue.labels.has(url.searchParams.get("labels")!) && (!since || issue.updatedAt >= Date.parse(since)))
+      .filter((issue) => (url.searchParams.get("state") === "all" || !issue.closed) && (!url.searchParams.has("labels") || issue.labels.has(url.searchParams.get("labels")!)) && (!since || issue.updatedAt >= Date.parse(since)))
       .sort((a, b) => a.updatedAt - b.updatedAt)
       .map((issue) => ({
         number: issue.number,
@@ -104,6 +104,8 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
         html_url: `https://github.com/acme/web/${issue.pr ? "pull" : "issues"}/${issue.number}`,
         user: { login: issue.user },
         updated_at: iso(issue.updatedAt),
+        state: issue.closed ? "closed" : "open",
+        labels: [...issue.labels].map((name) => ({ name })),
         ...(issue.subIssues ? { sub_issues_summary: { total: issue.subIssues.length } } : {}),
         ...(issue.pr ? { pull_request: {} } : {}),
       }));

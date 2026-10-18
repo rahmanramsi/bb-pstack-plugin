@@ -8,7 +8,7 @@ import type { rpcContract } from "./rpc.ts";
 import { CHECKOUT_RENDERER } from "./checkout-form.ts";
 import { CheckoutConsent } from "./ui/consent.tsx";
 import { bannerSummary, directiveRunId, panelRunId } from "./ui/layout.ts";
-import { ISSUES_PATH, IssuesHeader, IssuesPage, WorkerIssue } from "./ui/issues.tsx";
+import { ISSUES_PATH, IssuesPage, WorkerIssue } from "./ui/issues.tsx";
 import { useRunView, useThreadView } from "./ui/live.ts";
 import { Agreement, ChecklistPanel, Disclosure, Findings, LoadMessage, PanelFlow, RunHeading, RunOverview, Timeline, Workers, useNow } from "./ui/views.tsx";
 import "./ui/styles.css";
@@ -126,5 +126,5 @@ export default definePluginApp((app) => {
   app.composer.customize({ id: "pstack-status", scopes: ["thread"], banners: [{ id: "runs-and-checklist", chrome: "bare", component: ComposerBanner }] });
   app.slots.pendingInteraction({ id: CHECKOUT_RENDERER, component: CheckoutConsent });
   app.slots.threadPanelAction({ id: PANEL_ACTION, title: "pstack runs and checklist", icon: "Layers", layout: "flush", component: Inspector });
-  app.slots.navPanel({ id: "pstack-issues", title: "Issue workers", icon: "CircleDot", path: ISSUES_PATH, component: IssuesPage, headerContent: IssuesHeader });
+  app.slots.navPanel({ id: "pstack-issues", title: "Issue workers", icon: "CircleDot", path: ISSUES_PATH, component: IssuesPage });
 });

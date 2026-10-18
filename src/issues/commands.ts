@@ -51,7 +51,7 @@ export const ISSUE_SETTINGS = {
   issueRepos: {
     type: "string",
     label: "Issue repositories",
-    description: "One `owner/name project=<projectId> host=<hostId>` line per repository whose `agent`-labeled issues pstack works on.",
+    description: "One `owner/name project=<projectId> host=<hostId>` line per repository where pstack runs issue workers. The agent label starts work automatically; open issues can also be started from the Issues panel.",
     experimental_multiline: true,
     experimental_schema: z.string().superRefine((value, ctx) => {
       const parsed = parseIssueRepos(value);

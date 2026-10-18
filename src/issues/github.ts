@@ -48,6 +48,7 @@ export const CAN_TRIGGER: ReadonlySet<Permission> = new Set(["admin", "maintain"
 
 /** `subIssues` counts the issue's sub-issues, open or closed. */
 export type LabeledIssue = { number: number; title: string; body: string; url: string; author: string; updatedAt: number; subIssues: number };
+export type RepositoryIssue = LabeledIssue & { state: "open" | "closed"; labels: string[] };
 /** A sub-issue in this repository, without its blockers. */
 export type ListedSubIssue = { number: number; title: string; body: string; url: string; author: string; state: "open" | "closed" };
 export type LabelEvent = { id: number; actor: string; at: number };
@@ -60,6 +61,8 @@ export type PolledComment = { id: number; author: string; body: string; createdA
 
 export type RepoClient = {
   readonly name: RepoName;
+  /** All issues, including closed ones, excluding pull requests. Cached for one minute unless fresh. */
+  repositoryIssues(fresh?: boolean): Promise<RepositoryIssue[]>;
   /** `<slug>[bot]`. Events by it are never triggers. */
   appLogin(): Promise<string>;
   /**
@@ -420,6 +423,17 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return {
       name,
       appLogin,
+      async repositoryIssues(fresh = false) {
+        const load = async (): Promise<RepositoryIssue[]> => {
+          const items = await pages<{ number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; state: "open" | "closed"; labels: ({ name: string } | string)[]; pull_request?: unknown; sub_issues_summary?: { total: number } }>(auth, `${base}/issues?state=all&sort=updated&direction=desc&per_page=100`);
+          return items.filter((item) => item.pull_request === undefined).map((item) => ({
+            number: item.number, title: item.title, body: item.body ?? "", url: item.html_url, author: item.user.login,
+            updatedAt: Date.parse(item.updated_at), subIssues: item.sub_issues_summary?.total ?? 0,
+            state: item.state, labels: item.labels.map((label) => typeof label === "string" ? label : label.name),
+          }));
+        };
+        return fresh ? load() : cached(`issues:${name}`, 60_000, load);
+      },
       async labeledIssues(label, cursor) {
         type RawIssue = { number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; pull_request?: unknown; sub_issues_summary?: { total: number } };
         const read = await list<RawIssue>(auth, `${base}/issues`, { labels: label, state: "open", sort: "updated", direction: "asc" }, cursor as unknown as Cursor | null, true);
