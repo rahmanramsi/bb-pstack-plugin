@@ -297,6 +297,14 @@ export const MIGRATIONS: readonly string[] = [
   // A sub-issue gets at most one child job per parent, so a stuck child is never recreated in a loop.
   `CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL`,
   `ALTER TABLE issue_job_polls ADD COLUMN children_json TEXT`,
+  // A repository without host= picks each job's machine when the job starts. host_id stays NOT NULL, since dropping
+  // that needs another rebuild, and '' means "not picked yet". Rows from before were pinned by host=. A pinned job
+  // always has its machine, and so does every job past the start of its first round.
+  `ALTER TABLE issue_jobs ADD COLUMN host_pinned INTEGER NOT NULL DEFAULT 1 CHECK (
+     host_pinned IN (0, 1)
+     AND (host_pinned = 0 OR host_id != '')
+     AND (host_id != '' OR state NOT IN ('starting','working','publishing','asking','needs-info','review','addressing','sending','respawning','republishing','replying'))
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

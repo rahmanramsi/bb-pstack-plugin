@@ -239,6 +239,13 @@ export type Phase =
       nextAt: number | null;
     };
 
+/**
+ * Where the job's worker runs. A pinned job's machine comes from `host=<id>` and never changes. An automatic job has
+ * none until it first starts: start() writes the machine picked for it, and so does the startRound() that replaces a
+ * gone or failed worker, which starts from the pushed branch and may land elsewhere.
+ */
+export type JobHost = { pinned: true; id: string } | { pinned: false; id: string | null };
+
 export type Job = {
   id: JobId;
   /** Every write is guarded by it and bumps it. */
@@ -253,7 +260,7 @@ export type Job = {
   /** For a parent: the status comment body last planned, so a pass can tell when the progress changed. */
   progress: string | null;
   projectId: string;
-  hostId: string;
+  host: JobHost;
   baseBranch: string;
   branch: BranchName;
   phase: Phase;
@@ -302,6 +309,8 @@ export type Change = {
   roundBase?: Sha;
   worker?: WorkerSettings;
   progress?: string;
+  /** An automatic job's machine, written with the outbox whose spawn runs there. */
+  hostId?: string;
 };
 
 export type ThreadFact =
@@ -318,6 +327,9 @@ export type ThreadFact =
 export type WorkerProblem = { error: string; permanent: boolean };
 
 export type GateFact = { pass: true } | { pass: false; reason: string };
+
+/** The machine an automatic job's next worker spawns on, or why no machine can run it yet. */
+export type MachineFact = { hostId: string } | { wait: string };
 
 export type PullState = "open" | "merged" | "closed";
 
@@ -350,9 +362,11 @@ export type Facts = {
   children: readonly ChildFact[] | null;
   /** For a sub-issue's queued job: its open blockers as its parent last polled them. */
   blockers: readonly string[] | null;
+  /** Picked last, and only when needsMachine says the next step spawns a worker for an automatic job. */
+  machine: MachineFact | null;
 };
 
-export type FactName = Exclude<keyof Facts, "now">;
+export type FactName = Exclude<keyof Facts, "now" | "machine">;
 
 export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   ignored: [],
@@ -388,6 +402,32 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
   if (job.phase.state !== "review" || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.round > MAX_FEEDBACK_ROUNDS) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
+}
+
+/**
+ * Whether plan() needs a machine picked for an automatic job: it is queued with no open blockers and a resolved worker,
+ * or in review with a round due and its worker gone or failed, so the next step spawns one.
+ */
+export function needsMachine(job: Job, facts: Facts): boolean {
+  if (job.host.pinned) return false;
+  switch (job.phase.state) {
+    case "queued":
+      return !facts.blockers?.length && facts.worker !== null && !("error" in facts.worker);
+    case "review":
+      return (facts.thread?.kind === "gone" || facts.thread?.kind === "failed") && !!facts.remote?.head && job.worker !== null;
+    default:
+      return false;
+  }
+}
+
+/** The machine a new worker spawns on: the pin, or the automatic job's machine fact. Null while that is not gathered. */
+function spawnHost(job: Job, facts: Facts): MachineFact | null {
+  return job.host.pinned ? { hostId: job.host.id } : facts.machine;
+}
+
+/** Records why the job waits, or nothing when the row already says so: a sweep that learns nothing writes nothing. */
+function waitFor(job: Job, reason: string): Action | null {
+  return job.error === reason ? null : { type: "change", change: { error: reason } };
 }
 
 /** When a round may start: the newest pending item has been visible for FEEDBACK_QUIET_MS. */
@@ -451,18 +491,19 @@ function next(job: Job, facts: Facts): Action | null {
 
   switch (phase.state) {
     case "queued": {
-      if (facts.blockers?.length) {
-        const error = `waiting for ${facts.blockers.join(", ")}`;
-        return job.error === error ? null : { type: "change", change: { error } };
-      }
+      if (facts.blockers?.length) return waitFor(job, `waiting for ${facts.blockers.join(", ")}`);
       // An unblocked child drops its waiting reason before it starts.
       if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
       if (!facts.worker) return null;
       if ("error" in facts.worker) {
         if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
-        return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
+        return waitFor(job, facts.worker.error);
       }
-      return { type: "change", change: start(job, facts.worker, now) };
+      // No eligible machine never sticks the job: machines connect, install models and free up.
+      const host = spawnHost(job, facts);
+      if (!host) return null;
+      if ("wait" in host) return waitFor(job, host.wait);
+      return { type: "change", change: start(job, facts.worker, host.hostId, now) };
     }
     case "review": {
       const { pr, feedback } = facts;
@@ -477,8 +518,15 @@ function next(job: Job, facts: Facts): Action | null {
       if (!facts.thread || !facts.rounds || !facts.remote) return null;
       if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
       // A failed thread cannot take the round's message; it is replaced like a gone one.
-      const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
-      return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
+      if (facts.thread.kind !== "gone" && facts.thread.kind !== "failed") {
+        return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, null, now) };
+      }
+      if (!job.worker) return { type: "change", change: stick(job, "the worker thread is gone and the job has no worker settings to start another") };
+      // The feedback stays pending while no machine can take the replacement.
+      const host = spawnHost(job, facts);
+      if (!host) return null;
+      if ("wait" in host) return waitFor(job, host.wait);
+      return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, { worker: job.worker, hostId: host.hostId }, now) };
     }
     case "addressing":
     case "working": {
@@ -559,20 +607,24 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
   }
 }
 
-/** queued → starting: label the issue, then spawn the worker. Starts the round's clock. */
-export function start(job: Job, worker: WorkerSettings, now: number): Change {
+/** An automatic job's machine goes in the same guarded change as the spawn that runs there; a pin never moves. */
+const placed = (job: Job, hostId: string): Change => (job.host.pinned ? {} : { hostId });
+
+/** queued → starting on `hostId`: label the issue, then spawn the worker. Starts the round's clock. */
+export function start(job: Job, worker: WorkerSettings, hostId: string, now: number): Change {
   const effects: Effect[] = [
     { op: "labels", key: `labels:${job.id}:working`, on: "issue", add: [LABEL.working], remove: [] },
     { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
-  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } };
+  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] }, ...placed(job, hostId) };
 }
 
 /**
- * review → sending, or respawning when the worker thread is gone or failed: relabel the issue, then hand the worker every pending
- * item in one message. The round's row and its feedback are written with this change, so no item is sent twice.
+ * review → sending, or respawning on `respawn.hostId` when the worker thread is gone or failed: relabel the issue, then
+ * hand the worker every pending item in one message. The round's row and its feedback are written with this change, so
+ * no item is sent twice.
  */
-function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], head: Sha, respawn: boolean, now: number): Change {
+function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], head: Sha, respawn: { worker: WorkerSettings; hostId: string } | null, now: number): Change {
   const ordinal = job.round + 1;
   const text = roundPrompt(job, ordinal, pending, rounds, head);
   const relabel: Effect = { op: "labels", key: `labels:${job.id}:working:${ordinal}`, on: "issue", add: [LABEL.working], remove: [LABEL.review] };
@@ -585,15 +637,22 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
     error: null,
   } as const;
   if (!respawn) return { phase: enter("sending", [relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round };
-  if (!job.worker) return stick(job, "the worker thread is gone and the job has no worker settings to start another");
-  const spec: SpawnSpec = { ...job.worker, title: workerTitle(job), prompt: text, baseRef: `origin/${job.branch}` };
+  const spec: SpawnSpec = { ...respawn.worker, title: workerTitle(job), prompt: text, baseRef: `origin/${job.branch}` };
   const check: Effect = { op: "check-worktree", key: `check-worktree:${job.id}:${ordinal}`, base: head };
-  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }, check]), ...round };
+  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }, check]), ...round, ...placed(job, respawn.hostId) };
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */
 function close(job: Job): Change {
   return { phase: enter("closing", endingEffects(job, "close")), deadline: null, error: null };
+}
+
+/**
+ * Whether the job's outbox still owes a spawn: `starting`, or `respawning` before its spawn settled. Such a row counts
+ * against its machine until the spawned thread shows up as running, so jobs starting together spread out.
+ */
+export function owesSpawn(job: Job): boolean {
+  return "effects" in job.phase && job.phase.effects.some((effect) => effect.op === "spawn");
 }
 
 /** Waiting for its spawn to create the worker, which may report before the spawn is confirmed. */

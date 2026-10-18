@@ -111,6 +111,12 @@ const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
 
+/** The machine the job's worker runs on: set by the change that planned its first spawn, which the table's CHECK holds. */
+function workerHost(job: Job): string {
+  if (job.host.id === null) throw new Error(`issue job ${job.id} has no machine yet`);
+  return job.host.id;
+}
+
 /** `deadline` is when the claim's lease ends, less a margin to settle; every call the effect makes ends by then. */
 type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>, deadline: number) => Promise<EffectOutcome>;
 /** How to perform an effect, and how to find its trace when EFFECT_POLICY looks for one before running it again. */
@@ -151,7 +157,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const thread = await bb.sdk.threads.get({ threadId: job.threadId, ...(signal ? { signal } : {}) });
     if (!thread.environmentId) return { ok: false, transient: true, error: "the worker's worktree is not ready" };
     const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) });
-    if (environment.hostId !== job.hostId) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the mapped host ${job.hostId}` };
+    if (environment.hostId !== workerHost(job)) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the job's machine ${workerHost(job)}` };
     if (environment.status !== "ready" || !environment.path) return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
     const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
     if (status.outcome === "unavailable") return { ok: false, transient: true, error: `the worktree status is unavailable: ${status.failure.message}` };
@@ -189,7 +195,7 @@ export function createIssues(deps: IssuesDeps): Issues {
             visibility: "visible",
             // Not the project's worktree base: the first worker starts from the ref report validation counts new
             // commits against, so a fresh worktree has nothing ahead of it; a replacement starts from the pushed branch.
-            environment: { type: "host", hostId: job.hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: spec.baseRef } } },
+            environment: { type: "host", hostId: workerHost(job), workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: spec.baseRef } } },
             pluginMetadata: { pstackIssue: 1, jobId: job.id },
             prompt: spec.prompt,
             title: spec.title,
@@ -217,7 +223,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         const { remoteUrl, token } = await repo.pushCredentials();
         try {
           const input = { worktreePath: tree.path, remoteUrl, branch: job.branch, sha: effect.sha, expectedRemoteSha: effect.expectedRemoteSha, token };
-          const result = await deps.hostPush(job.hostId, input, until(deadline - REVOKE_MS));
+          const result = await deps.hostPush(workerHost(job), input, until(deadline - REVOKE_MS));
           if (result.status === "pushed") return done({ pushedSha: effect.sha });
           // A claim whose lease ran out may still be pushing the same commit, and its push can land first.
           if (result.status === "rejected" && result.reason === "stale-remote" && (await repo.branchSha(job.branch)) === effect.sha) {
@@ -385,7 +391,9 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
         worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
       }
-      const problem = await deps.checkWorker(job.hostId, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
+      // An automatic job's machine must have the tuple to be picked at all.
+      if (!job.host.pinned) return worker;
+      const problem = await deps.checkWorker(job.host.id, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
       return problem ? permanent(problem) : worker;
     } catch (error) {
       return { error: message(error), permanent: false };
@@ -406,7 +414,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function gather(job: Job): Promise<Facts> {
-    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, machine: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
     if (first.includes("pr")) {
@@ -709,7 +717,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           snapshot: { title: child.title, body: child.body, url: child.url, author: child.author, parent: { number: parent.issue, title, body, url } },
           parentId: parent.id,
           projectId: parent.projectId,
-          hostId: parent.hostId,
+          hostId: parent.host.pinned ? parent.host.id : null,
           baseBranch,
           state: "queued",
           error: null,
