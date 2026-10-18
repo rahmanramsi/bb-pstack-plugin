@@ -91,7 +91,7 @@ function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now:
         .filter((job) => job.repo === repo)
         .map((job) => {
           const parts = [`#${job.issue}`, stateLabel(job), job.pr ? `PR #${job.pr.number}` : null, job.threadId, job.id, age(job.createdAt, now)];
-          const detail = job.state === "ignored" || job.state === "stuck" ? job.error : null;
+          const detail = job.state === "ignored" || job.state === "stuck" || job.state === "stopped" ? job.error : null;
           const row = `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
           return job.poll.error ? `${row}\n    poll error: ${job.poll.error}` : row;
         });

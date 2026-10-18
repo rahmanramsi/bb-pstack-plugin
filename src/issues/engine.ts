@@ -651,7 +651,7 @@ export function createIssues(deps: IssuesDeps): Issues {
    * the App.
    */
   async function pollJobs(repo: RepoClient, canStart: boolean): Promise<void> {
-    const jobs = store.list({ repo: repo.name, all: false });
+    const jobs = store.openJobs(repo.name);
     if (jobs.length === 0) return;
     const appLogin = await repo.appLogin();
     const appSlug = appLogin.replace(/\[bot\]$/, "");

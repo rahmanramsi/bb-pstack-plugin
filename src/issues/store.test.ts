@@ -87,6 +87,26 @@ test("one open job per issue; a label event is recorded once; a re-label after a
   assert.deepEqual(store.list({ all: false }).map((job) => job.id), [second.id]);
 });
 
+test("without all, a stuck job is listed while it is the newest job on its issue that was not ignored; the poll reads open jobs only", () => {
+  const { store } = setup();
+  const stuck = store.insert(newJob({ issue: 41 }), 10)!;
+  store.write(stuck.id, 0, { phase: { state: "stuck" }, error: "codex/gpt-9/high: not in the host's catalog" }, 11);
+  store.insert(newJob({ issue: 41, state: "ignored", error: "@drive-by has read permission" }), 12);
+  const stopped = store.insert(newJob({ issue: 42 }), 13)!;
+  store.write(stopped.id, 0, { phase: { state: "stopped" } }, 14);
+  const superseded = store.insert(newJob({ issue: 43 }), 15)!;
+  store.write(superseded.id, 0, { phase: { state: "stuck" } }, 16);
+  const newer = store.insert(newJob({ issue: 43 }), 17)!;
+  store.write(newer.id, 0, { phase: { state: "done" } }, 18);
+  const open = store.insert(newJob({ issue: 44 }), 19)!;
+
+  assert.deepEqual(store.list({ all: false }).map((job) => job.id), [open.id, stuck.id]);
+  assert.deepEqual(store.list({ repo: REPO, all: false }).map((job) => job.id), [open.id, stuck.id]);
+  assert.deepEqual(store.list({ repo: "acme/api" as RepoName, all: false }), []);
+  assert.equal(store.list({ all: true }).length, 6);
+  assert.deepEqual(store.openJobs(REPO).map((job) => job.id), [open.id]);
+});
+
 test("repository poll state is stored per repository", () => {
   const { store } = setup();
   assert.deepEqual(store.repoPoll(REPO), { poll: null, polledAt: null, error: null });

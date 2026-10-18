@@ -46,10 +46,12 @@ Daily use happens on GitHub:
 Operators inspect jobs from bb:
 
 ```sh
-bb pstack issues list                 # each repository's last poll and its error, then its jobs and their state
+bb pstack issues list                 # each repository's last poll and its error, its open jobs, and each issue's stuck job with the reason
 bb pstack issues show <job>           # thread, pull request, last error, and the repository's last poll
 bb pstack issues stop <job>
 ```
+
+A stuck job waits for a person, so `issues list` and the app's board show it with its reason until a newer job on the issue replaces it. `--all` adds every finished, stopped, ignored and replaced job. The poll reads only open jobs.
 
 The worker thread uses one command. The plugin CLI has no stdin, so the worker writes the report to a file on its machine and passes the path:
 

@@ -57,8 +57,13 @@ export type IssueReads = {
   open(repo: RepoName, issue: number): Job | null;
   /** Jobs that may act at `now`, oldest first: WATCHED ones, and transit ones whose lease and backoff have passed. */
   due(now: number): JobId[];
-  /** Newest first; terminal jobs only with `all`. */
+  /**
+   * Newest first. Without `all`: open jobs, and a stuck job while it is the newest job on its issue that was not
+   * ignored, since it waits for a person. With `all`, every job.
+   */
   list(filter: { repo?: RepoName; all: boolean }): Job[];
+  /** The repository's open jobs, which the poll reads feedback and commands for. */
+  openJobs(repo: RepoName): Job[];
   /** Whether the item is stored already, sent or not. */
   hasFeedback(repo: RepoName, ref: FeedbackRef): boolean;
   /** The job's feedback not yet sent in a round, oldest first. */
@@ -332,13 +337,25 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       return rows.map((row) => row.id);
     },
     list({ repo, all }) {
+      // Generations count the issue's jobs that were not ignored, so the highest one is the newest of them.
       const where = [
         ...(repo ? ["repo = ?"] : []),
-        ...(all ? [] : [`state NOT IN (${placeholders(TERMINAL_LIST)})`]),
+        ...(all
+          ? []
+          : [
+              `(state NOT IN (${placeholders(TERMINAL_LIST)}) OR (state = 'stuck' AND NOT EXISTS (
+                 SELECT 1 FROM issue_jobs later WHERE later.repo = issue_jobs.repo AND later.issue = issue_jobs.issue AND later.state != 'ignored' AND later.generation > issue_jobs.generation)))`,
+            ]),
       ];
       const rows = db
         .prepare(`SELECT * FROM issue_jobs ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC, id DESC`)
         .all(...(repo ? [repo] : []), ...(all ? [] : TERMINAL_LIST)) as JobRow[];
+      return rows.map(parse);
+    },
+    openJobs(repo) {
+      const rows = db
+        .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND state NOT IN (${placeholders(TERMINAL_LIST)}) ORDER BY created_at DESC, id DESC`)
+        .all(repo, ...TERMINAL_LIST) as JobRow[];
       return rows.map(parse);
     },
     hasFeedback(repo, ref) {

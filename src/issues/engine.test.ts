@@ -344,6 +344,27 @@ test("the engine answers doctor with the poll's resolution: inherit-parent is th
   assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_web", hostId: "host_worker" }), { error: "codex/gpt-missing/high: not in the host's catalog", permanent: true });
 });
 
+test("a stuck job stays in the default list with its reason while it is the issue's latest job, and is no longer polled", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  Object.assign(h.threads.get(working.threadId!)!, { archivedAt: h.clock.now });
+  await h.settle();
+  const stuck = await h.only();
+  assert.equal(stuck.state, "stuck");
+
+  const listed = (await h.engine().run(["issues", "list"])).stdout!;
+  assert.match(listed, new RegExp(`#41 {2}stuck .*${stuck.id}.* {2}the worker thread was archived or deleted before it reported`));
+  const board = JSON.parse((await h.engine().run(["issues", "list", "--json"])).stdout!);
+  assert.deepEqual(board.jobs.map((job: { id: string }) => job.id), [stuck.id]);
+
+  const polled = h.store.jobPoll(stuck.id).polledAt;
+  h.clock.now += 5 * MIN;
+  await h.engine().issues.sweep();
+  assert.equal(h.store.jobPoll(stuck.id).polledAt, polled);
+});
+
 test("queued jobs that cannot resolve their worker yet do not hold back a job that can", async () => {
   const h = harness();
   h.setRepo({ repo: REPO, projectId: "prj_offline", hostId: "host_worker" });
