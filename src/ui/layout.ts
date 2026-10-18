@@ -126,7 +126,6 @@ export const issueStates: Record<JobState, { label: string; tone: StatusTone }> 
   tracking: { label: "Tracking sub-issues", tone: "blocked" },
   updating: { label: "Updating status", tone: "running" },
   closing: { label: "Closing", tone: "running" },
-  // A finished job always has an outcome, except one upgraded from history that never recorded it.
   done: { label: "Outcome unknown", tone: "neutral" },
   stopping: { label: "Stopping", tone: "cancelled" },
   stopped: { label: "Stopped", tone: "cancelled" },
