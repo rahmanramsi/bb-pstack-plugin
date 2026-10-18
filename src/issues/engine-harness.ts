@@ -25,7 +25,6 @@ export const SHA2 = "2".repeat(40);
 export const SHA3 = "3".repeat(40);
 const CATALOG = new Set(["codex/gpt-6.1-sol/high", "claude-code/claude-opus-5-5/high"]);
 
-/** A machine bb knows, as placement reads it: by default online with room, a checkout of every project, and CATALOG. */
 export type Machine = { connected?: boolean; phase?: string; limit?: number | null; checkout?: boolean; catalog?: readonly string[] };
 
 /** A held call: the fake applies the side effect, then waits here, as if the process died before it returned. */
@@ -249,7 +248,6 @@ export type FakeThread = {
   environmentId: string;
   metadata: Record<string, unknown>;
   pinnedAt?: number | null;
-  /** The machine its worktree is on; host_worker when unset. */
   hostId?: string;
 };
 

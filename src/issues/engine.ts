@@ -116,10 +116,8 @@ const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
 
-/** What a pick needs beyond the job rows, read with the other facts; or why it could not be read. */
 type MachineInputs = { facts: PlacementFacts; model: string; exclude: ReadonlyMap<HostId, string> } | { error: string };
 
-/** The machine the job's worker runs on: set by the change that planned its first spawn, which the table's CHECK holds. */
 function workerHost(job: Job): string {
   if (job.host.id === null) throw new Error(`issue job ${job.id} has no machine yet`);
   return job.host.id;
@@ -399,7 +397,6 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
         worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
       }
-      // An automatic job's machine must have the tuple to be picked at all.
       if (!job.host.pinned) return worker;
       const problem = await deps.checkWorker(job.host.id, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
       return problem ? permanent(problem) : worker;
@@ -425,14 +422,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     const model = `${worker.providerId}/${worker.model}`;
     try {
       const [facts, { primaryHostId }] = await Promise.all([deps.machines({ projectId: job.projectId, model, level: worker.reasoningLevel }), bb.sdk.system.config()]);
-      // The server's machine holds the App's private key, so no worker runs there.
       return { facts, model, exclude: new Map(primaryHostId ? [[hostId.parse(primaryHostId), "the bb server's machine"]] : []) };
     } catch (error) {
       return { error: `could not read the machines: ${message(error)}` };
     }
   }
 
-  /** Picks the machine from the inputs gather read and the rows that owe a spawn now, each counted against its machine. */
   function pickNow(facts: Facts, machine: MachineInputs | null): Facts {
     if (!machine) return facts;
     if ("error" in machine) return { ...facts, machine: { wait: machine.error } };
@@ -487,11 +482,8 @@ export function createIssues(deps: IssuesDeps): Issues {
     });
   }
 
-  async function apply(job: Job, action: Exclude<Action, { type: "sleep" }>): Promise<void> {
+  async function apply(job: Job, action: Exclude<Action, { type: "sleep" | "change" }>): Promise<void> {
     switch (action.type) {
-      case "change":
-        store.write(job.id, job.version, action.change, clock());
-        return;
       case "nudge": {
         if (!store.write(job.id, job.version, action.change, clock()) || !job.threadId) return;
         await bb.sdk.threads
@@ -517,11 +509,10 @@ export function createIssues(deps: IssuesDeps): Issues {
       const job = store.get(id);
       if (!job) return;
       const { facts, machine } = await gather(job);
-      // No await from the pick to apply's write, which comes before its first await: jobs reconciled in the same sweep
-      // resume from gather one after another, so each pick counts the rows the ones before it wrote.
       const action = plan(job, pickNow(facts, machine));
       if (!action || action.type === "sleep") return;
-      await apply(job, action);
+      if (action.type === "change") store.write(job.id, job.version, action.change, clock());
+      else await apply(job, action);
     }
   }
 

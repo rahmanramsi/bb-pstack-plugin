@@ -420,12 +420,10 @@ export function needsMachine(job: Job, facts: Facts): WorkerSettings | null {
   }
 }
 
-/** The machine a new worker spawns on: the pin, or the automatic job's machine fact. Null while that is not gathered. */
 function spawnHost(job: Job, facts: Facts): MachineFact | null {
   return job.host.pinned ? { hostId: job.host.id } : facts.machine;
 }
 
-/** Records why the job waits, or nothing when the row already says so: a sweep that learns nothing writes nothing. */
 function waitFor(job: Job, reason: string): Action | null {
   return job.error === reason ? null : { type: "change", change: { error: reason } };
 }
@@ -499,7 +497,6 @@ function next(job: Job, facts: Facts): Action | null {
         if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
         return waitFor(job, facts.worker.error);
       }
-      // No eligible machine never sticks the job: machines connect, install models and free up.
       const host = spawnHost(job, facts);
       if (!host) return null;
       if ("wait" in host) return waitFor(job, host.wait);
@@ -522,7 +519,6 @@ function next(job: Job, facts: Facts): Action | null {
         return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, null, now) };
       }
       if (!job.worker) return { type: "change", change: stick(job, "the worker thread is gone and the job has no worker settings to start another") };
-      // The feedback stays pending while no machine can take the replacement.
       const host = spawnHost(job, facts);
       if (!host) return null;
       if ("wait" in host) return waitFor(job, host.wait);
@@ -607,8 +603,7 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
   }
 }
 
-/** An automatic job's machine goes in the same guarded change as the spawn that runs there; a pin never moves. */
-const placed = (job: Job, hostId: string): Change => (job.host.pinned ? {} : { hostId });
+const hostChange = (job: Job, hostId: string): Change => (job.host.pinned ? {} : { hostId });
 
 /** queued → starting on `hostId`: label the issue, then spawn the worker. Starts the round's clock. */
 export function start(job: Job, worker: WorkerSettings, hostId: string, now: number): Change {
@@ -616,14 +611,9 @@ export function start(job: Job, worker: WorkerSettings, hostId: string, now: num
     { op: "labels", key: `labels:${job.id}:working`, on: "issue", add: [LABEL.working], remove: [] },
     { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
-  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] }, ...placed(job, hostId) };
+  return { phase: enter("starting", effects), deadline: now + ROUND_MS, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] }, ...hostChange(job, hostId) };
 }
 
-/**
- * review → sending, or respawning on `respawn.hostId` when the worker thread is gone or failed: relabel the issue, then
- * hand the worker every pending item in one message. The round's row and its feedback are written with this change, so
- * no item is sent twice.
- */
 function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], head: Sha, respawn: { worker: WorkerSettings; hostId: string } | null, now: number): Change {
   const ordinal = job.round + 1;
   const text = roundPrompt(job, ordinal, pending, rounds, head);
@@ -639,7 +629,7 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
   if (!respawn) return { phase: enter("sending", [relabel, { op: "send-round", key: `send-round:${job.id}:${ordinal}`, text }]), ...round };
   const spec: SpawnSpec = { ...respawn.worker, title: workerTitle(job), prompt: text, baseRef: `origin/${job.branch}` };
   const check: Effect = { op: "check-worktree", key: `check-worktree:${job.id}:${ordinal}`, base: head };
-  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }, check]), ...round, ...placed(job, respawn.hostId) };
+  return { phase: enter("respawning", [relabel, { op: "spawn", key: `spawn:${job.id}:${ordinal}`, spec }, check]), ...round, ...hostChange(job, respawn.hostId) };
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */

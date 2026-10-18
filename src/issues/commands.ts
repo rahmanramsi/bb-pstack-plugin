@@ -85,7 +85,6 @@ function stateLabel(job: JobView): string {
   return `${job.state} → ${job.next.state}: ${job.next.op}${job.next.tries > 0 ? `, try ${job.next.tries + 1}` : ""}${retry}`;
 }
 
-/** States whose error a list row shows: why the job ended, or why it waits, such as for an eligible machine. */
 const ROW_ERRORS: ReadonlySet<JobState> = new Set(["ignored", "stuck", "queued", "review"]);
 
 function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now: number): string {

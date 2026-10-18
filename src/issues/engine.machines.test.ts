@@ -3,7 +3,6 @@ import { test } from "node:test";
 import { MIN, REPO, SHA3, harness, type Machine } from "./engine-harness.ts";
 import { FEEDBACK_QUIET_MS } from "./job.ts";
 
-/** A repository without host=, on these machines. host_server is the bb server's machine. */
 function automatic(machines: Record<string, Machine>) {
   const h = harness();
   h.setRepo({ repo: REPO, projectId: "prj_web", hostId: null });

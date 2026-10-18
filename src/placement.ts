@@ -77,14 +77,8 @@ function environment(home: Home | Away, id: HostId): CreateThreadEnvironmentArgs
   };
 }
 
-/** One host's row before ranking. `ineligible` is the blocker without capacity, which only ranks a host for pickHost. */
 type Row = HostRow & { ineligible: string | null; headroom: number };
 
-/**
- * The per-host rows choose() and pickHost() share. With `home` null no host is exempt from the checkout and model checks.
- * `headroom` is limit − running − held without the floor at 0, so a full fleet keeps spreading instead of piling onto
- * the first host by name.
- */
 function hostRows(facts: Facts, holds: readonly Hold[], need: Pick<Need, "away" | "model">, home: HostId | null, now: number) {
   const running = new Map(facts.occupancy.threads.map((thread) => [thread.id, thread.hostId]));
   const bound = new Set(running.keys());
@@ -157,7 +151,6 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
   };
 }
 
-/** A fresh worktree of the project's default checkout, on any host that has one. */
 const ANY_WORKTREE: Away = { kind: "worktree", baseBranch: null, pin: null };
 
 export type HostPick = { hostId: HostId } | { hostId: null; why: string };
@@ -188,7 +181,6 @@ const LimitsStatus = z.object({
   hosts: z.array(z.object({ id: hostId, effectiveLimit: limit.nullable() })),
 });
 
-/** What factsFor reads from a Need. `level`, when set, must also be in the host's catalog for `model`. */
 type FactQuery = Pick<Need, "projectId" | "away" | "model"> & { level?: string };
 
 export interface Placement {

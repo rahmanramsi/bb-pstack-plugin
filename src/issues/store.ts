@@ -172,7 +172,7 @@ const parseFeedback = (row: FeedbackRow): Feedback => ({
   postedAt: row.posted_at ?? row.created_at,
 });
 
-/** host_id is NOT NULL, so an automatic job not started yet stores this. Nothing outside this file sees it. */
+/** SQLite cannot drop host_id's NOT NULL without rebuilding the table, so an automatic job not started yet stores this. */
 const NO_HOST = "";
 
 function parsePhase(row: JobRow): Phase {
