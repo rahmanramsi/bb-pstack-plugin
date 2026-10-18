@@ -134,7 +134,8 @@ async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv,
       let merged = first!;
       let tree = "";
       for (const parent of parents) {
-        const merge = await git(["merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", merged, parent], env, signal);
+        // Octopus has no rename detection. Upstream additions retain their original paths.
+        const merge = await git(["-c", "merge.renames=false", "merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", merged, parent], env, signal);
         if (merge.code !== 0 && merge.code !== 1) throw new Error("cannot reconstruct multi-parent merge");
         tree = merge.stdout.split("\n")[0]!;
         const synthetic = await git(["-c", "user.name=pstack", "-c", "user.email=pstack@localhost", "commit-tree", tree, "-p", merged, "-p", parent, "-m", "Reconstruct merge tree"], env, signal);

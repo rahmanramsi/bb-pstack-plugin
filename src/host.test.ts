@@ -418,3 +418,49 @@ test("an octopus that combines upstream workflow edits remains contents-only eve
   assert.deepEqual(readdirSync(f.temp), []);
   await f.harness.experimental_dispose();
 });
+
+for (const parentCount of [3, 4]) {
+  for (const authored of [false, true]) {
+    test(`${parentCount}-parent directory rename and upstream addition ${authored ? "retains authored workflow edits" : "remains contents-only"}`, async () => {
+      const f = fixture();
+      const workflow = ".github/workflows/b.yml";
+      mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+      const common = commit(f.main, ".github/workflows/a.yml", "name: original\n");
+      sh(f.main, "mv", ".github/workflows", ".github/new");
+      sh(f.main, "commit", "-qm", "Rename directory");
+      const sides = [sh(f.main, "rev-parse", "HEAD")];
+      sh(f.main, "checkout", "--detach", common);
+      sides.push(commit(f.main, workflow, "name: upstream\n"));
+      if (parentCount === 4) {
+        sh(f.main, "checkout", "--detach", common);
+        sides.push(commit(f.main, "another.txt", "another upstream change\n"));
+      }
+      sh(f.main, "checkout", "--detach", common);
+      commit(f.main, "upstream.txt", "upstream\n");
+      sh(f.main, "merge", "--no-edit", ...sides);
+      const base = sh(f.main, "rev-parse", "HEAD");
+      sh(f.worktree, "reset", "--hard", common);
+      const published = commit(f.worktree, "feature.txt", "feature\n");
+      sh(f.worktree, "merge", "--no-edit", ...sides);
+      assert.equal(readFileSync(join(f.worktree, workflow), "utf8"), "name: upstream\n", "default octopus retains the upstream addition at its original path");
+      assert.equal(existsSync(join(f.worktree, ".github/new/b.yml")), false);
+      assert.equal(sh(f.worktree, "diff", "--name-only", base, "HEAD", "--", ".github/workflows/"), "");
+      if (authored) {
+        writeFileSync(join(f.worktree, workflow), "name: authored\n");
+        sh(f.worktree, "add", workflow);
+        sh(f.worktree, "commit", "--amend", "--no-edit", "-q");
+      }
+      const head = sh(f.worktree, "rev-parse", "HEAD");
+      assert.equal(sh(f.worktree, "show", "-s", "--format=%P", head).split(" ").length, parentCount);
+      assert.equal(sh(f.worktree, "rev-list", "--no-merges", head, "--not", base, published), "", "upstream and published commits are excluded by exact reachability");
+      const result = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base, publishedSha: published });
+      assert.equal(result.kind, "inspected");
+      if (result.kind === "inspected") assert.equal(result.workflows, authored);
+      const pushed = await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: null, comparisonSha: base, workflows: false, token: TOKEN });
+      assert.equal(pushed.status, authored ? "rejected" : "pushed");
+      assert.deepEqual(readdirSync(f.loot), [], "worker hooks and credential helpers never run");
+      assert.deepEqual(readdirSync(f.temp), [], "scratch reconstruction is removed");
+      await f.harness.experimental_dispose();
+    });
+  }
+}
