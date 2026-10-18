@@ -129,7 +129,7 @@ detected ─► working ─┬─► needs-info ──(answer)──► working
                      └─► review ──(feedback, CI failure, conflict)──► addressing ──► review
 review, addressing ──(merged or closed)──► done
 any ──(@<app> stop, label removed)──► stopped
-any ──(round limit, timeout, repeated invalid report)──► stuck
+any ──(feedback round limit, branch gone, unconfirmed write, gone worker thread)──► stuck
 ```
 
 Step 2 builds feedback as the trigger for `addressing`, and `@<app> stop` comments. CI failures and conflicts come in step 4, and `needs-info` answers and the label removal in step 3.
@@ -164,7 +164,7 @@ The relabel comes first in `sending` and `respawning`, so the worker never gets 
 - The round starts in one store transaction: the job moves to `sending`, or to `respawning` when its thread is archived, deleted or failed, with the round ordinal plus one. The round's row is inserted in `issue_rounds`, and every item the message lists is marked with the round. An item is never sent in two rounds. The store refuses a round start that does not list every pending item. An item polled while the round was being planned then restarts the quiet period instead of starting a round of its own.
 - The round's base is the branch's head on GitHub when the round starts, kept on the job (`round_base`) and the round's row. A reviewer who commits a suggestion or presses Update branch moves it past the last push. The round's commit must contain the base, and its push expects it. When the branch moves again during the round, the report is refused with `remote_moved`, which does not count, and the base moves to the new head. A branch that no longer exists sticks the job.
 - The message is built from those items and stored in the effect, so a replay sends the same text. It stands alone. It holds the pull request URL and branch, the round number of 5, and the issue. Each item comes with its kind and id, author, file, line, diff hunk and body. An inline follow-up also shows the thread comment it answers. A one-line summary of each earlier round follows, then the rules. When the branch moved since the last push, the message says so and tells the worker to run `git fetch origin` and merge `origin/<branch>` before it commits. Comment text is fenced and marked as data from a GitHub user. The message also says that a repeated copy needs no work.
-- `addressing` behaves like `working`: 4 hours per round, reminders to an idle worker, two rejected reports, and `stop`.
+- `addressing` behaves like `working`: reminders to an idle worker, rejected reports that go back to the worker, and `stop`.
 - A merged or closed pull request ends a job in `review` or `addressing`: it stops the worker and removes the status labels.
 - A replacement worker is a spawn of its own, keyed by the round, and starts from the pushed branch with the settings the first worker used.
 
@@ -186,7 +186,7 @@ A round ends when the job leaves it: back in review, waiting in `needs-info`, or
 - A reply is longer than GitHub's 65,536 characters as it would be posted, quoted and with its marker.
 - The body is empty, longer than 10,000 characters, or describes the process instead of the change. The check matches whole phrases such as `poteto-mode`, `pstack`, `playbook`, `the checklist`, `gate pr`, `this round`, and `the agent`, not bare words, so "thread pool", "user agent", and "round the timestamp" pass. The title, the text posted on the issue, and every reply get the same check.
 
-Before posting, the service neutralizes `@mentions` into code spans in everything it posts. In the pull request body it also removes `Closes`, `Fixes`, and `Resolves` keywords and appends `Closes #<n>`. After two rejected reports in one round, the job moves to `stuck`.
+Before posting, the service neutralizes `@mentions` into code spans in everything it posts. In the pull request body it also removes `Closes`, `Fixes`, and `Resolves` keywords and appends `Closes #<n>`. A rejected report goes back to the worker with every reason, however many times. It never ends the job.
 
 **What the pull request shows.** The body describes the change for a reviewer who never saw the issue thread. It has no link to bb, no round history, and no status. The `agent` label marks the pull request as agent work. Replies to comments describe the code change and the commit, for example `Moved the check into parseInput in 9f3c2e1.` If the repository has `.github/pull_request_template.md`, the worker fills that template. Otherwise it follows the descriptions section of Opening a PR.
 
@@ -202,20 +202,20 @@ Before posting, the service neutralizes `@mentions` into code spans in everythin
 
 **Workers.** The service spawns a visible thread in the mapped project. Its environment is `{ type: "host", hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "origin/<base>" } } }`, where `<base>` is the repository's GitHub default branch. That is the ref report validation counts new commits against and the pull request targets, so a fresh worktree has nothing ahead of it whatever the project's own worktree base is. It sets `pluginMetadata: { pstackIssue: 1, jobId }` and uses the model of the `issue worker` role, which falls back to `feature, refactoring` until it is configured. The permission mode is the project's default execution mode, and the field is left out when the project has none. The service refuses a `host` that equals the server's `primaryHostId` and records the refusal as the repository's poll error.
 
-Before the start, the service resolves the worker and checks its `provider/model/level` against the mapped host's provider catalog. A problem only an operator can fix, such as an unconfigured role, a model the host lacks, or a reasoning level bb does not know, sticks the queued job at once with the reason, before any label or spawn. A problem that may pass, such as an offline host or a catalog that failed to load, stays on the queued job as its error, and the job retries on the next sweep.
+Before the start, the service resolves the worker and checks its `provider/model/level` against the mapped host's provider catalog. Any problem, whether only an operator can fix it (an unconfigured role, a model the host lacks, a reasoning level bb does not know) or it may pass (an offline host, a catalog that failed to load), stays on the queued job as its error, before any label or spawn. The job retries on every sweep and starts once the problem is gone.
 
 **No duplicate threads or GitHub writes.** Every effect, the spawn included, is claimed before it runs. The engine writes `tries + 1` and a lease to the row, then makes the call, then settles the outcome. After a crash the lease expires and the next claim probes for the effect's trace before running it again. A pushed commit is found as the remote branch at that commit, a pull request as any pull request from the head branch, and a comment as an App comment that carries the effect's key in an HTML marker. A probe that finds nothing lets a push, a pull request, or a comment run again. A spawn never runs twice, because no SDK error proves the thread was not created. Its probe looks for a thread in the job's project whose plugin metadata names the job, created since the job was and not bound to another job. It reads each page's metadata in one `threads.experimental_listPluginMetadata` call, and stops paging at the first unpinned thread older than the job, because bb lists pinned threads first and then newest first. If none appears within 5 minutes of the first claim, the job moves to `stuck`. A thread that names a job not waiting for it is stopped. Metadata only points at a job. The store's thread binding, not metadata, decides who may report.
+
+**A job ends only for safety or by a person.** The goal is a pull request, so nothing that may pass ends a job and throws its work away. A worker that runs long keeps working: `deadline` is recorded but no longer enforced. A worker thread in an error state, such as one whose provider ran out of quota, leaves the job waiting with the reason as its error, because bb retries the turn and the thread may come back and report. A role or host problem keeps the job queued with its error until it is fixed. The job moves to `stuck` only when its worker thread is archived or deleted, its branch is gone from GitHub, a write cannot be confirmed, or its feedback rounds run out.
 
 **Limits.** These are constants:
 
 - No cap on concurrent jobs in pstack. A queued job starts as soon as its worker resolves, and bb's per-machine and global concurrency limits decide when worker threads run.
-- 4 hours per round (`ROUND_MS`).
-- Two reminders to an idle worker that has not reported.
-- Two rejected reports per round.
+- Two reminders to an idle worker that has not reported. After them the job keeps waiting, with the reason as its error.
 - 5 feedback rounds per pull request (`MAX_FEEDBACK_ROUNDS`). New feedback after the fifth sticks the job with the reason.
 - 2 minutes of quiet after the newest pending feedback (`FEEDBACK_QUIET_MS`) before a round starts.
 
-Past a limit the job moves to `stuck`, which stops the worker and removes its status labels. Later steps make the limits settings and add 3 CI rounds.
+Past the feedback round limit the job moves to `stuck`, which stops the worker and removes its status labels. Later steps make the limits settings and add 3 CI rounds.
 
 **Reminders.** A `/poteto-mode` worker goes idle while its own pstack runs and child threads work, and their results wake it. An idle worker with an active run or child is waiting, not stopped, and gets no reminder. When it has stopped without reporting, the reminder also names `gate pr`'s open steps if the gate fails. This is the only reminder an issue worker gets: the checklist's idle nudge skips every thread pstack launched, so it never wakes a worker whose job has ended.
 
