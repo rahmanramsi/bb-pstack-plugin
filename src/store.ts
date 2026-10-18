@@ -428,6 +428,15 @@ CREATE TABLE issue_jobs_unattended (
          AND (newer.generation > j.generation OR (newer.generation = j.generation AND newer.created_at > j.created_at))
      );`,
   `ALTER TABLE issue_submissions ADD COLUMN intended_sha TEXT`,
+  `UPDATE issue_jobs SET
+     control_json = json_set(control_json, '$.disposition', CASE
+       WHEN (SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) = 'merged' THEN 'merged'
+       WHEN (SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) = 'closed' THEN 'closed'
+       WHEN json_extract(report_json, '$.outcome') = 'no-change' THEN 'no-change'
+     END), version = version + 1, runtime_revision = runtime_revision + 1
+   WHERE state = 'done' AND json_extract(control_json, '$.disposition') IS NULL
+     AND ((SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) IN ('merged','closed')
+       OR json_extract(report_json, '$.outcome') = 'no-change')`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

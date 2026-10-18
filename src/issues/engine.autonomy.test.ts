@@ -382,3 +382,28 @@ test("a dirty legacy waiting job migrates and resumes exactly once in its origin
   assert.equal(h.spawned.length, 1);
   assert.ok(!h.gh().comments.get(41)!.some((comment) => comment.body.includes("Which API?")));
 });
+
+test("migrated no-change and merged children satisfy parent prerequisites without inventing unknown outcomes", async () => {
+  const parent = "psi_00000000-0000-0000-0000-000000000050";
+  const unchanged = "psi_00000000-0000-0000-0000-000000000051";
+  const merged = "psi_00000000-0000-0000-0000-000000000052";
+  const unknown = "psi_00000000-0000-0000-0000-000000000099";
+  const h = harness({ beforeAutonomyUpgrade(db, now) {
+    const insert = db.prepare(`INSERT INTO issue_jobs (id,repo,issue,generation,trigger_event_id,triggered_by,triggered_at,issue_json,project_id,host_id,base_branch,branch,state,parent_id,report_json,pushed_sha,created_at,updated_at)
+      VALUES (?,'acme/web',?,1,NULL,'the bb app',?,?,'prj_web','host_worker','main',?,?,?,?,?,?,?)`);
+    const snapshot = JSON.stringify({ title: "Historical implementation", body: "Integrate the result", url: "https://github.com/acme/web/issues/50", author: "maya" });
+    const noChange = JSON.stringify({ outcome: "no-change", summary: "The interface already meets the requirement.", verification: ["Verified the existing behavior"], headSha: SHA1, acceptedAt: now - MIN });
+    insert.run(parent, 50, now - MIN, snapshot, "agent/issue-50-parent", "tracking", null, null, null, now - MIN, now - MIN);
+    insert.run(unchanged, 51, now - MIN, snapshot, "agent/issue-51-unchanged", "done", parent, noChange, null, now - MIN, now - MIN);
+    insert.run(merged, 52, now - MIN, snapshot, "agent/issue-52-merged", "done", parent, noChange, SHA2, now - MIN, now - MIN);
+    insert.run(unknown, 99, now - MIN, snapshot, "agent/issue-99-unknown", "done", null, null, null, now - MIN, now - MIN);
+    db.prepare("INSERT INTO issue_job_polls (job_id,pr_state) VALUES (?, 'merged')").run(merged);
+  } });
+  for (const issue of [50, 51, 52]) h.gh().issues.set(issue, { number: issue, title: `Historical part ${issue}`, body: "Verify integration", user: "maya", updatedAt: h.clock.now, labels: new Set(), ...(issue === 50 ? { subIssues: [51, 52] } : {}) });
+  h.label(50); await h.settle();
+  assert.equal((await h.byIssue(51)).outcome, "no-change");
+  assert.equal((await h.byIssue(52)).outcome, "merged");
+  assert.equal((await h.byIssue(99)).outcome, null);
+  assert.equal((await h.byIssue(50)).state, "working");
+  assert.equal(h.spawned.length, 1);
+});
