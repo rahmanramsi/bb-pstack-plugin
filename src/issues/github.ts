@@ -59,6 +59,8 @@ export type ActivityCursor = { readonly __brand: "ActivityCursor" };
 export type PullDetail = {
   number: number; url: string; title: string; body: string; author: string; state: PullState; draft: boolean;
   head: string; headSha: string; base: string;
+  /** `owner/name` of the head branch's repository, lowercased; null when that fork was deleted. */
+  headRepo: string | null;
 };
 export type IssueDetail = {
   number: number; url: string; title: string; body: string; author: string; state: "open" | "closed"; labels: string[];
@@ -132,6 +134,9 @@ export type RepoClient = {
   pullForBranch(branch: string): Promise<PullDetail | null>;
   /** An issue with its conversation, or null when there is none with that number. Pull requests are issues too. */
   issueDetail(issue: number): Promise<IssueDetail | null>;
+  closePull(pr: number): Promise<void>;
+  /** A branch that does not exist is success. */
+  deleteBranch(branch: string): Promise<void>;
   /** A pull request's reviews, inline review comments and conversation comments, oldest first. */
   feedback(pr: number): Promise<PullFeedback>;
   /** Check runs and commit statuses on a commit. */
@@ -174,12 +179,12 @@ type RawReviewComment = { id: number; body: string; user: RawUser; path: string;
 type RawComment = { id: number; body: string | null; user: RawUser; created_at: string; updated_at: string };
 type RawPull = {
   number: number; html_url: string; title: string; body: string | null; user: RawUser; state: string; draft?: boolean;
-  merged_at?: string | null; head: { ref: string; sha: string }; base: { ref: string };
+  merged_at?: string | null; head: { ref: string; sha: string; repo: { full_name: string } | null }; base: { ref: string };
 };
 const pullDetail = (json: RawPull): PullDetail => ({
   number: json.number, url: json.html_url, title: json.title, body: json.body ?? "", author: json.user?.login ?? "ghost",
   state: json.state === "open" ? "open" : json.merged_at ? "merged" : "closed", draft: json.draft ?? false,
-  head: json.head.ref, headSha: json.head.sha, base: json.base.ref,
+  head: json.head.ref, headSha: json.head.sha, base: json.base.ref, headRepo: json.head.repo?.full_name.toLowerCase() ?? null,
 });
 type RawReview = { id: number; body: string | null; user: RawUser; state: string; submitted_at?: string | null };
 
@@ -599,6 +604,12 @@ export function createGitHub(options: GitHubOptions): GitHub {
           pull: json.pull_request !== undefined,
           comments: comments.map((comment) => ({ id: comment.id, author: comment.user?.login ?? "ghost", body: comment.body ?? "", createdAt: Date.parse(comment.created_at) })),
         };
+      },
+      async closePull(pr) {
+        await call(auth, "PATCH", `${base}/pulls/${pr}`, { body: { state: "closed" } });
+      },
+      async deleteBranch(branch) {
+        await call(auth, "DELETE", `${base}/git/refs/heads/${branch.split("/").map(encodeURIComponent).join("/")}`, { ok: [404, 422] });
       },
       async feedback(pr) {
         const [reviews, inline, conversation] = await Promise.all([
