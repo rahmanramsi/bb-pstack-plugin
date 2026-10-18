@@ -303,7 +303,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
 
   const threads = new Map<string, FakeThread>();
   /** `commits`: what HEAD contains past `origin/main`; by default HEAD and every commit pstack pushed. */
-  type Worktree = { headSha: string; dirty: boolean; ahead: number; commits?: string[] };
+  type Worktree = { headSha: string; dirty: boolean; ahead: number; commits?: string[]; ancestors?: string[] };
   const worktrees = new Map<string, Worktree>();
   const files = new Map<string, string>();
   const spawned: Record<string, any>[] = [];
@@ -472,7 +472,12 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
       store,
       github: createGitHub({ credentials: () => ({ appId: "1", privateKey }), apiUrl: base, gitUrl: "https://github.test", clock: () => clock.now }),
       inspectOrigin: async () => "https://github.com/acme/web.git",
-      inspectCommit: async (_hostId, input) => failures.missingObject ? { kind: "missing-object", sha: failures.missingObject } : ({ kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows }),
+      inspectCommit: async (_hostId, input) => {
+        if (failures.missingObject) return { kind: "missing-object", sha: failures.missingObject };
+        const tree = worktrees.get(input.worktreePath.slice("/worktrees/".length));
+        const ancestors = tree?.ancestors ?? tree?.commits ?? [tree?.headSha, SHA1, ...pushes.map((push) => push.sha)];
+        return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows, ...(input.ancestorShas ? { ancestry: input.ancestorShas.map((sha) => ({ sha, included: sha === input.sha || ancestors.includes(sha) })) } : {}) };
+      },
       hostPush: async (hostId: string, input: PushInput, signal?: AbortSignal): Promise<PushResult> => {
         assert.equal(hostId, "host_worker");
         pushes.push(input);

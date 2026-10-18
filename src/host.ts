@@ -116,14 +116,20 @@ async function withScratch<T>(worktreePath: string, tempDir: string, signal: Abo
 }
 
 async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<InspectCommitResult> {
-  for (const sha of [input.sha, input.comparisonSha]) {
+  for (const sha of [input.sha, input.comparisonSha, ...input.ancestorShas ?? []]) {
     if ((await git(["cat-file", "-e", `${sha}^{commit}`], env, signal)).code !== 0) return { kind: "missing-object", sha };
   }
   const diff = await git(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", input.comparisonSha, input.sha], env, signal);
   const history = await git(["log", "--format=", "--name-only", "--no-renames", "-z", `${input.comparisonSha}..${input.sha}`], env, signal);
   if (diff.code !== 0 || history.code !== 0) throw new Error("cannot inspect pinned Git objects");
   const workflows = `${diff.stdout}\0${history.stdout}`.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));
-  return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: diff.stdout.length > 0, workflows };
+  const ancestry = [];
+  for (const sha of input.ancestorShas ?? []) {
+    const result = await git(["merge-base", "--is-ancestor", sha, input.sha], env, signal);
+    if (result.code !== 0 && result.code !== 1) throw new Error("cannot inspect pinned Git ancestry");
+    ancestry.push({ sha, included: result.code === 0 });
+  }
+  return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: diff.stdout.length > 0, workflows, ...(input.ancestorShas ? { ancestry } : {}) };
 }
 
 async function inspectCommit(input: InspectCommitInput, tempDir: string, signal: AbortSignal): Promise<InspectCommitResult> {

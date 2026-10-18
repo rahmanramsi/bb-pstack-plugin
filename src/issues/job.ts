@@ -392,9 +392,9 @@ export type FactName = Exclude<keyof Facts, "now">;
 
 export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   ignored: [],
-  queued: ["blockers", "worker"],
+  queued: ["blockers", "worker", "children"],
   starting: [],
-  working: ["thread", "waiting", "gate"],
+  working: ["thread", "waiting", "gate", "children"],
   publishing: [],
   recovering: [],
   repairing: [],
@@ -402,7 +402,7 @@ export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   drafting: [],
   checking: ["review", "children", "feedback", "pr"],
   review: ["feedback", "pr", "review", "children"],
-  addressing: ["thread", "waiting", "gate", "pr"],
+  addressing: ["thread", "waiting", "gate", "pr", "children"],
   closing: [],
   done: [],
   stopping: [],
@@ -482,16 +482,21 @@ function next(job: Job, facts: Facts): Action | null {
     return { type: "effect", effect: head, mode, leaseUntil: now + policy.leaseMs };
   }
 
+  if (facts.prerequisites && JSON.stringify(facts.prerequisites) !== JSON.stringify(job.control.prerequisites)) {
+    const control = { ...job.control, prerequisites: facts.prerequisites, localEvidence: null, readiness: null };
+    if (phase.state === "review" && facts.review?.kind === "observed") return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `prerequisites-draft:${job.id}:${job.version}`, target: facts.review.target, draft: true }]) } };
+    return { type: "change", change: { control } };
+  }
+  if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem) };
+
   switch (phase.state) {
     case "queued": {
-      if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem) };
       if (facts.blockers?.length) {
         const error = `waiting for ${facts.blockers.join(", ")}`;
         return job.error === error ? null : { type: "change", change: { error } };
       }
       // An unblocked child drops its waiting reason before it starts.
       if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
-      if (facts.prerequisites && JSON.stringify(facts.prerequisites) !== JSON.stringify(job.control.prerequisites)) return { type: "change", change: { control: { ...job.control, prerequisites: facts.prerequisites } } };
       if (!facts.worker) return null;
       if ("error" in facts.worker) {
         if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
@@ -583,12 +588,18 @@ function checkReview(job: Job, facts: Facts): Action | null {
   if (job.phase.state === "review" && (changed || !review.ready || review.draft || Boolean(facts.feedback?.pending.length))) {
     return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
   }
+  if (facts.blockers?.length) {
+    const control = { ...job.control, readiness: null, localEvidence: null };
+    if (job.phase.state === "review") return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `blockers-draft:${job.id}:${job.version}`, target, draft: true }]) } };
+    return job.control.localEvidence ? { type: "change", change: { control } } : null;
+  }
   if (facts.children?.length) {
     const failed = facts.children.filter((child) => child.state === "open" && child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
     if (failed.length) return { type: "change", change: stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`) };
     const pending = facts.children.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change");
     if (pending) {
-      if (job.phase.state === "review") return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `children-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
+      if (job.phase.state === "review") return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `children-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null, localEvidence: null } } };
+      if (job.control.localEvidence) return { type: "change", change: { control: { ...job.control, readiness: null, localEvidence: null } } };
       return null;
     }
   }
@@ -621,10 +632,14 @@ function track(job: Job, children: readonly ChildFact[]): Action | null {
   if (!progressing && failed.length) return { type: "change", change: { ...stick(job, `prerequisites failed: ${failed.map((child) => `#${child.number}`).join(", ")}`), progress: body } };
   if (!progressing && failed.length === 0) {
     const commits = children.flatMap((child) => child.job?.branch && child.job.sha ? [`Merge origin/${child.job.branch} at ${child.job.sha} for #${child.number}.`] : []);
-    return { type: "change", change: { phase: { state: "queued" }, progress: [body, "Verify the combined result in this issue's own worker.", ...commits].join("\n\n"), error: null } };
+    return { type: "change", change: { phase: { state: "queued" }, control: { ...job.control, prerequisites: integrationPrerequisites(children) }, progress: [body, "Verify the combined result in this issue's own worker.", ...commits].join("\n\n"), error: null } };
   }
   if (body === job.progress) return null;
   return { type: "change", change: { phase: enter("updating", [status]), progress: body } };
+}
+
+export function integrationPrerequisites(children: readonly ChildFact[]): Control["prerequisites"] {
+  return children.flatMap((child) => child.job?.branch && child.job.sha && child.job.disposition !== "no-change" ? [{ issue: child.number, branch: child.job.branch, sha: child.job.sha }] : []).sort((a, b) => a.issue - b.issue);
 }
 
 /** The Change for an effect's outcome, against the row as it was right after the claim. */
@@ -807,7 +822,8 @@ export type AcceptedReport = (Exclude<Report, { outcome: "failure" }> & { headSh
 export type ReportFacts = {
   now: number;
   /** `ahead`: how many commits HEAD has that `origin/<base>` does not; `commits`: those commits. */
-  worktree: { headSha: Sha; dirty: boolean; ahead: number; commits: readonly Sha[] };
+  worktree: { headSha: Sha; dirty: boolean; ahead: number; commits: readonly Sha[]; ancestry?: readonly { sha: Sha; included: boolean }[] };
+  prerequisiteProblems?: readonly string[];
   /** In a feedback round, the branch's head on GitHub now. */
   remoteHead: Sha | null;
   /** `gate pr` on the worker thread's checklist. Only the first round checks it. */
@@ -834,15 +850,15 @@ function newCommit(job: Job, worktree: ReportFacts["worktree"]): boolean {
   return job.round === 1 ? worktree.ahead > 0 : worktree.headSha !== roundBase(job);
 }
 
-export function containsSha(worktree: { headSha: Sha; commits: readonly Sha[] }, sha: Sha): boolean {
-  return worktree.headSha === sha || worktree.commits.includes(sha);
+export function containsSha(worktree: { headSha: Sha; commits: readonly Sha[]; ancestry?: readonly { sha: Sha; included: boolean }[] }, sha: Sha): boolean {
+  return worktree.headSha === sha || (worktree.ancestry ? worktree.ancestry.some((proof) => proof.sha === sha && proof.included) : worktree.commits.includes(sha));
 }
 
 function commitProblems(job: Job, outcome: Report["outcome"], worktree: ReportFacts["worktree"], base: string): string[] {
   const problems: string[] = [];
   if (outcome === "failure") return [];
   if (worktree.dirty) problems.push("the worktree has uncommitted or untracked changes: commit or remove every change before reporting");
-  if (outcome === "changes") for (const prerequisite of job.control.prerequisites) {
+  for (const prerequisite of job.control.prerequisites) {
     if (!containsSha(worktree, prerequisite.sha)) problems.push(`include prerequisite #${prerequisite.issue} by merging origin/${prerequisite.branch} at ${prerequisite.sha}`);
   }
   const added = newCommit(job, worktree);
@@ -864,6 +880,7 @@ function verdict(job: Job, reasons: readonly string[], accepted: () => Change): 
 }
 
 export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts): Verdict {
+  if (facts.prerequisiteProblems?.length && parsed.report.outcome !== "failure") return { ok: false, reasons: facts.prerequisiteProblems, change: rejectReport(job, facts.prerequisiteProblems) };
   const verdict = parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
   if (verdict.ok && (parsed.report.outcome === "changes" || (parsed.report.outcome === "no-change" && job.round > 1 && facts.gate.pass)) && facts.baseSha) {
     const milestone = !job.control.milestones.includes("verified-change");

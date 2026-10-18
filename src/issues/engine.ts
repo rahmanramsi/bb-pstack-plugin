@@ -31,6 +31,7 @@ import { acceptSync,
   parseReport,
   awaitingThread,
   containsSha,
+  integrationPrerequisites,
   isTransit,
   TRANSIT,
   command,
@@ -581,7 +582,12 @@ export function createIssues(deps: IssuesDeps): Issues {
       facts.pr = prState ? { state: prState } : null;
     }
     if (first.includes("children")) facts.children = childFacts(job);
-    if (first.includes("blockers") && job.parentId) {
+    if (facts.children?.length) {
+      facts.prerequisites = integrationPrerequisites(facts.children);
+      const unpinned = facts.children.find((child) => (child.job?.ready || child.job?.merged || child.job?.disposition === "merged") && (!child.job.branch || !child.job.sha));
+      if (unpinned) facts.prerequisiteProblem = `prerequisite #${unpinned.number} has no established commit`;
+    }
+    if (job.parentId && !isTransit(job.phase.state)) {
       const children = store.polledChildren(job.parentId) ?? [];
       const blockers = children.find((child) => child.number === job.issue)?.blockedBy ?? [];
       const localNumber = (ref: string) => Number(new RegExp(`^(?:${job.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})?#(\\d+)$`).exec(ref)?.[1] ?? NaN);
@@ -595,16 +601,18 @@ export function createIssues(deps: IssuesDeps): Issues {
         path.delete(number); return false;
       };
       if (cycle(job.issue)) facts.prerequisiteProblem = "prerequisite dependency cycle";
-      facts.prerequisites = [];
+      facts.prerequisites ??= [];
       facts.blockers = blockers.filter((ref) => {
         const number = localNumber(ref);
         const child = children.find((candidate) => candidate.number === number);
         if (!child) { facts.prerequisiteProblem = `prerequisite ${ref} is outside this parent job's owned scope`; return false; }
         const prerequisite = store.open(job.repo, number) ?? store.children(job.parentId!).find((candidate) => candidate.issue === number);
         if (prerequisite && TERMINAL.has(prerequisite.phase.state) && prerequisite.control.disposition !== "no-change" && prerequisite.control.disposition !== "merged") { facts.prerequisiteProblem = `prerequisite ${ref} failed`; return false; }
-        if (prerequisite?.control.readiness && prerequisite.pushedSha) facts.prerequisites = [...(facts.prerequisites ?? []), { issue: prerequisite.issue, branch: prerequisite.branch, sha: prerequisite.pushedSha }];
+        if (prerequisite && (prerequisite.control.readiness || prerequisite.control.disposition === "merged") && !prerequisite.pushedSha) facts.prerequisiteProblem = `prerequisite ${ref} has no established commit`;
+        if (prerequisite?.pushedSha && prerequisite.control.disposition !== "no-change") facts.prerequisites = [...(facts.prerequisites ?? []), { issue: prerequisite.issue, branch: prerequisite.branch, sha: prerequisite.pushedSha }];
         return child.state !== "closed" && !prerequisite?.control.readiness && prerequisite?.control.disposition !== "no-change" && prerequisite?.control.disposition !== "merged";
       });
+      facts.prerequisites = [...facts.prerequisites].sort((a, b) => a.issue - b.issue);
     }
     const wanted = [...first, ...moreFacts(job, facts)];
     if (wanted.includes("rounds")) facts.rounds = store.roundSummaries(job.id);
@@ -742,8 +750,10 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub`, disposition: "fail" };
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       const comparisonSha = job.round === 1 ? capabilities.defaultHead : job.roundBase ?? remoteHead ?? capabilities.defaultHead;
-      const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha });
+      const ancestorShas = [...new Set([...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : [])])];
+      const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha, ancestorShas });
       if (inspected.kind !== "inspected") return { unavailable: `missing local commit object ${inspected.sha}`, disposition: "worker", sha: inspected.sha as Sha };
+      if (ancestorShas.some((sha) => !inspected.ancestry?.some((proof) => proof.sha === sha))) return { unavailable: "the host did not establish the requested Git ancestry", disposition: "retry" };
       const gate = job.threadId ? deps.prGate(job.threadId) : { pass: false as const, reason: "the job has no worker thread" };
       const finalTree = await worktree(job);
       if (!finalTree.ok || finalTree.headSha !== tree.headSha || finalTree.dirty !== tree.dirty) return { unavailable: "the worker changed its snapshot while the report was being inspected", disposition: "retry" };
@@ -751,7 +761,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         now: clock(),
         baseSha: capabilities.defaultHead,
         inspected: { ...inspected, sha: inspected.sha as Sha, comparisonSha: inspected.comparisonSha as Sha },
-        worktree: { headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead, commits: tree.commits },
+        worktree: { headSha: tree.headSha, dirty: tree.dirty, ahead: tree.ahead, commits: tree.commits, ancestry: inspected.ancestry?.map((proof) => ({ ...proof, sha: proof.sha as Sha })) },
         remoteHead,
         gate,
         titleConvention: await github.repo(job.repo).titleConvention(),
@@ -811,6 +821,11 @@ export function createIssues(deps: IssuesDeps): Issues {
       store.finishSubmission(submission.id, "job no longer reporting", clock());
       return reject("not_working", `job ${job.id} is ${job.phase.state}`);
     }
+    const currentFacts = await gather(job);
+    if (currentFacts.prerequisites && JSON.stringify(currentFacts.prerequisites) !== JSON.stringify(job.control.prerequisites)) {
+      store.write(job.id, job.version, { control: { ...job.control, prerequisites: currentFacts.prerequisites, readiness: null, localEvidence: null } }, clock());
+      return reject("pending", "Report saved while current prerequisites are reconciled.");
+    }
     let parsed: ReturnType<typeof parseReport>;
     try { parsed = parseReport(job, JSON.parse(submission.raw)); }
     catch (error) { parsed = { ok: false, code: "invalid_report", message: `the report is not JSON: ${message(error)}` }; }
@@ -864,6 +879,11 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       return reject("pending", `Report saved. Evaluation resumes automatically when dependencies recover. ${facts.unavailable}`);
     }
+    facts.prerequisiteProblems = [
+      ...(currentFacts.prerequisiteProblem ? [currentFacts.prerequisiteProblem] : []),
+      ...(currentFacts.blockers?.length ? [`prerequisites are not ready: ${currentFacts.blockers.join(", ")}`] : []),
+      ...(currentFacts.children?.filter((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change").map((child) => `prerequisite #${child.number} is not ready`) ?? []),
+    ];
     if (submission.intendedSha !== facts.worktree.headSha) {
       const result = reject("stale_snapshot", "The worker changed HEAD during report evaluation; current verification is required.");
       store.write(job.id, job.version, { ...rejectedChange(rejectReport(job, [result.result.message]), result.result.message), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());

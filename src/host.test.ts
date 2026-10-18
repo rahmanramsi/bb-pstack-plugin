@@ -213,3 +213,21 @@ test("commit inspection includes deleted and reverted workflow ancestors without
   assert.deepEqual(readdirSync(f.temp), []);
   await f.harness.experimental_dispose();
 });
+
+test("fixed object inspection proves ancestry including default-base ancestors and rejects missing objects", async () => {
+  const f = fixture();
+  const base = sh(f.worktree, "rev-parse", "HEAD");
+  const head = commit(f.worktree, "a.txt", "main change\n");
+  sh(f.worktree, "checkout", "-qb", "side", base);
+  const side = commit(f.worktree, "side.txt", "side change\n");
+  const input = { worktreePath: f.worktree, sha: head, comparisonSha: base, ancestorShas: [base, side, head] };
+  const result = await f.harness.experimental_call("inspectCommit", input);
+  assert.equal(result.kind, "inspected");
+  if (result.kind === "inspected") assert.deepEqual(result.ancestry, [{ sha: base, included: true }, { sha: side, included: false }, { sha: head, included: true }]);
+  const missing = "f".repeat(40);
+  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { ...input, ancestorShas: [missing] }), { kind: "missing-object", sha: missing });
+  await assert.rejects(f.harness.experimental_call("inspectCommit", { ...input, ancestorShas: ["--help"] }));
+  assert.deepEqual(readdirSync(f.loot), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});

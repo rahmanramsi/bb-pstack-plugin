@@ -72,9 +72,9 @@ export const FetchResult = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("failed"), detail: z.string() }),
 ]);
 
-export const InspectCommitInput = z.strictObject({ worktreePath: WorktreePath, sha: Sha, comparisonSha: Sha });
+export const InspectCommitInput = z.strictObject({ worktreePath: WorktreePath, sha: Sha, comparisonSha: Sha, ancestorShas: z.array(Sha).optional() });
 export const InspectCommitResult = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("inspected"), sha: Sha, comparisonSha: Sha, nonemptyDiff: z.boolean(), workflows: z.boolean() }),
+  z.strictObject({ kind: z.literal("inspected"), sha: Sha, comparisonSha: Sha, nonemptyDiff: z.boolean(), workflows: z.boolean(), ancestry: z.array(z.strictObject({ sha: Sha, included: z.boolean() })).optional() }),
   z.strictObject({ kind: z.literal("missing-object"), sha: Sha }),
 ]);
 export type InspectCommitInput = z.infer<typeof InspectCommitInput>;

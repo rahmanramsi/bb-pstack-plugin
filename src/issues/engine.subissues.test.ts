@@ -13,6 +13,64 @@ function withParent(subIssues = [51, 52]) {
 
 const statusComments = (h: ReturnType<typeof harness>) => (h.gh().comments.get(50) ?? []).filter((comment) => comment.body.includes("Sub-issues:"));
 
+test("integration reports must contain the exact ready child commits", async () => {
+  const h = withParent();
+  await h.settle();
+  for (const issue of [51, 52]) await h.report((await h.byIssue(issue)).threadId!, GOOD);
+  await h.settle();
+  const parent = await h.byIssue(50);
+  const response = await h.report(parent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40)], ahead: 1 });
+  assert.equal(response.exitCode, 1);
+  assert.match(response.stderr!, /include prerequisite #51/);
+  assert.notEqual((await h.byIssue(50)).outcome, "ready");
+  const falseList = await h.report(parent.threadId!, GOOD, { headSha: "4".repeat(40), commits: ["4".repeat(40), "2".repeat(40)], ancestors: ["4".repeat(40)], ahead: 1 });
+  assert.equal(falseList.exitCode, 1, "SDK membership cannot override negative Git object proof");
+  assert.match(falseList.stderr!, /include prerequisite #51/);
+});
+
+test("host ancestry proves merged default-base prerequisites beyond the SDK commit list", async () => {
+  const h = withParent();
+  h.gh().issues.get(52)!.blockedBy = [51];
+  await h.settle();
+  const child = await h.byIssue(51);
+  await h.report(child.threadId!, GOOD); await h.settle();
+  Object.assign(h.gh().pulls.get((await h.byIssue(51)).pr!.number)!, { state: "closed", merged: true });
+  h.gh().refs.set("main", "2".repeat(40));
+  h.clock.now += 2 * 60_000;
+  await h.settle();
+  const dependent = await h.byIssue(52);
+  const response = await h.report(dependent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40)], ancestors: ["1".repeat(40), "2".repeat(40)], ahead: 1 });
+  assert.equal(response.exitCode, 0, response.stderr);
+  await h.settle();
+  assert.equal((await h.byIssue(52)).outcome, "ready");
+  const parent = await h.byIssue(50);
+  assert.equal(h.store.get(parent.id)!.control.prerequisites.length, 2);
+});
+
+test("a newly ready child head cannot restore its parent's old integration evidence", async () => {
+  const h = withParent([51]);
+  await h.settle();
+  let child = await h.byIssue(51);
+  await h.report(child.threadId!, GOOD); await h.settle();
+  const parent = await h.byIssue(50);
+  await h.report(parent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40), "2".repeat(40)], ahead: 2 });
+  await h.settle();
+  assert.equal((await h.byIssue(50)).outcome, "ready");
+  h.gh().refs.set(child.branch, "4".repeat(40));
+  await h.settle();
+  child = await h.byIssue(51);
+  assert.equal(child.state, "addressing");
+  await h.report(child.threadId!, { outcome: "changes", round: child.round - 1, replies: [], verification: ["integration tests passed"], summary: "Updated child." }, { headSha: "5".repeat(40), commits: ["5".repeat(40), "4".repeat(40), "2".repeat(40)], ahead: 3 });
+  await h.settle();
+  assert.equal((await h.byIssue(51)).outcome, "ready");
+  assert.notEqual((await h.byIssue(50)).outcome, "ready");
+  const current = h.store.get(parent.id)!;
+  assert.equal(current.control.localEvidence, null);
+  assert.equal(current.control.prerequisites[0]!.sha, "5".repeat(40));
+  assert.equal(current.phase.state, "addressing");
+  assert.match(h.sent.filter((message) => message.threadId === parent.threadId).at(-1)!.input[0].text, /Repair/);
+});
+
 test("a labeled parent tracks its sub-issues and runs one worker per open sub-issue with the parent as context", async () => {
   const h = withParent();
   await h.settle();
