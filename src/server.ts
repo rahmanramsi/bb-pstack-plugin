@@ -20,6 +20,7 @@ import { createPlacement } from "./placement.ts";
 import { createPlacementCommands } from "./placement-commands.ts";
 import { registerDispatchGuard } from "./dispatch-guard.ts";
 import { createCheckouts, parseCheckouts } from "./checkouts.ts";
+import { GH_INSTRUCTIONS, ghCommands } from "./gh/commands.ts";
 import {
   PluginCliError,
   cliCommand,
@@ -217,17 +218,19 @@ export default async function plugin(bb: BbPluginApi) {
     return parsed.ok ? parsed.repos : [];
   };
   const hosts = bb.hosts.experimental_client({ contract: hostContract });
+  const githubConfigured = () => !!current.githubAppId && !!current.githubPrivateKey;
+  const github = createGitHub({
+    credentials: () => {
+      if (!githubConfigured()) return null;
+      const key = decodePrivateKey(current.githubPrivateKey);
+      if (!key.ok) throw new GitHubSetupError(key.error);
+      return { appId: current.githubAppId, privateKey: key.pem };
+    },
+  });
   const issues = createIssues({
     bb,
     store: issueStore,
-    github: createGitHub({
-      credentials: () => {
-        if (!current.githubAppId || !current.githubPrivateKey) return null;
-        const key = decodePrivateKey(current.githubPrivateKey);
-        if (!key.ok) throw new GitHubSetupError(key.error);
-        return { appId: current.githubAppId, privateKey: key.pem };
-      },
-    }),
+    github,
     hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),
     repos: issueRepos,
     catalog: async () => {
@@ -273,7 +276,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.contributeInstructions(({ threadId }) => {
-    const parts = [issues.instructions(threadId), checklist.instructions(threadId), instructionsFor(modelsText)].filter((part): part is string => !!part);
+    const parts = [issues.instructions(threadId), githubConfigured() ? GH_INSTRUCTIONS : null, checklist.instructions(threadId), instructionsFor(modelsText)].filter((part): part is string => !!part);
     return parts.length > 0 ? parts.join("\n\n").slice(0, INSTRUCTIONS_MAX) : null;
   });
 
@@ -320,12 +323,29 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register(
     defineCli({
       name: "pstack",
-      summary: "pstack model roles, panel and swarm runs, playbook checklists, and GitHub issue workers",
+      summary: "pstack model roles, panel and swarm runs, playbook checklists, GitHub issue workers, and GitHub access through the pstack App",
       commands: {
         ...checklist.commands,
         ...runs.commands,
         ...createPlacementCommands({ bb, placement, checkouts }),
         ...issues.commands,
+        ...ghCommands({
+          bb,
+          github,
+          configured: githubConfigured,
+          isIssueWorker: (threadId) => issueStore.byThread(threadId) !== null,
+          prGate: (threadId) => {
+            if (!checklistStore.poteto(threadId)) return { pass: true };
+            const state = checklistStore.checklist(threadId);
+            const result = gate("pr", state);
+            return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
+          },
+          host: {
+            pushBranch: (hostId, input) => hosts.call("pushBranch", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS }),
+            inspect: async (hostId, worktreePath) => (await hosts.call("inspect", { worktreePath }, { hostId })).originUrl,
+            fetch: (hostId, input) => hosts.call("fetch", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS }),
+          },
+        }),
         models: cliCommand({
           summary:
             "Print the effective role-to-model table (configured values merged over defaults)",

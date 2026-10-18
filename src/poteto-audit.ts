@@ -159,8 +159,9 @@ export function createsPr(command: string): boolean {
     if (program.length === 0) return false;
     const script = shellScript(program);
     if (script !== null) return createsPr(script);
-    const [name, group, action, ...flags] = program;
-    return ["gh", "origin"].includes(basename(name)) && group === "pr" && (action === "create" || action === "new")
+    // `bb pstack gh pr create` is `gh pr create` behind two more words.
+    const [name, group, action, ...flags] = basename(program[0]!) === "bb" && program[1] === "pstack" && program[2] === "gh" ? ["gh", ...program.slice(3)] : program;
+    return ["gh", "origin"].includes(basename(name!)) && group === "pr" && (action === "create" || action === "new")
       && !flags.includes("--help") && !flags.includes("-h");
   });
 }
