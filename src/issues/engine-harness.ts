@@ -557,6 +557,10 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const settle = async () => {
     for (let i = 0; i < 5; i++) await current.issues.sweep();
   };
+  const advance = async (milliseconds: number) => {
+    clock.now += milliseconds;
+    await settle();
+  };
   const byIssue = async (issue: number) => (await views()).find((job) => job.issue === issue)!;
   /** Label the issue and let the worker's first report open its pull request. */
   const toReview = async (issue = 41) => {
@@ -565,6 +569,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     const working = await byIssue(issue);
     await report(working.threadId!, GOOD);
     await settle();
+    await advance(MIN);
     const job = await byIssue(issue);
     assert.equal(job.state, "review", job.error ?? "");
     return { job, pr: job.pr!.number };
@@ -621,6 +626,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     stopped,
     pushes,
     failures,
+    advance,
     work,
     events,
     services,
