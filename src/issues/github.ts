@@ -98,7 +98,7 @@ export type Capabilities = z.infer<typeof CapabilitiesSchema>;
 const CheckStateSchema = z.enum(["pending", "success", "neutral", "skipped", "failure", "cancelled", "unknown"]);
 export type CheckState = z.infer<typeof CheckStateSchema>;
 const CheckSchema = z.object({
-  id: z.string(), name: z.string(), source: z.enum(["check-run", "status"]), appId: z.number().nullable(),
+  id: z.string(), name: z.string(), source: z.enum(["check-run", "check-suite", "status"]), appId: z.number().nullable(),
   head: WireSha, state: CheckStateSchema, url: z.string().nullable(),
 });
 export type Check = z.infer<typeof CheckSchema>;
@@ -254,6 +254,8 @@ type SnapshotPull = z.infer<typeof SnapshotPullSchema>;
 const SuiteSchema = z.object({ id: z.number().int().positive(), head_sha: WireSha, status: z.string(), conclusion: z.string().nullable(), app: z.object({ id: z.number().int().positive(), slug: z.string().optional() }) });
 const RunSchema = z.object({ id: z.number().int().positive(), name: z.string(), head_sha: WireSha,
   status: z.string(), conclusion: z.string().nullable(), html_url: z.string().nullable(), app: z.object({ id: z.number().int().positive() }) });
+type SuiteObservation = { suite: z.infer<typeof SuiteSchema>; runs: z.infer<typeof RunSchema>[] };
+type CheckObservations = { checks: Check[]; placeholders: Check[]; complete: boolean };
 const StatusSchema = z.object({ id: z.number().int().positive(), context: z.string(), state: z.string(), target_url: z.string().nullable(), created_at: z.string().datetime() });
 const StatusCommentSchema = z.object({ id: z.number().int().positive(), created_at: z.string().datetime(), body: z.string().nullable(),
   user: z.object({ login: z.string(), type: z.string() }).nullable(),
@@ -499,12 +501,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
     async function capabilities(input: { fresh: boolean }): Promise<Capabilities> {
       credentials();
       const key = `capabilities:${name}`;
-      if (input.fresh) {
-        cache.delete(key);
-        const id = installations.get(name);
-        if (id !== undefined) tokens.delete(id);
-        installations.delete(name);
-      }
+      if (input.fresh) cache.delete(key);
       return cached(key, 60_000, async () => {
         const installation = await request({ kind: "app", signal }, "GET", `${base}/installation`);
         if (installation.status === 404) throw new GitHubSetupError(`the GitHub App is not installed on ${name}`);
@@ -537,8 +534,9 @@ export function createGitHub(options: GitHubOptions): GitHub {
       return pull;
     }
 
-    async function checkObservations(head: Sha): Promise<{ checks: Check[]; complete: boolean }> {
+    async function checkObservations(head: Sha): Promise<CheckObservations> {
       const checks: Check[] = [];
+      const placeholders: Check[] = [];
       let complete = true;
       async function collection<T>(path: string, field: string, schema: z.ZodType<T>): Promise<T[]> {
         const items: T[] = [];
@@ -556,20 +554,26 @@ export function createGitHub(options: GitHubOptions): GitHub {
         return items;
       }
       const suites = await collection(`${base}/commits/${head}/check-suites?per_page=100`, "check_suites", SuiteSchema);
+      const observations: SuiteObservation[] = [];
       const newestRuns = new Map<string, z.infer<typeof RunSchema>>();
       for (const suite of suites) {
         if (suite.head_sha !== head) complete = false;
         const runs = await collection(`${base}/check-suites/${suite.id}/check-runs?filter=all&per_page=100`, "check_runs", RunSchema);
+        observations.push({ suite, runs });
         for (const run of runs) {
           if (run.head_sha !== head || run.app.id !== suite.app.id) complete = false;
           const key = `${run.app.id}:${run.name}`;
           if ((newestRuns.get(key)?.id ?? -1) < run.id) newestRuns.set(key, run);
         }
+      }
+      for (const { suite, runs } of observations) {
         const state = checkState(suite.status, suite.conclusion);
-        if (runs.length === 0 && !["success", "neutral", "skipped"].includes(state)) {
-          checks.push({ id: `check-suite:${suite.id}`, name: suite.app.slug ?? `App ${suite.app.id}`, source: "check-run", appId: suite.app.id,
-            head: suite.head_sha, state, url: null });
-        }
+        if (["success", "neutral", "skipped"].includes(state)) continue;
+        if (runs.length > 0 && !runs.some((run) => newestRuns.get(`${run.app.id}:${run.name}`)?.id === run.id)) continue;
+        const aggregate: Check = { id: `check-suite:${suite.id}`, name: suite.app.slug ?? `App ${suite.app.id}`,
+          source: "check-suite", appId: suite.app.id, head: suite.head_sha, state, url: null };
+        if (runs.length === 0 && suite.status === "queued" && suite.conclusion === null) placeholders.push(aggregate);
+        else checks.push(aggregate);
       }
       for (const run of newestRuns.values()) checks.push({ id: `check-run:${run.id}`, name: run.name, source: "check-run", appId: run.app.id,
         head: run.head_sha, state: checkState(run.status, run.conclusion), url: run.html_url });
@@ -581,7 +585,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
       }
       for (const status of newest.values()) checks.push({ id: `status:${status.id}`, name: status.context, source: "status", appId: null,
         head, state: status.state === "error" ? "failure" : CheckStateSchema.catch("unknown").parse(status.state), url: status.target_url });
-      return { checks, complete };
+      return { checks, placeholders, complete };
     }
 
     async function requiredPolicy(pull: SnapshotPull): Promise<ReviewSnapshot["required"]> {
@@ -652,13 +656,15 @@ export function createGitHub(options: GitHubOptions): GitHub {
       if (!before) return null;
       const observations = await checkObservations(before.head.sha);
       const required = await requiredPolicy(before);
+      const checks = [...observations.placeholders.filter((suite) => required.checks?.some((check) =>
+        check.source !== "status" && check.appId === suite.appId)), ...observations.checks];
       const after = await snapshotPull(pr);
       if (!after) return null;
       return ReviewSnapshotSchema.parse({ pr, head: after.head.sha, base: after.base.sha, url: after.html_url,
         state: after.state === "open" ? "open" : after.merged_at ? "merged" : "closed", draft: after.draft,
         headRepository: after.head.repo?.full_name ?? null, headBranch: after.head.ref, baseBranch: after.base.ref,
         mergeability: after.mergeable === null ? "unknown" : after.mergeable ? "clean" : "conflicting", observedAt: clock(),
-        complete: observations.complete && JSON.stringify(before) === JSON.stringify(after), checks: observations.checks, required });
+        complete: observations.complete && JSON.stringify(before) === JSON.stringify(after), checks, required });
     }
 
     async function setDraft(input: { expected: Target; draft: boolean }): Promise<DraftResult> {

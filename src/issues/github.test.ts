@@ -427,7 +427,26 @@ test("capabilities read effective installation grants and refresh repository/def
   assert.equal(fresh.defaultHead, NEXT_BASE);
   assert.equal(fresh.observedAt, NOW + 1);
   assert.equal(seen.filter((request) => request.path.endsWith("/installation")).length, 2);
+  assert.equal(minted, 1, "fresh grants reuse the unexpired installation read token");
   assert.ok(!seen.some((request) => request.path.includes("/protection")));
+});
+
+test("fresh grants retain read-token refresh on rejection and isolate a replacement installation", async () => {
+  const { repo, grants } = autonomySetup();
+  await repo.capabilities({ fresh: false });
+  let repositoryReads = 0;
+  routes["GET /repos/acme/web"] = () => ++repositoryReads === 1
+    ? { status: 401 }
+    : { status: 200, json: { id: 1234, default_branch: "main", archived: false } };
+  grants.issues = "read";
+  assert.equal((await repo.capabilities({ fresh: true })).permissions.issues, "read");
+  assert.deepEqual(seen.filter((request) => request.path === "/repos/acme/web").map(authOf),
+    ["Bearer ghs_1", "Bearer ghs_1", "Bearer ghs_2"]);
+  routes["GET /repos/acme/web/installation"] = () => ({ status: 200, json: { id: 88, permissions: grants } });
+  routes["POST /app/installations/88/access_tokens"] = () => ({ status: 201,
+    json: { token: "replacement-read", expires_at: new Date(NOW + 60 * 60_000).toISOString() } });
+  await repo.capabilities({ fresh: true });
+  assert.equal(authOf(seen.filter((request) => request.path === "/repos/acme/web").at(-1)!), "Bearer replacement-read");
 });
 
 test("fresh capability inspection distinguishes missing/rejected/suspended setup from transient faults", async () => {
@@ -505,8 +524,8 @@ test("snapshots select newest App/name attempts across suites and retain pending
   for (const pending of [false, true]) {
     const { repo } = autonomySetup();
     routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = (request) => request.path.includes("page=2")
-      ? { status: 200, json: { total_count: 4, check_suites: [suite(11), suite(14, 2)] } }
-      : { status: 200, json: { total_count: 4, check_suites: [suite(12), { ...suite(13), status: "queued", conclusion: null }] },
+      ? { status: 200, json: { total_count: 4, check_suites: [{ ...suite(11), conclusion: "failure" }, suite(14, 2)] } }
+      : { status: 200, json: { total_count: 4, check_suites: [suite(12), { ...suite(13), status: "in_progress", conclusion: null }] },
         headers: { link: `<${base}/repos/acme/web/commits/${HEAD}/check-suites?page=2>; rel="next"` } };
     routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 1, check_runs: [run(10, 1, "failure")] } });
     routes["GET /repos/acme/web/check-suites/12/check-runs"] = () => ({ status: 200, json: { total_count: 1,
@@ -518,6 +537,95 @@ test("snapshots select newest App/name attempts across suites and retain pending
     assert.deepEqual(snapshot.checks.filter((check) => check.id.startsWith("check-run:")).map((check) => [check.id, check.appId, check.state]),
       [["check-run:20", 1, pending ? "pending" : "success"], ["check-run:30", 2, "failure"]]);
     assert.deepEqual(snapshot.checks.filter((check) => check.id.startsWith("check-suite:")).map((check) => check.state), ["pending"]);
+  }
+});
+
+test("running suites retain pending CI when every visible run is already successful", async () => {
+  for (const status of ["in_progress", "queued"]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1,
+      check_suites: [{ ...suite(11), status, conclusion: null }] } });
+    routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200,
+      json: { total_count: 1, check_runs: [run(10)] } });
+    const snapshot = (await repo.reviewSnapshot(7))!;
+    assert.equal(snapshot.complete, true);
+    assert.deepEqual(snapshot.checks.map((check) => [check.id, check.source, check.state]),
+      [["check-suite:11", "check-suite", "pending"], ["check-run:10", "check-run", "success"]]);
+  }
+});
+
+test("empty automatic queued suites leave an ordinary no-CI repository with no checks", async () => {
+  const { repo } = autonomySetup();
+  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1,
+    check_suites: [{ ...suite(11), status: "queued", conclusion: null }] } });
+  routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
+  const snapshot = (await repo.reviewSnapshot(7))!;
+  assert.equal(snapshot.complete, true);
+  assert.deepEqual(snapshot.checks, []);
+  assert.deepEqual(snapshot.required, { kind: "known", checks: [], blockers: [] });
+});
+
+test("required App bindings retain empty queued producers even with partially unavailable policy", async () => {
+  for (const unavailable of [false, true]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 2,
+      check_suites: [1, 2].map((app) => ({ ...suite(10 + app, app), status: "queued", conclusion: null })) } });
+    for (const id of [11, 12]) routes[`GET /repos/acme/web/check-suites/${id}/check-runs`] = () => ({ status: 200,
+      json: { total_count: 0, check_runs: [] } });
+    routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [
+      { type: "required_status_checks", parameters: {
+        required_status_checks: [{ context: "build", integration_id: 2 }], strict_required_status_checks_policy: false,
+      } }, ...(unavailable ? [{ type: "workflows" }] : []),
+    ] });
+    const snapshot = (await repo.reviewSnapshot(7))!;
+    assert.equal(snapshot.required.kind, unavailable ? "unavailable" : "known");
+    assert.deepEqual(snapshot.required.checks, [{ name: "build", source: "either", appId: 2, accepted: ["success", "neutral", "skipped"] }]);
+    assert.deepEqual(snapshot.checks.map((check) => [check.id, check.source, check.appId, check.state]),
+      [["check-suite:12", "check-suite", 2, "pending"]]);
+  }
+});
+
+test("actual producers remain pending without readable required policy", async () => {
+  for (const hasRun of [false, true]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1,
+      check_suites: [{ ...suite(11), status: hasRun ? "queued" : "in_progress", conclusion: null }] } });
+    routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200,
+      json: { total_count: hasRun ? 1 : 0, check_runs: hasRun ? [run(10, 1, "success", { status: "in_progress", conclusion: null })] : [] } });
+    routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 403 });
+    const snapshot = (await repo.reviewSnapshot(7))!;
+    assert.equal(snapshot.required.kind, "unavailable");
+    assert.equal(snapshot.checks[0]?.source, "check-suite");
+    assert.ok(snapshot.checks.every((check) => check.state === "pending"));
+  }
+});
+
+test("a required named producer stays pending beside an unrelated empty placeholder", async () => {
+  const { repo } = autonomySetup();
+  routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 2,
+    check_suites: [1, 2].map((app) => ({ ...suite(10 + app, app), status: "queued", conclusion: null })) } });
+  routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200, json: { total_count: 0, check_runs: [] } });
+  routes["GET /repos/acme/web/check-suites/12/check-runs"] = () => ({ status: 200,
+    json: { total_count: 1, check_runs: [run(20, 2, "success", { status: "in_progress", conclusion: null })] } });
+  routes["GET /repos/acme/web/rules/branches/main"] = () => ({ status: 200, json: [{ type: "required_status_checks", parameters: {
+    required_status_checks: [{ context: "build", integration_id: 2 }], strict_required_status_checks_policy: false,
+  } }] });
+  const snapshot = (await repo.reviewSnapshot(7))!;
+  assert.equal(snapshot.complete, true);
+  assert.deepEqual(snapshot.checks.map((check) => [check.id, check.source, check.appId, check.name, check.state]),
+    [["check-suite:12", "check-suite", 2, "app-2", "pending"], ["check-run:20", "check-run", 2, "build", "pending"]]);
+  assert.deepEqual(snapshot.required.checks, [{ name: "build", source: "either", appId: 2, accepted: ["success", "neutral", "skipped"] }]);
+});
+
+test("current suite failures remain aggregate blockers despite successful visible runs", async () => {
+  for (const conclusion of ["failure", "cancelled", "future_conclusion"]) {
+    const { repo } = autonomySetup();
+    routes[`GET /repos/acme/web/commits/${HEAD}/check-suites`] = () => ({ status: 200, json: { total_count: 1,
+      check_suites: [{ ...suite(11), conclusion }] } });
+    routes["GET /repos/acme/web/check-suites/11/check-runs"] = () => ({ status: 200,
+      json: { total_count: 1, check_runs: [run(10)] } });
+    assert.deepEqual((await repo.reviewSnapshot(7))!.checks.map((check) => [check.id, check.source, check.state]),
+      [["check-suite:11", "check-suite", conclusion === "future_conclusion" ? "unknown" : conclusion], ["check-run:10", "check-run", "success"]]);
   }
 });
 
