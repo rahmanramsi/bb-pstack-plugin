@@ -231,3 +231,28 @@ test("fixed object inspection proves ancestry including default-base ancestors a
   assert.deepEqual(readdirSync(f.temp), []);
   await f.harness.experimental_dispose();
 });
+
+test("base-only workflows and base-only changes do not count as unpublished worker changes", async () => {
+  const f = fixture();
+  const common = sh(f.worktree, "rev-parse", "HEAD");
+  sh(f.worktree, "checkout", "-qb", "main-advance");
+  mkdirSync(join(f.worktree, ".github/workflows"), { recursive: true });
+  const base = commit(f.worktree, ".github/workflows/check.yml", "name: base check\n");
+  sh(f.worktree, "checkout", "-qb", "worker", common);
+  const head = commit(f.worktree, "a.txt", "worker change\n");
+  const result = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base });
+  assert.equal(result.kind, "inspected");
+  if (result.kind === "inspected") {
+    assert.equal(result.workflows, false);
+    assert.equal(result.nonemptyDiff, true);
+  }
+  const empty = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: common, comparisonSha: base });
+  assert.equal(empty.kind, "inspected");
+  if (empty.kind === "inspected") assert.equal(empty.nonemptyDiff, false);
+  const pushed = await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: null, comparisonSha: base, workflows: false, token: TOKEN });
+  assert.equal(pushed.status, "pushed");
+  assert.equal(f.remoteHead(), head);
+  assert.deepEqual(readdirSync(f.loot), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});

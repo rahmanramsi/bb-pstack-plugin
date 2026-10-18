@@ -194,8 +194,8 @@ export function createIssues(deps: IssuesDeps): Issues {
     {
       reasons.push(...(snapshot.required.blockers ?? []));
       for (const required of snapshot.required.checks ?? []) {
-        const matching = snapshot.checks.filter((check) => check.head === snapshot.head && check.name === required.name && (required.source === "either" || required.source === check.source) && (required.appId === null || check.appId === required.appId));
-        if (!matching.some((check) => required.accepted.some((accepted) => accepted === check.state))) reasons.push(`required check missing or unsatisfied: ${required.source}/${required.appId}/${required.name}`);
+        const matching = snapshot.checks.filter((check) => check.source !== "check-suite" && check.head === snapshot.head && check.name === required.name && (required.source === "either" || required.source === check.source) && (required.appId === null || check.appId === required.appId));
+        if (!matching.some((check) => required.accepted.some((accepted) => accepted === check.state)) && !matching.some((check) => check.state === "pending")) reasons.push(`required check missing or unsatisfied: ${required.source}/${required.appId}/${required.name}`);
       }
     }
     return { kind: "observed", target: { pr: snapshot.pr, head: snapshot.head, base: snapshot.base }, state: snapshot.state, draft: snapshot.draft, complete: snapshot.complete, ready: snapshot.complete && reasons.length === 0 && !pending, limitation: snapshot.required.kind === "unavailable" ? `Branch policy could not be inspected: ${snapshot.required.reason}. Observed CI and local evidence passed; merge prerequisites are not established.` : null, pending, reasons, fingerprint: reasons.map((reason) => reason.replace(/[0-9a-f]{40}/g, "<sha>")).sort().join("|") || "healthy" };
@@ -392,7 +392,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           if (isMissing(error)) return { kind: "fail", error: "the worker thread is gone" };
           throw error;
         }
-        return done({ control: { ...job.control, idleObservation: thread.kind === "idle" ? { since: thread.since, remindedAt: clock() } : null } });
+        return thread.kind === "idle" ? done({ control: { ...job.control, idleObservation: { since: thread.since, remindedAt: clock() } } }) : done();
       },
     },
     reply: {
@@ -481,11 +481,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         const result = await github.repo(job.repo, until(deadline)).setDraft({ expected: effect.target, draft: effect.draft });
         if (result.kind === "missing" || result.kind === "closed") return { kind: "fail", error: "the pull request disappeared or closed during readiness conversion" };
         if (result.kind === "stale") return { kind: "changed-target", target: { pr: result.snapshot.pr, head: result.snapshot.head, base: result.snapshot.base } };
-        if (!effect.draft) {
-          const observation = reviewObservation(job, result.snapshot);
-          if (observation.kind !== "observed" || !observation.ready || observation.target.head !== effect.target.head || observation.target.base !== effect.target.base) return { kind: "changed-target", target: effect.target };
-        }
-        return done({ control: { ...job.control, readiness: effect.draft ? null : effect.target } });
+        return done({ control: { ...job.control, readiness: null, reviewIntent: effect.draft ? null : effect.target } });
       },
     },
     "close-issue": {
@@ -568,6 +564,7 @@ export function createIssues(deps: IssuesDeps): Issues {
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
         const retry = queued.filter((item) => item.payload.kind === "retry").map((item) => item.sendAt ?? clock() + SWEEP_MS);
         if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt: retry.length ? Math.max(...retry) : null };
+        if (thread.status === "idle" && queued.length) return { kind: "waiting" };
       }
       if (thread.status === "idle") return { kind: "idle", since: thread.updatedAt };
       return { kind: "active" };
@@ -753,7 +750,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (job.round > 1 && remoteHead === null) return { unavailable: `the branch ${job.branch} is not on GitHub`, disposition: "fail" };
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       const comparisonSha = job.round === 1 ? capabilities.defaultHead : job.roundBase ?? remoteHead ?? capabilities.defaultHead;
-      const ancestorShas = [...new Set([...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : []), ...(job.control.publicationRepair ? [job.control.publicationRepair.acceptedSha] : [])])];
+      const ancestorShas = [...new Set([capabilities.defaultHead, ...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : []), ...(job.control.publicationRepair ? [job.control.publicationRepair.acceptedSha] : [])])];
       const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha, ancestorShas });
       if (inspected.kind !== "inspected") return { unavailable: `missing local commit object ${inspected.sha}`, disposition: "worker", sha: inspected.sha as Sha };
       if (ancestorShas.some((sha) => !inspected.ancestry?.some((proof) => proof.sha === sha))) return { unavailable: "the host did not establish the requested Git ancestry", disposition: "retry" };

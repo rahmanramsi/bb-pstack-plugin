@@ -62,6 +62,9 @@ type GitHubState = {
   policyUnavailable: boolean;
   checkRuns: { id: number; name: string; head_sha: string; status: string; conclusion: string | null; html_url: string | null; app: { id: number } }[];
   requiredChecks: { context: string; app_id: number }[];
+  draftConversions: boolean[];
+  suiteState: { status: string; conclusion: string | null };
+  readyStartsCI: boolean;
 };
 
 let server: ReturnType<typeof createServer>;
@@ -138,7 +141,7 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     const permission = gh.permissions.get(decodeURIComponent(match[1]!));
     return permission ? [200, { permission }] : [404, { message: "Not Found" }];
   }
-  if (method === "GET" && /^\/repos\/acme\/web\/commits\/[^/]+\/check-suites$/.test(path)) return [200, { total_count: gh.checkRuns.length ? 1 : 0, check_suites: gh.checkRuns.length ? [{ id: 1, head_sha: path.split("/")[5], status: "completed", conclusion: "success", app: { id: 9, slug: "ci" } }] : [] }];
+  if (method === "GET" && /^\/repos\/acme\/web\/commits\/[^/]+\/check-suites$/.test(path)) return [200, { total_count: gh.checkRuns.length ? 1 : 0, check_suites: gh.checkRuns.length ? [{ id: 1, head_sha: path.split("/")[5], ...gh.suiteState, app: { id: gh.checkRuns[0]!.app.id, slug: "ci" } }] : [] }];
   if (method === "GET" && path === "/repos/acme/web/check-suites/1/check-runs") return [200, { total_count: gh.checkRuns.length, check_runs: gh.checkRuns }];
   if (method === "GET" && /^\/repos\/acme\/web\/commits\/[^/]+\/statuses$/.test(path)) return [200, []];
   if (method === "GET" && path === "/repos/acme/web/branches/main") return [200, { protected: gh.protected, commit: { sha: gh.refs.get("main") } }];
@@ -149,6 +152,11 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     const issue = gh.issues.get(id)!;
     const draft = body.query.includes("convertPullRequestToDraft");
     issue.pr!.draft = draft;
+    gh.draftConversions.push(draft);
+    if (!draft && gh.readyStartsCI) {
+      gh.suiteState = { status: "in_progress", conclusion: null };
+      gh.checkRuns = gh.checkRuns.map((run) => ({ ...run, status: "in_progress", conclusion: null }));
+    }
     const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
     return [200, { data: { [mutation]: { pullRequest: { id: `PR_${id}`, isDraft: draft } } } }];
   }
@@ -298,7 +306,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     nextId: 1000,
     now: () => clock.now,
     grants: { contents: "write", issues: "write", pull_requests: "write", workflows: "write", checks: "read", statuses: "read" },
-    mergeable: true, protected: false, policyUnavailable: false, checkRuns: [], requiredChecks: [],
+    mergeable: true, protected: false, policyUnavailable: false, checkRuns: [], requiredChecks: [], draftConversions: [], suiteState: { status: "completed", conclusion: "success" }, readyStartsCI: false,
   };
 
   const threads = new Map<string, FakeThread>();
@@ -316,6 +324,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
   const threadReads = { count: 0 };
+  const queued = new Set<string>();
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
   const held = async (key: string) => {
@@ -339,7 +348,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
 
   const sdk = {
     threads: {
-      queuedMessages: { list: async () => failures.scheduledRetryAt === null ? [] : [{ payload: { kind: "retry" }, sendAt: failures.scheduledRetryAt }] },
+      queuedMessages: { list: async ({ threadId }: { threadId: string }) => failures.scheduledRetryAt !== null ? [{ payload: { kind: "retry" }, sendAt: failures.scheduledRetryAt }] : queued.has(threadId) ? [{ payload: { kind: "message" }, sendAt: null }] : [] },
       async get({ threadId }: { threadId: string }) {
         threadReads.count++;
         const thread = threads.get(threadId);
@@ -475,7 +484,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
       inspectCommit: async (_hostId, input) => {
         if (failures.missingObject) return { kind: "missing-object", sha: failures.missingObject };
         const tree = worktrees.get(input.worktreePath.slice("/worktrees/".length));
-        const ancestors = tree?.ancestors ?? tree?.commits ?? [tree?.headSha, SHA1, ...pushes.map((push) => push.sha)];
+        const ancestors = [SHA1, ...tree?.ancestors ?? tree?.commits ?? [tree?.headSha, ...pushes.map((push) => push.sha)]];
         return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows, ...(input.ancestorShas ? { ancestry: input.ancestorShas.map((sha) => ({ sha, included: sha === input.sha || ancestors.includes(sha) })) } : {}) };
       },
       hostPush: async (hostId: string, input: PushInput, signal?: AbortSignal): Promise<PushResult> => {
@@ -604,6 +613,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     late,
     calls,
     threadReads,
+    queued,
     spawned,
     sent,
     stopped,

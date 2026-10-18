@@ -259,6 +259,7 @@ export type Control = {
   bestReasons: readonly string[] | null;
   milestones: readonly string[];
   readiness: ReviewTarget | null;
+  reviewIntent: ReviewTarget | null;
   localEvidence: { head: Sha; base: Sha } | null;
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
   objectRepair: { sha: Sha } | null;
@@ -271,7 +272,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -342,6 +343,7 @@ export type Change = {
 
 export type ThreadFact =
   | { kind: "active" }
+  | { kind: "waiting" }
   /** `since` is the thread's last activity, independent of lifecycle writes. */
   | { kind: "idle"; since: number }
   | { kind: "failed"; error: string; retryAt?: number | null }
@@ -529,13 +531,15 @@ function next(job: Job, facts: Facts): Action | null {
         }
         case "idle":
           if (facts.waiting) return null;
-          if (job.control.idleObservation?.since === thread.since && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
+          if (job.control.idleObservation && thread.since <= job.control.idleObservation.since) return null;
           if (job.nudges >= MAX_NUDGES) {
+            if (job.control.idleObservation && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
             return { type: "change", change: recover(job, "the worker stopped without reporting after two reminders") };
           }
           return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1, control: { ...job.control, idleObservation: { since: thread.since, remindedAt: now } } } };
         case "active":
-          return job.nudges > 0 || job.control.idleObservation !== null ? { type: "change", change: { nudges: 0, control: { ...job.control, idleObservation: null } } } : null;
+        case "waiting":
+          return null;
       }
     }
     case "tracking":
@@ -588,6 +592,11 @@ function checkReview(job: Job, facts: Facts): Action | null {
   const target = review.target;
   const previous = job.control.readiness;
   const changed = previous && (previous.head !== target.head || previous.base !== target.base);
+  const local = job.control.localEvidence?.head === target.head && job.control.localEvidence.base === target.base;
+  const intent = job.control.reviewIntent ?? previous;
+  const converted = intent?.head === target.head && intent.base === target.base && intent.pr === target.pr;
+  const awaitingCI = converted && local && review.complete && !review.draft && review.pending && review.reasons.length === 0;
+  if (job.phase.state === "review" && awaitingCI && !facts.feedback?.pending.length) return { type: "change", change: { phase: { state: "checking" }, control: { ...job.control, readiness: null, reviewIntent: target } } };
   if (job.phase.state === "review" && (changed || !review.ready || review.draft || Boolean(facts.feedback?.pending.length))) {
     return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
   }
@@ -608,10 +617,19 @@ function checkReview(job: Job, facts: Facts): Action | null {
   }
   if (job.phase.state !== "checking" || !review.complete) return null;
   if (facts.feedback?.pending.length && !review.draft) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `feedback-observed:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
-  const local = job.control.localEvidence?.head === target.head && job.control.localEvidence.base === target.base;
+  if (awaitingCI) return null;
   if (!review.draft && (!review.ready || !local)) return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `checking-draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
   if (review.pending) return null;
-  if (review.ready && local) return { type: "change", change: { phase: enter("readifying", [{ op: "set-draft", key: `ready:${job.id}:${target.head}:${target.base}`, target, draft: false }]), control: { ...job.control, policyLimitation: review.limitation ?? null } } };
+  if (review.ready && local) {
+    const control = { ...job.control, policyLimitation: review.limitation ?? null };
+    if (converted && !review.draft) {
+      const repair = job.control.repair;
+      const counts = { ...(repair?.counts ?? (repair ? { [repair.cause]: repair.attempts } : {})) };
+      delete counts["local-evidence"];
+      return { type: "change", change: { phase: { state: "review" }, control: { ...control, readiness: target, reviewIntent: target, repair: repair ? { ...repair, counts, attempts: repair.cause === "local-evidence" ? 0 : repair.attempts } : null } } };
+    }
+    return { type: "change", change: { phase: enter("readifying", [{ op: "set-draft", key: `ready:${job.id}:${target.head}:${target.base}`, target, draft: false }]), control } };
+  }
   const cause = local ? review.fingerprint : "local-evidence";
   const counts = job.control.repair?.counts ?? (job.control.repair ? { [job.control.repair.cause]: job.control.repair.attempts } : {});
   const attempts = (counts[cause] ?? 0) + 1;
@@ -905,6 +923,10 @@ function verdict(job: Job, reasons: readonly string[], accepted: () => Change): 
 
 export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts): Verdict {
   if (facts.prerequisiteProblems?.length && parsed.report.outcome !== "failure") return { ok: false, reasons: facts.prerequisiteProblems, change: rejectReport(job, facts.prerequisiteProblems) };
+  if (parsed.report.outcome !== "failure" && facts.baseSha && !containsSha(facts.worktree, facts.baseSha)) {
+    const reasons = [`HEAD must contain the verified base ${facts.baseSha}; fetch and integrate the current base before reporting`];
+    return { ok: false, reasons, change: rejectReport(job, reasons) };
+  }
   const verdict = parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
   if (verdict.ok && (parsed.report.outcome === "changes" || (parsed.report.outcome === "no-change" && job.round > 1 && facts.gate.pass)) && facts.baseSha) {
     const milestone = !job.control.milestones.includes("verified-change");

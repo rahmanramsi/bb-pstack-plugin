@@ -119,7 +119,9 @@ async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv,
   for (const sha of [input.sha, input.comparisonSha, ...input.ancestorShas ?? []]) {
     if ((await git(["cat-file", "-e", `${sha}^{commit}`], env, signal)).code !== 0) return { kind: "missing-object", sha };
   }
-  const diff = await git(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", input.comparisonSha, input.sha], env, signal);
+  const common = await git(["merge-base", input.comparisonSha, input.sha], env, signal);
+  if (common.code !== 0) throw new Error("cannot establish a merge base for pinned Git objects");
+  const diff = await git(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", common.stdout.trim(), input.sha], env, signal);
   const history = await git(["log", "--format=", "--name-only", "--no-renames", "-z", `${input.comparisonSha}..${input.sha}`], env, signal);
   if (diff.code !== 0 || history.code !== 0) throw new Error("cannot inspect pinned Git objects");
   const workflows = `${diff.stdout}\0${history.stdout}`.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));

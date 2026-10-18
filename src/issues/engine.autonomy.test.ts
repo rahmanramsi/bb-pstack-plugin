@@ -2,6 +2,98 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { harness, GOOD, MIN, SHA1, SHA2, SHA3, REPO } from "./engine-harness.ts";
 
+test("same-target pending CI clears readiness without reversing a ready conversion", async () => {
+  const h = harness();
+  h.gh().checkRuns = [{ id: 1, name: "build", head_sha: SHA2, status: "completed", conclusion: "skipped", html_url: null, app: { id: 1 } }];
+  h.gh().requiredChecks = [{ context: "build", app_id: 1 }];
+  h.gh().readyStartsCI = true;
+  h.label(41); await h.settle();
+  await h.report((await h.only()).threadId!, GOOD); await h.settle();
+  const pr = (await h.only()).pr!.number;
+  assert.notEqual((await h.only()).outcome, "ready");
+  assert.equal(h.gh().issues.get(pr)!.pr!.draft, false);
+  h.restart(); await h.settle();
+  assert.deepEqual(h.gh().draftConversions, [false]);
+  h.gh().checkRuns[0]!.status = "completed";
+  h.gh().checkRuns[0]!.conclusion = "success";
+  h.gh().suiteState = { status: "completed", conclusion: "success" };
+  await h.settle();
+  assert.equal((await h.only()).outcome, "ready");
+  assert.deepEqual(h.gh().draftConversions, [false]);
+});
+
+test("legitimate skipped checks remain acceptable after a separate non-draft observation", async () => {
+  const h = harness();
+  h.gh().checkRuns = [{ id: 1, name: "conditional build", head_sha: SHA2, status: "completed", conclusion: "skipped", html_url: null, app: { id: 9 } }];
+  const { job } = await h.toReview();
+  assert.equal(job.outcome, "ready");
+  assert.deepEqual(h.gh().draftConversions, [false]);
+});
+
+test("recorded local evidence cannot claim a default base absent from the verified HEAD", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  h.gh().refs.set("main", SHA3);
+  const response = await h.report(job.threadId!, GOOD, { headSha: SHA2, commits: [SHA2], ancestors: [SHA1], ahead: 1 });
+  assert.equal(response.exitCode, 1);
+  assert.match(response.stderr!, /verified base/);
+  assert.equal(h.store.get(job.id)!.control.localEvidence, null);
+});
+
+test("healthy verified base advances do not exhaust a lifetime local-evidence budget", async () => {
+  const h = harness();
+  const { job } = await h.toReview();
+  let previousHead = SHA2;
+  for (let step = 0; step < 7; step++) {
+    const base = (100 + step).toString(16).padStart(40, "0");
+    const head = (200 + step).toString(16).padStart(40, "0");
+    h.gh().refs.set("main", base);
+    await h.settle();
+    const repair = await h.only();
+    assert.equal(repair.state, "addressing", repair.error ?? "");
+    const report = await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [], summary: "Verified current base integration.", verification: ["integration tests passed"] }, { headSha: head, ancestors: [previousHead, base], ahead: 2 });
+    assert.equal(report.exitCode, 0, report.stderr);
+    await h.settle();
+    assert.equal((await h.only()).outcome, "ready");
+    previousHead = head;
+  }
+});
+
+test("ordinary queued work waits for capacity before new confirmed idle reminder cycles", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const job = await h.only();
+  const worker = h.threads.get(job.threadId!)!;
+  Object.assign(worker, { status: "idle", updatedAt: h.clock.now + 1, queuedMessageCount: 1 });
+  h.queued.add(worker.id);
+  h.clock.now += 24 * 60 * MIN;
+  await h.settle();
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.spawned.length, 1);
+  for (let cycle = 0; cycle < 2; cycle++) {
+    h.queued.delete(worker.id);
+    Object.assign(worker, { status: "active", queuedMessageCount: 0 });
+    await h.settle();
+    h.clock.now += MIN;
+    Object.assign(worker, { status: "idle", updatedAt: h.clock.now });
+    await h.settle();
+    assert.equal(h.sent.length, cycle + 1);
+    worker.queuedMessageCount = 1;
+    h.queued.add(worker.id);
+    h.clock.now += 24 * 60 * MIN;
+    await h.settle();
+    assert.equal(h.spawned.length, 1);
+  }
+  h.queued.delete(worker.id);
+  Object.assign(worker, { status: "active", queuedMessageCount: 0 });
+  await h.settle();
+  h.clock.now += MIN;
+  Object.assign(worker, { status: "idle", updatedAt: h.clock.now });
+  await h.settle();
+  assert.equal(h.spawned.length, 2);
+});
+
 test("publication divergence preserves accepted work and requires a fresh merged report", async () => {
   const h = harness();
   h.label(41); await h.settle();
@@ -149,12 +241,13 @@ test("an asynchronous rejection wakes its idle worker after outage and restart",
   h.gh().outages.length = 0;
   await h.settle();
   assert.ok(h.sent.some((message) => message.threadId === job.threadId && /title/.test(message.input[0].text)), "the current worker receives validation reasons");
-  h.clock.now += 24 * 60 * MIN;
-  await h.settle();
-  h.clock.now += MIN;
-  await h.settle();
-  h.clock.now += MIN;
-  await h.settle();
+  for (let cycle = 0; cycle < 3; cycle++) {
+    h.clock.now += 24 * 60 * MIN;
+    h.threads.get(job.threadId!)!.updatedAt = h.clock.now;
+    const current = h.store.get(job.id)!;
+    h.store.write(current.id, current.version, { error: current.error }, h.clock.now + 1);
+    await h.settle();
+  }
   assert.ok(h.spawned.length > 1 || (await h.only()).outcome === "failure", "an unresponsive worker cannot remain permanently idle");
 });
 
@@ -441,7 +534,7 @@ test("CI repair recovers a gone published worker in the preserved environment", 
   assert.match(h.spawned[1]!.prompt, /repair worker is unavailable/);
 });
 
-test("a missing fresh base object asks the authorized worker to fetch and resumes the saved report", async () => {
+test("a missing fresh base object asks the worker to fetch and requires integrated current evidence", async () => {
   const h = harness();
   h.label(41); await h.settle();
   const worker = (await h.only()).threadId!;
@@ -455,7 +548,44 @@ test("a missing fresh base object asks the authorized worker to fetch and resume
   assert.equal(h.pushes.length, 0);
   h.failures.missingObject = null;
   h.restart(); await h.settle();
+  assert.notEqual((await h.only()).outcome, "ready");
+  assert.match(h.sent.at(-1)!.input[0].text, /verified base/);
+  const response = await h.report(worker, GOOD, { headSha: "4".repeat(40), ancestors: [SHA3], ahead: 2 });
+  assert.equal(response.exitCode, 0, response.stderr);
+  await h.settle();
   assert.equal((await h.only()).outcome, "ready");
+});
+
+test("aggregate pending suites cannot make an otherwise successful head ready", async () => {
+  const h = harness();
+  h.gh().checkRuns = [{ id: 1, name: "build", head_sha: SHA2, status: "completed", conclusion: "success", html_url: null, app: { id: 9 } }];
+  h.gh().requiredChecks = [{ context: "build", app_id: 9 }];
+  h.gh().suiteState = { status: "queued", conclusion: null };
+  h.label(41); await h.settle();
+  const job = await h.only();
+  await h.report(job.threadId!, GOOD); await h.settle();
+  assert.equal((await h.only()).state, "checking");
+  assert.equal((await h.only()).outcome, null);
+  assert.deepEqual(h.gh().draftConversions, []);
+  h.gh().suiteState = { status: "completed", conclusion: "success" };
+  await h.settle();
+  assert.equal((await h.only()).outcome, "ready");
+});
+
+test("persistently unknown mergeability stays unready and exhausts its actual repair cause", async () => {
+  const h = harness();
+  const { job } = await h.toReview();
+  h.gh().mergeable = null;
+  await h.settle();
+  for (let round = 0; round < 5; round++) {
+    const current = await h.only();
+    assert.equal(current.state, "addressing");
+    assert.notEqual(current.outcome, "ready");
+    await h.report(job.threadId!, { outcome: "no-change", round: current.round - 1, replies: [], summary: "Verified the current implementation.", verification: ["local tests passed; mergeability is still unknown"] }, { headSha: SHA2, ahead: 1 });
+    await h.settle();
+  }
+  assert.equal((await h.only()).outcome, "failure");
+  assert.match((await h.only()).error!, /repair exhausted.*mergeability is unknown/);
 });
 
 test("saved report verification never rebinds to a later worker commit", async () => {
