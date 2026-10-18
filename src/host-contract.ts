@@ -28,6 +28,8 @@ export const PushInput = z.strictObject({
   sha: Sha,
   /** The remote branch must be at this commit, or absent when null, and `sha` must descend from it. */
   expectedRemoteSha: Sha.nullable(),
+  comparisonSha: Sha.optional(),
+  workflows: z.boolean().optional(),
   /** A one-repository, contents-only installation token. It lives only in the git child's environment. */
   token: z.string().min(1),
 });
@@ -70,7 +72,17 @@ export const FetchResult = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("failed"), detail: z.string() }),
 ]);
 
+export const InspectCommitInput = z.strictObject({ worktreePath: WorktreePath, sha: Sha, comparisonSha: Sha });
+export const InspectCommitResult = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("inspected"), sha: Sha, comparisonSha: Sha, nonemptyDiff: z.boolean(), workflows: z.boolean() }),
+  z.strictObject({ kind: z.literal("missing-object"), sha: Sha }),
+]);
+export type InspectCommitInput = z.infer<typeof InspectCommitInput>;
+export type InspectCommitResult = z.infer<typeof InspectCommitResult>;
+export type HostInspectCommit = (hostId: string, input: InspectCommitInput, signal?: AbortSignal) => Promise<InspectCommitResult>;
+
 export const hostContract = defineRpcContract({
+  inspectCommit: { input: InspectCommitInput, output: InspectCommitResult },
   push: { input: PushInput, output: PushResult },
   pushBranch: { input: PushBranchInput, output: PushResult },
   inspect: { input: InspectInput, output: InspectResult },
@@ -87,6 +99,7 @@ export type HostPush = (hostId: string, input: PushInput, signal?: AbortSignal) 
 
 /** The ports `bb pstack gh` uses. server.ts builds them from bb.hosts.experimental_client. */
 export type HostGit = {
+  inspectCommit?: HostInspectCommit;
   pushBranch(hostId: string, input: PushBranchInput): Promise<PushResult>;
   inspect(hostId: string, worktreePath: string): Promise<string | null>;
   fetch(hostId: string, input: FetchInput): Promise<FetchResult>;

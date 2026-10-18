@@ -13,7 +13,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
-import { hostContract, type FetchInput, type FetchResult, type PushInput, type PushResult } from "./host-contract.ts";
+import { hostContract, type FetchInput, type FetchResult, type PushInput, type PushResult, type InspectCommitInput, type InspectCommitResult } from "./host-contract.ts";
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -115,6 +115,23 @@ async function withScratch<T>(worktreePath: string, tempDir: string, signal: Abo
   }
 }
 
+async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<InspectCommitResult> {
+  for (const sha of [input.sha, input.comparisonSha]) {
+    if ((await git(["cat-file", "-e", `${sha}^{commit}`], env, signal)).code !== 0) return { kind: "missing-object", sha };
+  }
+  const diff = await git(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", input.comparisonSha, input.sha], env, signal);
+  const history = await git(["log", "--format=", "--name-only", "--no-renames", "-z", `${input.comparisonSha}..${input.sha}`], env, signal);
+  if (diff.code !== 0 || history.code !== 0) throw new Error("cannot inspect pinned Git objects");
+  const workflows = `${diff.stdout}\0${history.stdout}`.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));
+  return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: diff.stdout.length > 0, workflows };
+}
+
+async function inspectCommit(input: InspectCommitInput, tempDir: string, signal: AbortSignal): Promise<InspectCommitResult> {
+  return withScratch(input.worktreePath, tempDir, signal,
+    (scratch) => inspectObjects(input, isolatedEnv(scratch, "file:///", null), signal),
+    (detail) => { throw new Error(detail); });
+}
+
 async function push(input: PushInput & { rewrite?: boolean | undefined }, tempDir: string, signal: AbortSignal): Promise<PushResult> {
   const redact = (text: string) => text.split(input.token).join("***").trim();
   return withScratch(input.worktreePath, tempDir, signal, async (scratch): Promise<PushResult> => {
@@ -130,6 +147,12 @@ async function push(input: PushInput & { rewrite?: boolean | undefined }, tempDi
       }
     }
 
+    if (input.comparisonSha !== undefined || input.workflows !== undefined) {
+      if (input.comparisonSha === undefined || input.workflows === undefined) return { status: "rejected", reason: "denied", detail: "push classification is incomplete" };
+      const classified = await inspectObjects({ worktreePath: input.worktreePath, sha: input.sha, comparisonSha: input.comparisonSha }, local, signal);
+      if (classified.kind === "missing-object") return { status: "rejected", reason: "missing-commit", detail: `missing comparison object ${classified.sha}` };
+      if (classified.workflows !== input.workflows) return { status: "rejected", reason: "denied", detail: "workflow classification changed" };
+    }
     const ref = `refs/heads/${input.branch}`;
     // Ancestry is checked above unless a rewrite was asked for, so the lease forces nothing else. It makes the
     // remote-state check atomic: an empty expected value means the branch must not exist yet.
@@ -193,6 +216,7 @@ async function fetchRefs(input: FetchInput, tempDir: string, signal: AbortSignal
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    inspectCommit: (input, ctx) => inspectCommit(input, ctx.experimental_paths.tempDir, ctx.signal),
     push: (input, ctx) => push(input, ctx.experimental_paths.tempDir, ctx.signal),
     pushBranch: (input, ctx) => push(input, ctx.experimental_paths.tempDir, ctx.signal),
     inspect: (input, ctx) => inspect(input.worktreePath, ctx.signal),

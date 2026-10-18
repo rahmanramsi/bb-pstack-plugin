@@ -191,3 +191,24 @@ test("fetch brings remote branches into origin/* without the worktree's config, 
   assert.deepEqual(readdirSync(f.temp), []);
   await f.harness.experimental_dispose();
 });
+
+test("commit inspection includes deleted and reverted workflow ancestors without reading worker commands", async () => {
+  const f = fixture();
+  const base = sh(f.worktree, "rev-parse", "HEAD");
+  mkdirSync(join(f.worktree, ".github/workflows"), { recursive: true });
+  const added = commit(f.worktree, ".github/workflows/check.yml", "name: check\n");
+  sh(f.worktree, "rm", ".github/workflows/check.yml");
+  sh(f.worktree, "commit", "-qm", "remove workflow");
+  const head = commit(f.worktree, "a.txt", "change\n");
+  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base }), {
+    kind: "inspected", sha: head, comparisonSha: base, nonemptyDiff: true, workflows: true,
+  });
+  assert.deepEqual(await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: added }), {
+    kind: "inspected", sha: head, comparisonSha: added, nonemptyDiff: true, workflows: true,
+  });
+  assert.equal((await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: null, comparisonSha: base, workflows: false, token: TOKEN })).status, "rejected");
+  assert.equal(f.remoteHead(), null);
+  assert.deepEqual(readdirSync(f.loot), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});
