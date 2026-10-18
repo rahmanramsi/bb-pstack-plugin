@@ -18,6 +18,7 @@ import {
   enter,
   isReasoningLevel,
   plan,
+  retryable,
   settle,
   stop,
   toView,
@@ -67,6 +68,7 @@ function job(overrides: Partial<Job> = {}): Job {
     roundBase: null,
     worker: null,
     parentId: null,
+    retryOf: null,
     progress: null,
     createdAt: NOW - MIN,
     updatedAt: NOW - MIN,
@@ -605,4 +607,27 @@ test("a pull request merged while a round is being handed over ends the job inst
     const merged = plan(current, facts({ pr: { state: "merged" } }));
     assert.equal((merged as { change: Change }).change.phase?.state, "closing", current.phase.state);
   }
+});
+
+test("only the newest stuck or stopped job on an issue with no open job is retryable, and a child only while its parent tracks", () => {
+  const stuck = job({ phase: { state: "stuck" } });
+  const newer = job({ id: "psi_00000000-0000-0000-0000-000000000002" as JobId, generation: 2, phase: { state: "stuck" } });
+  const open = job({ id: "psi_00000000-0000-0000-0000-000000000003" as JobId, generation: 2, phase: { state: "working" }, threadId: "thr_w" });
+  const code = (...args: Parameters<typeof retryable>) => retryable(...args)?.code ?? null;
+
+  assert.equal(code(stuck, stuck, null, null), null);
+  assert.equal(code(job({ phase: { state: "stopped" } }), null, null, null), null);
+  for (const state of ["queued", "working", "done", "ignored", "sticking"] as const) {
+    assert.equal(code(job({ phase: state === "sticking" ? transit("sticking", [{ op: "stop-thread", key: "k" }]) : { state } }), null, null, null), "not_retryable", state);
+  }
+  assert.equal(code(stuck, newer, null, null), "superseded");
+  assert.match(retryable(stuck, newer, null, null)!.message, new RegExp(newer.id));
+  assert.equal(code(stuck, open, open, null), "open_job");
+
+  const parent = job({ id: "psi_00000000-0000-0000-0000-000000000009" as JobId, issue: 50, phase: { state: "tracking" } });
+  const child = job({ issue: 51, parentId: parent.id, phase: { state: "stuck" } });
+  assert.equal(code(child, child, null, parent), null);
+  assert.equal(code(child, child, null, { ...parent, phase: transit("updating", [{ op: "status", key: "k", body: "b" }]) }), null);
+  assert.equal(code(child, child, null, { ...parent, phase: { state: "stuck" } }), "parent_ended");
+  assert.equal(code(child, child, null, null), "parent_ended");
 });

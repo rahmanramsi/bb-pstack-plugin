@@ -5,7 +5,7 @@ import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand } f
 import { z } from "zod";
 import { readThreadFile } from "../thread-files.ts";
 import { issueBoard, listed, repoView, type ListedJob, type RepoView } from "./board.ts";
-import { JOB_ID, MAX_FEEDBACK_ROUNDS, type JobId, type JobView, type RepoName } from "./job.ts";
+import { JOB_ID, MAX_FEEDBACK_ROUNDS, type Job, type JobId, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
 export type RepoMapping = { repo: RepoName; projectId: string; hostId: string };
@@ -93,7 +93,9 @@ function formatList(repos: readonly RepoView[], jobs: readonly ListedJob[], now:
           const parts = [`#${job.issue}`, stateLabel(job), job.pr ? `PR #${job.pr.number}` : null, job.threadId, job.id, age(job.createdAt, now)];
           const detail = job.state === "ignored" || job.state === "stuck" || job.state === "stopped" ? job.error : null;
           const row = `  ${parts.filter(Boolean).join("  ")}${detail ? `  ${detail}` : ""}`;
-          return job.poll.error ? `${row}\n    poll error: ${job.poll.error}` : row;
+          const replaced = jobs.some((other) => other.repo === job.repo && other.issue === job.issue && other.state !== "ignored" && other.createdAt > job.createdAt);
+          const hint = job.state === "stuck" && !replaced ? `\n    retry: bb pstack issues retry ${job.id}` : "";
+          return `${row}${job.poll.error ? `\n    poll error: ${job.poll.error}` : ""}${hint}`;
         });
       return [header, ...(error ? [`  poll error: ${error}`] : []), ...rows].join("\n");
     })
@@ -105,6 +107,7 @@ function formatShow(job: ListedJob, repo: RepoView, now: number): string {
     ["state", stateLabel(job)],
     ["issue", job.issueUrl],
     ["triggered by", `@${job.triggeredBy}`],
+    ["retry of", job.retryOf],
     ["branch", job.branch],
     ["thread", job.threadId],
     ["pull request", job.pr?.url ?? null],
@@ -128,6 +131,7 @@ export function issueCommands(deps: {
   clock: () => number;
   report(threadId: string, text: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
   stop(id: JobId, by: string): Promise<boolean>;
+  retry(id: JobId): Promise<{ ok: true; job: Job } | { ok: false; code: string; message: string }>;
 }): Record<string, PluginCliCommand> {
   const { bb, store } = deps;
   const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
@@ -168,6 +172,22 @@ export function issueCommands(deps: {
         if (!store.get(id)) throw new PluginCliError(`no issue job ${id}`, { code: "job_not_found" });
         const stopped = await deps.stop(id, ctx.threadId ? `thread ${ctx.threadId}` : "the bb CLI");
         return { exitCode: 0, stdout: stopped ? `Stopping ${id}.\n` : `${id} already ended.\n` };
+      },
+    }),
+    "issues retry": cliCommand({
+      summary: "Start a new job for a stuck or stopped job's issue, on the repository's current mapping and issue worker",
+      description:
+        "Only the issue's newest job can be retried, once, and only while no other job is open on the issue. A sub-issue's job needs its parent job still running; otherwise retry the parent.",
+      positionals: [{ name: "job", description: "Job id (psi_…)", required: true }],
+      async run(input, ctx) {
+        const id = jobId(input.positionals.job);
+        if (ctx.threadId && store.byThread(ctx.threadId)) {
+          throw new PluginCliError("an issue worker cannot retry issue jobs", { code: "worker_cannot_retry" });
+        }
+        const result = await deps.retry(id);
+        if (!result.ok) throw new PluginCliError(result.message, { code: result.code });
+        const { job } = result;
+        return { exitCode: 0, stdout: `Retrying ${job.repo}#${job.issue} as ${job.id} on ${job.branch}.\n` };
       },
     }),
     "issues report": cliCommand({

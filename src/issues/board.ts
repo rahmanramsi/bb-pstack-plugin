@@ -29,6 +29,7 @@ export const IssueBoardSchema = z.object({
       triggeredBy: z.string(),
       branch: z.string(),
       parentId: z.string().regex(JOB_ID).nullable(),
+      retryOf: z.string().regex(JOB_ID).nullable(),
       threadId: z.string().nullable(),
       pr: z.object({ number: z.number().int(), url: z.string() }).nullable(),
       pushedSha: z.string().nullable(),

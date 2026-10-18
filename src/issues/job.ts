@@ -246,10 +246,12 @@ export type Job = {
   repo: RepoName;
   issue: number;
   generation: number;
-  /** `eventId` is null for a sub-issue's job, which its parent's label event started. */
+  /** `eventId` is null for a sub-issue's job, which its parent's label event started, and for a retry. */
   trigger: { eventId: number | null; actor: string; at: number };
   snapshot: IssueSnapshot;
   parentId: JobId | null;
+  /** The stuck or stopped job this one retries; it copies that job's trigger, snapshot and parent. */
+  retryOf: JobId | null;
   /** For a parent: the status comment body last planned, so a pass can tell when the progress changed. */
   progress: string | null;
   projectId: string;
@@ -632,6 +634,24 @@ export function stick(job: Job, reason: string): Change {
   return { phase: enter("sticking", endingEffects(job, "stick")), deadline: null, error: reason };
 }
 
+export type RetryRefusal = { code: "not_retryable" | "superseded" | "open_job" | "parent_ended"; message: string };
+
+/**
+ * Whether `bb pstack issues retry` may start a new job for this one's issue. `latest` is the issue's newest job that
+ * was not ignored, `open` its open job, and `parent` the parent job of a sub-issue's job: a child retried after its
+ * parent ended would have nothing tracking it.
+ */
+export function retryable(job: Job, latest: Job | null, open: Job | null, parent: Job | null): RetryRefusal | null {
+  const state = job.phase.state;
+  if (state !== "stuck" && state !== "stopped") return { code: "not_retryable", message: `job ${job.id} is ${state}; only a stuck or stopped job can be retried` };
+  if (open) return { code: "open_job", message: `job ${open.id} is already open on ${job.repo}#${job.issue}` };
+  if (latest && latest.id !== job.id) return { code: "superseded", message: `job ${latest.id} is newer on ${job.repo}#${job.issue}; retry that one instead` };
+  if (job.parentId && !(parent?.phase.state === "tracking" || parent?.phase.state === "updating")) {
+    return { code: "parent_ended", message: `the parent job ${job.parentId} ended; retry the parent, which starts jobs for its open sub-issues` };
+  }
+  return null;
+}
+
 export function canStop(state: JobState): boolean {
   return !TERMINAL.has(state) && state !== "stopping" && state !== "sticking";
 }
@@ -872,6 +892,7 @@ export function branchFor(issue: number, title: string, generation: number): Bra
 export type JobView = {
   id: JobId;
   parentId: JobId | null;
+  retryOf: JobId | null;
   repo: RepoName;
   issue: number;
   title: string;
@@ -897,6 +918,7 @@ export function toView(job: Job): JobView {
   return {
     id: job.id,
     parentId: job.parentId,
+    retryOf: job.retryOf,
     repo: job.repo,
     issue: job.issue,
     title: job.snapshot.title,

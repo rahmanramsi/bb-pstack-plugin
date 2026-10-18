@@ -38,6 +38,8 @@ export type NewJob = {
   snapshot: IssueSnapshot;
   /** Set for a sub-issue's job, whose trigger has no event. */
   parentId?: JobId;
+  /** Set for a retry, whose trigger has no event. A job is retried at most once. */
+  retryOf?: JobId;
   projectId: string;
   hostId: string;
   baseBranch: string;
@@ -55,6 +57,8 @@ export type IssueReads = {
   byThread(threadId: string): Job | null;
   byTrigger(eventId: number): Job | null;
   open(repo: RepoName, issue: number): Job | null;
+  /** The issue's newest job that was not ignored, in any state. */
+  latest(repo: RepoName, issue: number): Job | null;
   /** Jobs that may act at `now`, oldest first: WATCHED ones, and transit ones whose lease and backoff have passed. */
   due(now: number): JobId[];
   /**
@@ -79,8 +83,9 @@ export type IssueReads = {
 /** A write that returns null or 0 changed nothing; any other result means it did. */
 export type IssueWrites = {
   /**
-   * Inserts the job for a label event. Its generation is 1 + the issue's earlier jobs that were not ignored, and its
-   * branch follows from it. Null when the event is already recorded or an open job holds the issue.
+   * Inserts the job for a label event, a sub-issue or a retry. Its generation is 1 + the issue's earlier jobs that were
+   * not ignored, and its branch follows from it. Null when the event or the retried job is already recorded, or an
+   * open job holds the issue.
    */
   insert(job: NewJob, now: number): Job | null;
   /**
@@ -142,6 +147,7 @@ type JobRow = {
   round_base: string | null;
   parent_id: string | null;
   progress: string | null;
+  retry_of: string | null;
 };
 
 type FeedbackRow = {
@@ -200,6 +206,7 @@ function parse(row: JobRow): Job {
     trigger: { eventId: row.trigger_event_id, actor: row.triggered_by, at: row.triggered_at },
     snapshot: JSON.parse(row.issue_json) as IssueSnapshot,
     parentId: row.parent_id as JobId | null,
+    retryOf: row.retry_of as JobId | null,
     progress: row.progress,
     projectId: row.project_id,
     hostId: row.host_id,
@@ -268,16 +275,17 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
 
   const insert = db.transaction((job: NewJob, now: number): Job | null => {
     if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
+    if (job.retryOf && db.prepare("SELECT 1 FROM issue_jobs WHERE retry_of = ?").get(job.retryOf)) return null;
     if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
-    if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
+    if (job.parentId && !job.retryOf && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ? AND retry_of IS NULL").get(job.parentId, job.issue)) return null;
     const { earlier } = db
       .prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'")
       .get(job.repo, job.issue) as { earlier: number };
     const generation = earlier + 1;
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, base_branch, branch, state, error, created_at, updated_at, parent_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         project_id, host_id, base_branch, branch, state, error, created_at, updated_at, parent_id, retry_of)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       job.id,
       job.repo,
@@ -296,6 +304,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       now,
       now,
       job.parentId ?? null,
+      job.retryOf ?? null,
     );
     return get(job.id);
   });
@@ -324,6 +333,12 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     },
     open(repo, issue) {
       const row = openRow(repo, issue);
+      return row ? parse(row) : null;
+    },
+    latest(repo, issue) {
+      const row = db
+        .prepare("SELECT * FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored' ORDER BY generation DESC LIMIT 1")
+        .get(repo, issue) as JobRow | undefined;
       return row ? parse(row) : null;
     },
     due(now) {

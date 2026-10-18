@@ -33,6 +33,7 @@ import {
   moreFacts,
   isReasoningLevel,
   plan,
+  retryable,
   settle,
   stop as stopChange,
   type Action,
@@ -104,6 +105,7 @@ export type Issues = {
 };
 
 export type ReportResult = { ok: true; message: string } | { ok: false; code: string; message: string };
+export type RetryResult = { ok: true; job: Job } | { ok: false; code: string; message: string };
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const isMissing = (error: unknown) => {
@@ -448,7 +450,9 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (!polled) return null;
     const created = store.children(parent.id);
     return polled.map((child) => {
-      const job = store.open(parent.repo, child.number) ?? created.find((row) => row.issue === child.number);
+      // The newest, so a retried child's outcome replaces the one it retried.
+      const newest = created.filter((row) => row.issue === child.number).sort((a, b) => b.generation - a.generation)[0];
+      const job = store.open(parent.repo, child.number) ?? newest;
       return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged" } : null };
     });
   }
@@ -629,6 +633,63 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!TERMINAL.has(child.phase.state)) await stop(child.id, `parent ${id}`);
     }
     return true;
+  }
+
+  /**
+   * Starts a new job for a stuck or stopped job's issue, on the repository's current mapping and worker. It copies the
+   * old job's trigger, snapshot and parent; a top-level issue that has sub-issues gets a parent job again.
+   */
+  async function retry(id: JobId): Promise<RetryResult> {
+    const refuse = (code: string, message: string): RetryResult => ({ ok: false, code, message });
+    const job = store.get(id);
+    if (!job) return refuse("job_not_found", `no issue job ${id}`);
+    const refusal = () => retryable(job, store.latest(job.repo, job.issue), store.open(job.repo, job.issue), job.parentId ? store.get(job.parentId) : null);
+    const refused = refusal();
+    if (refused) return refuse(refused.code, refused.message);
+    const mapping = deps.repos().find((candidate) => candidate.repo === job.repo);
+    if (!mapping) return refuse("repo_unmapped", `${job.repo} is not in issueRepos`);
+    const { primaryHostId } = await bb.sdk.system.config();
+    if (mapping.hostId === primaryHostId) return refuse("primary_host", `host ${mapping.hostId} is the bb server's machine; map ${job.repo} to another host`);
+    const worker = await resolveWorker(mapping);
+    if ("error" in worker) {
+      return worker.permanent
+        ? refuse("worker_unavailable", `issue worker cannot run on host ${mapping.hostId}: ${worker.error}`)
+        : refuse("unavailable", `could not resolve the issue worker, try again shortly: ${worker.error}`);
+    }
+    let read: { tracking: boolean; baseBranch: string };
+    try {
+      const repo = github.repo(job.repo);
+      const issue = await repo.issue(job.issue);
+      if (!issue.open) return refuse("issue_closed", `${job.repo}#${job.issue} is closed`);
+      if (!job.parentId && !issue.labels.includes(LABEL.trigger)) return refuse("label_missing", `${job.repo}#${job.issue} no longer has the ${LABEL.trigger} label`);
+      const [subIssues, baseBranch] = await Promise.all([job.parentId ? [] : repo.subIssues(job.issue), repo.defaultBranch()]);
+      read = { tracking: subIssues.length > 0, baseBranch };
+    } catch (error) {
+      return refuse("unavailable", `could not read ${job.repo}#${job.issue} on GitHub, try again shortly: ${message(error)}`);
+    }
+    const inserted = store.insert(
+      {
+        id: `psi_${randomUUID()}` as JobId,
+        repo: job.repo,
+        issue: job.issue,
+        trigger: { ...job.trigger, eventId: null },
+        snapshot: job.snapshot,
+        ...(job.parentId ? { parentId: job.parentId } : {}),
+        retryOf: job.id,
+        projectId: mapping.projectId,
+        hostId: mapping.hostId,
+        baseBranch: read.baseBranch,
+        state: read.tracking ? "tracking" : "queued",
+        error: null,
+      },
+      clock(),
+    );
+    if (!inserted) {
+      const now = refusal();
+      return now ? refuse(now.code, now.message) : refuse("superseded", `job ${id} was already retried`);
+    }
+    background(tick(inserted.id));
+    return { ok: true, job: inserted };
   }
 
   async function onThread(threadId: string): Promise<void> {
@@ -819,7 +880,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   };
 
   return {
-    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, stop }),
+    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, stop, retry }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
         bb.events.on(event, ({ thread }) => {

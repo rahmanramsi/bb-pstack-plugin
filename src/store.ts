@@ -297,6 +297,68 @@ export const MIGRATIONS: readonly string[] = [
   // A sub-issue gets at most one child job per parent, so a stuck child is never recreated in a loop.
   `CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL`,
   `ALTER TABLE issue_job_polls ADD COLUMN children_json TEXT`,
+  // A retry is a job with neither a label event nor, at the top level, a parent, so issue_jobs is rebuilt again.
+  `CREATE TABLE issue_jobs_next (
+     id TEXT PRIMARY KEY,
+     version INTEGER NOT NULL DEFAULT 0,
+     repo TEXT NOT NULL,
+     issue INTEGER NOT NULL,
+     generation INTEGER NOT NULL,
+     trigger_event_id INTEGER UNIQUE,
+     triggered_by TEXT NOT NULL,
+     triggered_at INTEGER NOT NULL,
+     issue_json TEXT NOT NULL,
+     project_id TEXT NOT NULL,
+     host_id TEXT NOT NULL,
+     base_branch TEXT NOT NULL,
+     branch TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN (
+       'ignored','queued','working','needs-info','review','addressing','tracking','done','stopped','stuck',
+       'starting','publishing','asking','closing','stopping','sticking','sending','respawning','republishing','replying','updating')),
+     effects_json TEXT,
+     effect_tries INTEGER NOT NULL DEFAULT 0,
+     effect_first_at INTEGER,
+     effect_lease_until INTEGER,
+     effect_next_at INTEGER,
+     thread_id TEXT UNIQUE,
+     deadline INTEGER,
+     rejections INTEGER NOT NULL DEFAULT 0,
+     nudges INTEGER NOT NULL DEFAULT 0,
+     report_json TEXT,
+     pushed_sha TEXT,
+     pr_number INTEGER,
+     pr_url TEXT,
+     error TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     round INTEGER NOT NULL DEFAULT 1,
+     worker_json TEXT,
+     round_base TEXT,
+     parent_id TEXT,
+     progress TEXT,
+     retry_of TEXT UNIQUE,
+     CHECK ((state IN ('starting','publishing','asking','closing','stopping','sticking','sending','respawning','republishing','replying','updating')) = (effects_json IS NOT NULL)),
+     CHECK (state NOT IN ('working','needs-info','review','addressing','sending') OR thread_id IS NOT NULL),
+     CHECK (state NOT IN ('review','addressing','sending','respawning','republishing','replying') OR (pr_number IS NOT NULL AND pushed_sha IS NOT NULL)),
+     CHECK (parent_id IS NULL OR trigger_event_id IS NULL),
+     CHECK (trigger_event_id IS NOT NULL OR parent_id IS NOT NULL OR retry_of IS NOT NULL)
+   )`,
+  `INSERT INTO issue_jobs_next (id, version, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
+       project_id, host_id, base_branch, branch, state, effects_json, effect_tries, effect_first_at, effect_lease_until,
+       effect_next_at, thread_id, deadline, rejections, nudges, report_json, pushed_sha, pr_number, pr_url, error, created_at,
+       updated_at, round, worker_json, round_base, parent_id, progress)
+     SELECT id, version, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
+       project_id, host_id, base_branch, branch, state, effects_json, effect_tries, effect_first_at, effect_lease_until,
+       effect_next_at, thread_id, deadline, rejections, nudges, report_json, pushed_sha, pr_number, pr_url, error, created_at,
+       updated_at, round, worker_json, round_base, parent_id, progress
+     FROM issue_jobs`,
+  `DROP TABLE issue_jobs`,
+  `ALTER TABLE issue_jobs_next RENAME TO issue_jobs`,
+  `CREATE UNIQUE INDEX issue_jobs_open ON issue_jobs (repo, issue)
+     WHERE state NOT IN ('ignored','done','stopped','stuck')`,
+  `CREATE INDEX issue_jobs_due ON issue_jobs (state, created_at)`,
+  // A retried child keeps its parent, so only the child the parent's poll created is unique per sub-issue.
+  `CREATE UNIQUE INDEX issue_jobs_child ON issue_jobs (parent_id, issue) WHERE parent_id IS NOT NULL AND retry_of IS NULL`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

@@ -49,9 +49,12 @@ Operators inspect jobs from bb:
 bb pstack issues list                 # each repository's last poll and its error, its open jobs, and each issue's stuck job with the reason
 bb pstack issues show <job>           # thread, pull request, last error, and the repository's last poll
 bb pstack issues stop <job>
+bb pstack issues retry <job>          # a new job for a stuck or stopped job's issue
 ```
 
-A stuck job waits for a person, so `issues list` and the app's board show it with its reason until a newer job on the issue replaces it. `--all` adds every finished, stopped, ignored and replaced job. The poll reads only open jobs.
+A stuck job waits for a person, so `issues list` and the app's board show it with its reason and the retry command until a newer job on the issue replaces it. `--all` adds every finished, stopped, ignored and replaced job. The poll reads only open jobs.
+
+`issues retry` starts a new job on the issue with the old job's trigger, issue snapshot and parent, and with the repository's current mapping and issue worker. Only the issue's newest job can be retried, once, and only while no other job is open on the issue and the issue is still open. A top-level job's issue must still have the `agent` label, and an issue that has sub-issues gets a parent job again, which starts jobs for its open sub-issues. A sub-issue's job can be retried only while its parent job is still tracking, and the retry stays that parent's child. A worker that the mapped host cannot run refuses the retry and creates nothing. An issue worker cannot retry jobs.
 
 The worker thread uses one command. The plugin CLI has no stdin, so the worker writes the report to a file on its machine and passes the path:
 
@@ -227,7 +230,7 @@ Past a limit the job moves to `stuck`, which stops the worker and removes its st
 
 - `issue_repos`: repository, the label poll cursor (`since` and the ETag), the last poll time, and the last poll error. Its `feedback_json` column is no longer read.
 - `issue_job_polls`: one row per polled job: its cursor, its pull request's last state, when it was last polled, and the last error.
-- `issue_jobs`: one row per label event, unique on the event id. It holds the trigger, the issue snapshot, project, host, branch, generation, state, the outbox and its claim bookkeeping (`effects_json`, `effect_tries`, `effect_first_at`, `effect_lease_until`, `effect_next_at`), thread, deadline, rejections, reminders, the accepted report, the pushed commit, the pull request, the current round and its base, the worker's settings, the last error, and a version for compare-and-set writes. Its `CHECK` state lists repeat `job.ts`, and a test fails when they disagree. Step 2 rebuilt the table, because SQLite cannot alter a `CHECK`; existing jobs are in round 1.
+- `issue_jobs`: one row per label event, unique on the event id, per sub-issue a parent started, or per retry, unique on the retried job (`retry_of`). It holds the trigger, the issue snapshot, project, host, branch, generation, state, the outbox and its claim bookkeeping (`effects_json`, `effect_tries`, `effect_first_at`, `effect_lease_until`, `effect_next_at`), thread, deadline, rejections, reminders, the accepted report, the pushed commit, the pull request, the current round and its base, the worker's settings, the last error, and a version for compare-and-set writes. Its `CHECK` state lists repeat `job.ts`, and a test fails when they disagree. Step 2 rebuilt the table, because SQLite cannot alter a `CHECK`; existing jobs are in round 1.
 - `issue_rounds`: one row per round, keyed by job and ordinal. It holds the kind (`initial` or `feedback`), when the round started, the branch head it started from, the accepted report, the commit it pushed, and when it ended.
 - `issue_feedback`: one row per counted review, inline comment, or conversation comment that mentions the App, keyed by repository, kind, and GitHub id, which dedupes repeated polls. It holds the job, the pull request, the author, the body, and the file, line, diff hunk and review of an inline comment. A follow-up also holds the thread comment it answers, with that comment's author and text. Each row records when it was made and when it became visible. `round` is null while the item waits, and is set to the round that sent it.
 

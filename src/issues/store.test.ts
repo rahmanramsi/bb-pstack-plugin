@@ -107,6 +107,49 @@ test("without all, a stuck job is listed while it is the newest job on its issue
   assert.deepEqual(store.openJobs(REPO).map((job) => job.id), [open.id]);
 });
 
+test("a retry is recorded once, keeps a sub-issue's parent, and is the issue's latest job", () => {
+  const { db, store } = setup();
+  const stuck = store.insert(newJob(), 10)!;
+  store.write(stuck.id, 0, { phase: { state: "stuck" } }, 11);
+  store.insert(newJob({ state: "ignored", error: "@drive-by has read permission" }), 12);
+  assert.equal(store.latest(REPO, 41)!.id, stuck.id);
+
+  const retry = store.insert(newJob({ trigger: { eventId: null, actor: "maya", at: 1 }, retryOf: stuck.id }), 13)!;
+  assert.equal(retry.retryOf, stuck.id);
+  assert.equal(retry.generation, 2);
+  assert.equal(store.latest(REPO, 41)!.id, retry.id);
+  store.write(retry.id, 0, { phase: { state: "stopped" } }, 14);
+  assert.equal(store.insert(newJob({ trigger: { eventId: null, actor: "maya", at: 1 }, retryOf: stuck.id }), 15), null, "a job is retried once");
+  assert.equal(store.latest(REPO, 99), null);
+
+  const parent = store.insert(newJob({ issue: 50, state: "tracking" }), 20)!;
+  const child = store.insert(newJob({ issue: 51, trigger: { eventId: null, actor: "maya", at: 1 }, parentId: parent.id }), 21)!;
+  store.write(child.id, 0, { phase: { state: "stuck" } }, 22);
+  assert.equal(store.insert(newJob({ issue: 51, trigger: { eventId: null, actor: "maya", at: 1 }, parentId: parent.id }), 23), null, "the poll creates one child per sub-issue");
+  const retriedChild = store.insert(newJob({ issue: 51, trigger: { eventId: null, actor: "maya", at: 1 }, parentId: parent.id, retryOf: child.id }), 24)!;
+  assert.deepEqual(store.children(parent.id).map((job) => job.id), [child.id, retriedChild.id]);
+
+  const insert = db.prepare(
+    `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch, state, created_at, updated_at, parent_id, retry_of)
+     VALUES (?, 'acme/web', 60, 1, ?, 'maya', 1, '{}', 'p', 'h', 'main', 'b', 'queued', 1, 1, ?, ?)`,
+  );
+  assert.throws(() => insert.run(nextId(), null, null, null), /CHECK/, "a job needs a label event, a parent or a retried job");
+  assert.throws(() => insert.run(nextId(), 7_000, parent.id, null), /CHECK/, "a sub-issue's job has no label event");
+});
+
+test("the retry migration keeps every existing job", () => {
+  const db = new Database(":memory:");
+  const rebuild = MIGRATIONS.map((statement) => statement.startsWith("CREATE TABLE issue_jobs_next")).lastIndexOf(true);
+  for (const statement of MIGRATIONS.slice(0, rebuild)) db.exec(statement);
+  db.prepare(
+    `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch, state, error, created_at, updated_at, round, worker_json, progress)
+     VALUES ('psi_old', 'acme/web', 41, 1, 77, 'maya', 1, '{"title":"t","body":"b","url":"u","author":"maya"}', 'p', 'h', 'main', 'agent/issue-41-t', 'stuck', 'no model', 5, 6, 1, NULL, 'p1')`,
+  ).run();
+  for (const statement of MIGRATIONS.slice(rebuild)) db.exec(statement);
+  const job = openIssueStore(db, () => {}).get("psi_old" as JobId)!;
+  assert.deepEqual([job.trigger.eventId, job.phase.state, job.error, job.progress, job.retryOf, job.createdAt], [77, "stuck", "no model", "p1", null, 5]);
+});
+
 test("repository poll state is stored per repository", () => {
   const { store } = setup();
   assert.deepEqual(store.repoPoll(REPO), { poll: null, polledAt: null, error: null });
