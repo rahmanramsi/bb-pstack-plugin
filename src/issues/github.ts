@@ -6,7 +6,7 @@
 import { createHash, createPrivateKey, createSign } from "node:crypto";
 import { z } from "zod";
 import type { PolledFeedback, PullState, RepoName, Sha } from "./job.ts";
-import { CONVENTIONAL_TITLE } from "./text.ts";
+import { COMMENT_MAX, CONVENTIONAL_TITLE, statusComment } from "./text.ts";
 
 export type GitHubCredentials = { appId: string; privateKey: string };
 
@@ -721,12 +721,13 @@ export function createGitHub(options: GitHubOptions): GitHub {
     }
 
     async function upsertIssueStatus(input: { issue: number; marker: string; revision: number; body: string }): Promise<{ commentId: number }> {
+      const body = statusComment(input.body, input.revision, input.marker);
       if (!Number.isSafeInteger(input.issue) || input.issue < 1 || !Number.isSafeInteger(input.revision) || input.revision < 0 || !/^<!--[^\r\n]+-->$/.test(input.marker)) {
         throw new GitHubPermanentError("invalid issue status identity or revision", 422);
       }
+      if (body.length > COMMENT_MAX) throw new GitHubPermanentError(`issue status is ${body.length} characters; GitHub's limit is ${COMMENT_MAX}`, 422);
       const login = await appLogin();
       const appId = Number(credentials().appId);
-      const body = `${input.body.trimEnd()}\n\n<!-- pstack:status-revision:${input.revision} -->\n${input.marker}`;
       const owned = (comment: z.infer<typeof StatusCommentSchema>) => comment.user?.login === login && comment.user.type === "Bot"
         && comment.performed_via_github_app?.id === appId && endsWith(comment.body ?? "", input.marker)
         && comment.issue_url === `${apiUrl}${base}/issues/${input.issue}`;

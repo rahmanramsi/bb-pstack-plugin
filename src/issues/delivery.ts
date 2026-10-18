@@ -1,6 +1,7 @@
 import { EFFECT_POLICY, LABEL, TERMINAL, type Effect, type EffectMode, type EffectOutcome, type Job } from "./job.ts";
 import { GitHubTransientError, type GitHub } from "./github.ts";
 import type { IssueStore } from "./store.ts";
+import { statusMarker } from "./text.ts";
 
 export const STATUS_AUDIT_MS = 60 * 60_000;
 export const DELIVERY_RETRY_MS = 60_000;
@@ -37,7 +38,7 @@ export function createStatusDelivery({ store, github, clock, runEffect }: Delive
             let nextAt = clock() + STATUS_AUDIT_MS;
             let notBefore = 0;
             try {
-              await github.repo(status.repo, AbortSignal.timeout(50_000)).upsertIssueStatus({ issue: status.issue, marker: `<!-- pstack:issue-status:${status.repo}:${status.issue} -->`, revision: status.revision, body: status.body });
+              await github.repo(status.repo, AbortSignal.timeout(50_000)).upsertIssueStatus({ issue: status.issue, marker: statusMarker(status.repo, status.issue), revision: status.revision, body: status.body });
             } catch (failure) {
               error = failure instanceof Error ? failure.message : String(failure);
               notBefore = failure instanceof GitHubTransientError ? failure.notBefore ?? 0 : 0;

@@ -936,6 +936,13 @@ test("status upsert creates once, updates the same App-owned comment repeatedly 
   assert.deepEqual(await repo.upsertIssueStatus(statusInput(3)), { commentId: 11 });
 });
 
+test("a status that would exceed GitHub's comment limit is refused before any request", async () => {
+  const { repo } = statusSetup();
+  seen = [];
+  await assert.rejects(repo.upsertIssueStatus({ ...statusInput(), body: "x".repeat(65_500) }), (error) => error instanceof GitHubPermanentError && error.status === 422);
+  assert.deepEqual(seen, []);
+});
+
 test("status reconciliation paginates without cutoff, keeps oldest owned comment and removes only rechecked duplicates", async () => {
   const { repo, comments } = statusSetup();
   comments.set(1, markedComment(1));

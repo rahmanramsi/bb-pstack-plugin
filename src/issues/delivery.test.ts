@@ -8,7 +8,7 @@ import { createStatusDelivery, STATUS_AUDIT_MS, STATUS_CONCURRENCY } from "./del
 import { createGitHub, GitHubTransientError } from "./github.ts";
 import { initialControl, LABEL, type EffectOutcome, type JobId, type RepoName, type Sha } from "./job.ts";
 import { openIssueStore } from "./store.ts";
-import { statusBody } from "./text.ts";
+import { COMMENT_MAX, statusBody, statusComment, statusMarker } from "./text.ts";
 
 const REPO = "acme/web" as RepoName;
 const SHA = "1".repeat(40) as Sha;
@@ -40,6 +40,7 @@ async function fixture(t: TestContext) {
       response.setHeader("retry-after", String(failures.retrySeconds));
       return send(429, { message: "slow down" });
     }
+    if (body && typeof body === "object" && "body" in body && typeof body.body === "string" && body.body.length > COMMENT_MAX) return send(422, { message: "body is too long (maximum is 65536 characters)" });
     if (path.includes("/issues/") && path.endsWith("/comments")) {
       if (failures.status-- > 0) {
         response.setHeader("retry-after", String(failures.retrySeconds));
@@ -89,7 +90,8 @@ async function fixture(t: TestContext) {
       }
     } });
   };
-  return { db, clock, requests, comments, failures, insert, build, get store() { return store; }, restart() { store = openIssueStore(db, () => {}); }, labelPosts: () => requests.filter((request) => request.method === "POST" && request.path.endsWith("/labels")), statusReads: () => requests.filter((request) => request.method === "GET" && request.path.endsWith("/comments")) };
+  const status = () => [...comments.values()].filter((comment) => comment.body.includes("pstack:issue-status"));
+  return { db, clock, requests, comments, failures, insert, build, status, get store() { return store; }, restart() { store = openIssueStore(db, () => {}); }, labelPosts: () => requests.filter((request) => request.method === "POST" && request.path.endsWith("/labels")), statusReads: () => requests.filter((request) => request.method === "GET" && request.path.endsWith("/comments")) };
 }
 
 test("one eligible label attempt retains Retry-After across revisions, audits, restart and overlap", async (t) => {
@@ -281,4 +283,72 @@ test("new generations retain the live issue lease and old responses cannot ackno
   assert.equal(h.store.delivery(REPO, 41).pending, false);
   assert.equal([...h.comments.values()].filter((comment) => comment.body.includes("pstack:issue-status")).length, 1);
   assert.deepEqual(h.db.prepare("SELECT count(*) AS n FROM issue_status WHERE issue = 41").get(), { n: 1 });
+});
+
+test("oversized accepted changes deliver a bounded status that keeps the outcome, pull request, commit and branch", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  const verification = ["v".repeat(70_000), ...Array.from({ length: 3_000 }, (_, index) => `check ${index} passed`)];
+  const summary = "@a ".repeat(30_000);
+  job = h.store.write(job.id, job.version, { phase: { state: "review" }, threadId: "thread", pushedSha: SHA, pr: { number: 5, url: "https://github.test/pull/5" }, control: { ...job.control, readiness: { pr: 5, head: SHA, base: SHA } }, report: { outcome: "changes", headSha: SHA, acceptedAt: h.clock.now, pr: { title: "fix", body: "fix" }, summary, verification } }, h.clock.now)!;
+  await h.build()();
+  const [comment] = h.status();
+  assert.ok(comment, h.store.delivery(REPO, 41).error ?? "no status comment");
+  assert.ok(comment.body.length <= COMMENT_MAX, String(comment.body.length));
+  assert.match(comment.body, /^Issue #41: Ready for review/);
+  assert.match(comment.body, /Pull request: https:\/\/github\.test\/pull\/5/);
+  assert.match(comment.body, new RegExp(`Reported commit: ${SHA}`));
+  assert.match(comment.body, /Branch: `agent\//);
+  assert.match(comment.body, /Truncated to fit GitHub's comment limit/);
+  assert.doesNotMatch(comment.body, /(^|[^`])@a\b/);
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
+  assert.deepEqual(h.store.get(job.id)!.report!.verification, verification);
+  assert.equal(h.store.get(job.id)!.report!.summary, summary);
+});
+
+test("a huge failure reason and child progress cannot hide the failed outcome or the policy limitation", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  const limitation = "Branch policy could not be inspected: rules are unavailable.";
+  job = h.store.write(job.id, job.version, { phase: { state: "stuck" }, control: { ...job.control, disposition: "failure", publicFailure: { kind: "report", reason: "r".repeat(100_000) }, preservedSha: SHA, policyLimitation: limitation, childrenProgress: `**Sub-issues: 0 of 5000 closed**\n\n${Array.from({ length: 5_000 }, (_, index) => `- [ ] #${index + 100} ${"t".repeat(30)} (queued)`).join("\n")}` } }, h.clock.now)!;
+  await h.build()();
+  const [comment] = h.status();
+  assert.ok(comment, h.store.delivery(REPO, 41).error ?? "no status comment");
+  assert.ok(comment.body.length <= COMMENT_MAX, String(comment.body.length));
+  assert.match(comment.body, /^Issue #41: Failed/);
+  assert.ok(comment.body.includes(limitation));
+  assert.match(comment.body, /Reason: r+/);
+  assert.match(comment.body, new RegExp(`Preserved commit: ${SHA}`));
+  assert.match(comment.body, /Branch: `agent\//);
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
+});
+
+test("a status body that fits alone still fits once the revision and identity markers are added", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  const shell = statusBody(h.store.write(job.id, job.version, { phase: { state: "done" }, control: { ...job.control, disposition: "no-change" }, report: { outcome: "no-change", headSha: SHA, acceptedAt: h.clock.now, summary: "x", verification: [] } }, h.clock.now)!).length;
+  job = h.store.get(job.id)!;
+  job = h.store.write(job.id, job.version, { report: { outcome: "no-change", headSha: SHA, acceptedAt: h.clock.now, summary: "x".repeat(COMMENT_MAX - shell - 10), verification: [] } }, h.clock.now)!;
+  await h.build()();
+  const [comment] = h.status();
+  assert.ok(comment, h.store.delivery(REPO, 41).error ?? "no status comment");
+  assert.ok(comment.body.length <= COMMENT_MAX, String(comment.body.length));
+  assert.match(comment.body, /^Issue #41: No change needed/);
+  assert.match(comment.body, /<!-- pstack:issue-status:acme\/web:41 -->$/);
+  assert.equal(h.store.delivery(REPO, 41).pending, false);
+});
+
+test("mention-dense prose in every field stays within the limit for the longest repository name", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  const repo = `${"o".repeat(39)}/${"r".repeat(100)}` as RepoName;
+  const dense = (size: number) => "@a ".repeat(size);
+  job = h.store.write(job.id, job.version, { phase: { state: "stuck" }, control: { ...job.control, disposition: "failure", publicFailure: { kind: "report", reason: dense(20_000) }, childrenProgress: dense(20_000), policyLimitation: "Branch policy could not be inspected." }, report: { outcome: "failure", reason: dense(20_000), headSha: SHA, acceptedAt: h.clock.now, summary: dense(20_000), verification: Array.from({ length: 5_000 }, () => dense(10)) } }, h.clock.now)!;
+  const body = statusBody({ ...job, repo });
+  const posted = statusComment(body, Number.MAX_SAFE_INTEGER, statusMarker(repo, job.issue));
+  assert.ok(posted.length <= COMMENT_MAX, String(posted.length));
+  assert.ok(posted.length > COMMENT_MAX / 2, String(posted.length));
+  assert.match(body, /^Issue #41: Failed\n\nBranch policy could not be inspected\./);
+  assert.match(body, new RegExp(`Reported commit: ${SHA}`));
+  assert.doesNotMatch(body, /(^|[^`])@a\b/);
 });

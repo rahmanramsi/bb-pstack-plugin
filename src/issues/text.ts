@@ -336,11 +336,44 @@ const ISSUE_STAGE: Record<Job["phase"]["state"], string> = {
   stuck: "Failed",
 };
 
+const TRUNCATED = "[Truncated to fit GitHub's comment limit.]";
+
+export function statusMarker(repo: Job["repo"], issue: number): string {
+  return `<!-- pstack:issue-status:${repo}:${issue} -->`;
+}
+
+/** The status comment as posted: the body, then its revision, then the identity marker on the last line. */
+export function statusComment(body: string, revision: number, marker: string): string {
+  return `${body.trimEnd()}\n\n<!-- pstack:status-revision:${revision} -->\n${marker}`;
+}
+
+/** Shares `room` among the lengths, smallest first, so short fields stay whole. */
+function allocate(lengths: readonly number[], room: number): number[] {
+  const limits = lengths.map(() => 0);
+  const order = lengths.map((_, index) => index).sort((a, b) => lengths[a]! - lengths[b]!);
+  order.forEach((index, rank) => {
+    limits[index] = Math.min(lengths[index]!, Math.floor(room / (order.length - rank)));
+    room -= limits[index]!;
+  });
+  return limits;
+}
+
+function clipped(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const end = /[\uD800-\uDBFF]/.test(text[limit - 1] ?? "") ? limit - 1 : limit;
+  return `${text.slice(0, end)}\n\n${TRUNCATED}`;
+}
+
+/**
+ * The status comment's body, within GitHub's limit once `statusComment` wraps it. Only the report's prose and the
+ * sub-issue progress are cut; the store keeps the full report.
+ */
 export function statusBody(job: Job): string {
   const result = job.control.disposition;
   const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : ISSUE_STAGE[job.phase.state];
   const failure = job.control.publicFailure;
   let reason: string | null = null;
+  let reported: string | null = null;
   if (result === "failure") {
     switch (failure?.kind) {
       case "workflow-permission": reason = "Workflow changes require a workflow write permission that is unavailable. The work is preserved."; break;
@@ -348,21 +381,32 @@ export function statusBody(job: Job): string {
       case "prerequisite": reason = `Prerequisite work did not complete${failure.issues.length ? ` for ${failure.issues.map((issue) => `#${issue}`).join(", ")}` : ""}.`; break;
       case "verification": reason = "The current contribution could not be verified for review. The work is preserved."; break;
       case "recovery-exhausted": reason = "Automatic worker recovery was exhausted. The work is preserved."; break;
-      case "report": reason = failure.reason; break;
+      case "report": reported = failure.reason; break;
       case "execution":
       case undefined: reason = "Execution failed. The work is preserved."; break;
       default: { const exhaustive: never = failure; return exhaustive; }
     }
   }
-  return issueText([
+  const verification = (job.report?.verification ?? []).map((line) => `- ${line}`).join("\n\n");
+  const prose = [job.control.childrenProgress, job.report?.summary ?? null, reported, verification || null];
+  const render = ([children, summary, because, checks]: (string | null)[]) => [
     `Issue #${job.issue}: ${status}`,
     job.control.policyLimitation,
-    job.control.childrenProgress,
-    job.report?.summary,
+    children,
+    summary,
+    because ? `Reason: ${because}` : null,
     reason ? `Reason: ${reason}` : null,
     job.pr ? `Pull request: ${job.pr.url}` : null,
     job.report?.headSha ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : job.control.preservedSha ? `Preserved commit: ${job.control.preservedSha}` : null,
     `Branch: \`${job.branch}\``,
-    ...(job.report?.verification ?? []).map((line) => `- ${line}`),
-  ].filter(Boolean).join("\n\n"));
+    checks,
+  ].flatMap((part) => (part ? [issueText(part)] : [])).filter(Boolean).join("\n\n");
+  const full = render(prose);
+  const budget = COMMENT_MAX - statusComment("", Number.MAX_SAFE_INTEGER, statusMarker(job.repo, job.issue)).length;
+  if (full.length <= budget) return full;
+  // Normalizing at most doubles text (a neutralized mention gains two backticks), so half the room always fits.
+  const fixed = render(prose.map((text) => text && TRUNCATED)).length;
+  const room = Math.max(0, Math.floor((budget - fixed) / 2) - prose.length);
+  const limits = allocate(prose.map((text) => text?.length ?? 0), room);
+  return render(prose.map((text, index) => text && clipped(text, limits[index]!)));
 }
