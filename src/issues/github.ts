@@ -56,6 +56,22 @@ export type LabelEvent = { id: number; actor: string; at: number };
 export type PollCursor = { readonly __brand: "PollCursor" };
 /** Opaque to callers, like PollCursor: one job's list cursors, ETags, and its pull request's last known reviews. */
 export type ActivityCursor = { readonly __brand: "ActivityCursor" };
+export type PullDetail = {
+  number: number; url: string; title: string; body: string; author: string; state: PullState; draft: boolean;
+  head: string; headSha: string; base: string;
+};
+export type IssueDetail = {
+  number: number; url: string; title: string; body: string; author: string; state: "open" | "closed"; labels: string[];
+  pull: boolean; comments: PolledComment[];
+};
+export type PullFeedback = {
+  reviews: { id: number; author: string; state: string; body: string; submittedAt: number }[];
+  inline: { id: number; author: string; path: string; line: number | null; inReplyTo: number | null; body: string; createdAt: number }[];
+  conversation: PolledComment[];
+};
+/** `conclusion` is null while the check runs. */
+export type CheckResult = { name: string; status: "queued" | "in_progress" | "completed"; conclusion: string | null; url: string | null };
+
 /** A comment in an issue's conversation. */
 export type PolledComment = { id: number; author: string; body: string; createdAt: number };
 
@@ -106,7 +122,22 @@ export type RepoClient = {
   removeLabel(issue: number, label: string): Promise<void>;
   comment(issue: number, body: string): Promise<{ id: number }>;
   createDraftPull(input: { head: string; base: string; title: string; body: string }): Promise<{ number: number; url: string }>;
-  editPull(pr: number, input: { body: string }): Promise<void>;
+  createPull(input: { head: string; base: string; title: string; body: string; draft: boolean }): Promise<{ number: number; url: string }>;
+  editPull(pr: number, input: { title?: string; body?: string; base?: string }): Promise<void>;
+  /** Merges an open pull request whose head is still `sha`. GitHub answers 405 when it cannot merge, 409 when the head moved. */
+  mergePull(pr: number, input: { sha: string; method: "merge" | "squash" | "rebase" }): Promise<{ sha: string }>;
+  /** A pull request with its head commit, or null when there is none with that number. */
+  pull(pr: number): Promise<PullDetail | null>;
+  /** The newest pull request, open or closed, whose head is this repository's `branch`. */
+  pullForBranch(branch: string): Promise<PullDetail | null>;
+  /** An issue with its conversation, or null when there is none with that number. Pull requests are issues too. */
+  issueDetail(issue: number): Promise<IssueDetail | null>;
+  /** A pull request's reviews, inline review comments and conversation comments, oldest first. */
+  feedback(pr: number): Promise<PullFeedback>;
+  /** Check runs and commit statuses on a commit. */
+  checks(sha: string): Promise<CheckResult[]>;
+  /** A fresh token for this one repository with only `contents: read`, and the HTTPS remote. Revoke it after the fetch. */
+  fetchCredentials(): Promise<{ remoteUrl: string; token: string }>;
   /** Answers in an inline thread. `commentId` must be the thread's first comment: GitHub refuses replies to replies. */
   replyToReviewComment(pr: number, commentId: number, body: string): Promise<{ id: number }>;
   /** An inline review comment's author and text, or null when it no longer exists. */
@@ -141,6 +172,15 @@ const repoOf = (item: RawLinkedIssue) => (item.repository?.full_name ?? item.rep
 type RawUser = { login: string } | null;
 type RawReviewComment = { id: number; body: string; user: RawUser; path: string; line: number | null; original_line?: number | null; diff_hunk: string; in_reply_to_id?: number; pull_request_review_id: number | null; created_at: string; updated_at: string };
 type RawComment = { id: number; body: string | null; user: RawUser; created_at: string; updated_at: string };
+type RawPull = {
+  number: number; html_url: string; title: string; body: string | null; user: RawUser; state: string; draft?: boolean;
+  merged_at?: string | null; head: { ref: string; sha: string }; base: { ref: string };
+};
+const pullDetail = (json: RawPull): PullDetail => ({
+  number: json.number, url: json.html_url, title: json.title, body: json.body ?? "", author: json.user?.login ?? "ghost",
+  state: json.state === "open" ? "open" : json.merged_at ? "merged" : "closed", draft: json.draft ?? false,
+  head: json.head.ref, headSha: json.head.sha, base: json.base.ref,
+});
 type RawReview = { id: number; body: string | null; user: RawUser; state: string; submitted_at?: string | null };
 
 /** Whether the last line of a body is `marker`: the App appends its marker there, after any text it quotes. */
@@ -534,6 +574,72 @@ export function createGitHub(options: GitHubOptions): GitHub {
       async createDraftPull(input) {
         const { json } = await call<{ number: number; html_url: string }>(auth, "POST", `${base}/pulls`, { body: { ...input, draft: true } });
         return { number: json.number, url: json.html_url };
+      },
+      async createPull(input) {
+        const { json } = await call<{ number: number; html_url: string }>(auth, "POST", `${base}/pulls`, { body: input });
+        return { number: json.number, url: json.html_url };
+      },
+      async pull(pr) {
+        const { status, json } = await call<RawPull>(auth, "GET", `${base}/pulls/${pr}`, { ok: [404] });
+        return status === 404 ? null : pullDetail(json);
+      },
+      async pullForBranch(branch) {
+        const owner = name.split("/")[0]!;
+        const { json } = await call<RawPull[]>(auth, "GET", `${base}/pulls?state=all&head=${encodeURIComponent(`${owner}:${branch}`)}&sort=created&direction=desc&per_page=10`);
+        return json[0] ? pullDetail(json[0]) : null;
+      },
+      async issueDetail(issue) {
+        type RawIssue = { number: number; html_url: string; title: string; body: string | null; user: RawUser; state: string; labels: ({ name: string } | string)[]; pull_request?: unknown };
+        const { status, json } = await call<RawIssue>(auth, "GET", `${base}/issues/${issue}`, { ok: [404] });
+        if (status === 404) return null;
+        const comments = await pages<RawComment>(auth, `${base}/issues/${issue}/comments?per_page=100`);
+        return {
+          number: json.number, url: json.html_url, title: json.title, body: json.body ?? "", author: json.user?.login ?? "ghost",
+          state: json.state === "open" ? "open" : "closed", labels: json.labels.map((label) => (typeof label === "string" ? label : label.name)),
+          pull: json.pull_request !== undefined,
+          comments: comments.map((comment) => ({ id: comment.id, author: comment.user?.login ?? "ghost", body: comment.body ?? "", createdAt: Date.parse(comment.created_at) })),
+        };
+      },
+      async feedback(pr) {
+        const [reviews, inline, conversation] = await Promise.all([
+          pages<RawReview>(auth, `${base}/pulls/${pr}/reviews?per_page=100`),
+          pages<RawReviewComment>(auth, `${base}/pulls/${pr}/comments?per_page=100`),
+          pages<RawComment>(auth, `${base}/issues/${pr}/comments?per_page=100`),
+        ]);
+        return {
+          reviews: reviews.flatMap((review) => (review.submitted_at ? [{ id: review.id, author: review.user?.login ?? "ghost", state: review.state, body: review.body ?? "", submittedAt: Date.parse(review.submitted_at) }] : [])),
+          inline: inline.map((comment) => ({ id: comment.id, author: comment.user?.login ?? "ghost", path: comment.path, line: comment.line ?? comment.original_line ?? null, inReplyTo: comment.in_reply_to_id ?? null, body: comment.body, createdAt: Date.parse(comment.created_at) })),
+          conversation: conversation.map((comment) => ({ id: comment.id, author: comment.user?.login ?? "ghost", body: comment.body ?? "", createdAt: Date.parse(comment.created_at) })),
+        };
+      },
+      async checks(sha) {
+        type RawRun = { name: string; status: CheckResult["status"]; conclusion: string | null; html_url: string | null };
+        const runs: RawRun[] = [];
+        let url: string | null = `${base}/commits/${sha}/check-runs?per_page=100`;
+        while (url) {
+          const reply = await request(auth, "GET", url);
+          if (reply.status !== 200) throw failure("GET", url, reply);
+          runs.push(...(reply.json as { check_runs: RawRun[] }).check_runs);
+          url = nextLink(reply.headers);
+        }
+        const { json } = await call<{ statuses: { context: string; state: string; target_url: string | null }[] }>(auth, "GET", `${base}/commits/${sha}/status`);
+        return [
+          ...runs.map((run) => ({ name: run.name, status: run.status, conclusion: run.conclusion, url: run.html_url })),
+          ...json.statuses.map((item) => ({
+            name: item.context,
+            status: item.state === "pending" ? ("in_progress" as const) : ("completed" as const),
+            conclusion: item.state === "pending" ? null : item.state,
+            url: item.target_url,
+          })),
+        ];
+      },
+      async fetchCredentials() {
+        const { token } = await mintToken(name, signal, { repositories: [name.split("/")[1]], permissions: { contents: "read" } });
+        return { remoteUrl: `${gitUrl}/${name}.git`, token };
+      },
+      async mergePull(pr, input) {
+        const { json } = await call<{ sha: string }>(auth, "PUT", `${base}/pulls/${pr}/merge`, { body: { sha: input.sha, merge_method: input.method } });
+        return { sha: json.sha };
       },
       async editPull(pr, input) {
         await call(auth, "PATCH", `${base}/pulls/${pr}`, { body: input });
