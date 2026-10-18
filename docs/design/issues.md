@@ -148,6 +148,8 @@ A feedback round's report also answers the round's comments:
 
 A pending report binds to the first commit pstack can inspect. If the worktree changes later, the worker must verify and report the current commit. Missing local Git objects trigger a fetch request to the authorized worker. A permanent prerequisite failure ends the job with the report and observed commit preserved.
 
+A prerequisite that temporarily loses readiness keeps the report pending without spending invalid-report or worker-recovery attempts. Reports from the current worker are also saved while a reminder or rejection notice is being delivered. Evaluation resumes after that delivery settles.
+
 **Validation.** pstack rejects a `changes` or `no-change` report and tells the worker every reason when any check fails:
 
 - The worktree has uncommitted or untracked changes.
@@ -189,7 +191,7 @@ Recovery runs as the transit state `recovering`:
 
 Each recovery starts a new worker epoch. Reports from an earlier epoch are kept and refused. A spawn whose result is uncertain is never repeated blindly. The probe adopts a thread that names the job and the current epoch. If several match, the job fails with the workspace kept. If none appears within 5 minutes, the job fails.
 
-Temporary pre-spawn environment observations wait and retry without claiming a spawn happened. Once a spawn call may have been issued, the probe-only rule applies. Reminder delivery is also persisted before the send. A lost SDK response can duplicate a reminder, but cannot silently discard it.
+Creating or provisioning environments and typed transient pre-spawn observations retry with increasing delays, for up to 8 observations. A missing, destroyed, or errored environment ends recovery with the work preserved. These observation attempts are separate from the spawn claim. Once a spawn call may have been issued, the probe-only rule applies. Reminder delivery is also persisted before the send. A lost SDK response can duplicate a reminder, but cannot silently discard it.
 
 A job gets 2 recoveries. The count resets once, when the job's first `changes` report is accepted. When recoveries run out, or the environment is conclusively unsafe to reuse, the job fails. Its public status names the failure category and retained commit; local details remain available in bb.
 
@@ -201,7 +203,7 @@ An accepted `changes` report enters `publishing`. The service pins three commits
 
 **Push through the host entry.** The worktree lives on a host, and the token lives on the server. The host entry (`src/host.ts`) never runs a worker's command. It offers fixed operations over Git objects:
 
-- `inspectCommit` reads pinned Git objects and finds their merge base. It returns whether the worker contribution is non-empty, whether unpublished changes touch `.github/workflows`, and whether HEAD contains the requested base and prerequisite commits. Workflow classification includes deletions, renames, and reverted unpublished ancestors.
+- `inspectCommit` reads pinned Git objects and finds their merge base. It returns whether the worker contribution is non-empty, whether unpublished changes touch `.github/workflows`, and whether HEAD contains the requested base and prerequisite commits. The comparison commit pins the current contribution base; a separate published commit excludes history already on the publication branch. Merging or rebasing upstream workflow updates alone does not require a workflow write grant. Worker workflow changes, deletions, reversions, and conflict resolutions remain classified as workflow changes.
 - `push` pushes one named commit to one branch that matches `agent/issue-<n>-<slug>`. The host builds `<sha>:refs/heads/<branch>` itself.
 
 The push works like this:
@@ -269,6 +271,8 @@ A job gets 5 feedback rounds (`MAX_FEEDBACK_ROUNDS`). New feedback after the fif
 
 A parent issue with sub-issues gets a `tracking` job. Each open sub-issue gets its own job, with the parent issue as context. A sub-issue blocked by an open sub-issue of the same parent waits until that blocker is closed, ready for review, merged, or needs no change. A ready blocker's branch and commit become prerequisites: the dependent worker merges them, and its report must contain them.
 
+The prerequisite commit is the head actually verified as ready, including a collaborator's commit adopted without a plugin push. Merged prerequisites use an observed merged pull request head. Historical records without that head require a fresh remote observation; the last plugin-pushed commit is not substituted. Temporary observation faults wait on the persisted poll schedule, while a permanent denial ends the dependent job with its work kept. A later prerequisite change does not reopen an already terminal job.
+
 The parent fails when a sub-issue's job fails, when blockers form a cycle, or when a blocker is outside the parent's sub-issues. Independent sub-issues keep going. Once every open sub-issue is ready, merged, or needs no change, the parent starts its own worker to merge the sub-issue branches and verify the combined result, and it then follows the same publication and readiness path. A sub-issue whose readiness is later lost returns the parent to draft. Stopping the parent, removing its label, or closing it stops the sub-issue jobs it created.
 
 ## Issue status on GitHub
@@ -277,15 +281,17 @@ Each issue has one status comment owned by the App. It states the outcome or cur
 
 A parent's public sub-issue progress stays visible during integration and after failure. It is stored separately from the instructions that tell its worker which branches to merge.
 
+The public comment fits GitHub's size limit, including its identity and revision markers. Oversized report prose and sub-issue progress carry an explicit truncation notice. The outcome, branch-policy limitation, fixed failure category, pull request, commit, and branch remain visible. The full report stays in the local store.
+
 The comment's desired text lives in the `issue_status` table, one row per repository and issue across all jobs on that issue. Every job write recomputes the text in the same transaction and raises the row's revision when the text changed or a newer job took over. A separate delivery loop, run after each poll and sweep, works through due rows:
 
 - It claims the row with a lease, finds every App-owned comment on the issue with the marker `<!-- pstack:issue-status:<repo>:<issue> -->`, edits the oldest, deletes the other App-owned copies, and creates the comment when none exists.
 - It acknowledges only the revision it delivered. A newer revision stays due.
-- It audits a delivered comment once an hour, so a deleted or edited comment is restored on the next audit. New desired text becomes due immediately, subject to any persisted GitHub cooldown.
+- It audits delivered comments hourly for active jobs and daily for terminal jobs. A deleted or edited comment is restored on the next audit. New desired text becomes due immediately, subject to any persisted GitHub cooldown.
 - The status labels (`agent:working` while active, `agent:review` when ready, none once the job ends), replies, and review requests are queued on the same row with their own retry times. An unchanged desired label set retains its retry time and is not rewritten on comment audits. A newer set supersedes stale issue labels without dropping replies or review requests.
 - At most four delivery leases are held across engines. Leases carry owner tokens across issue generations; an expired or replaced owner cannot settle newer work. A lost response may still require later reconciliation.
 
-A delivery error is stored on the row and shown in the app and in `issues show`. It never changes the job's outcome or holds back another job. Pending decoration retries remain due independently of the hourly comment audit. Terminal jobs are delivered the same way, so a failure reaches the issue once GitHub is reachable.
+A delivery error is stored on the row and shown in the app and in `issues show`. It never changes the job's outcome or holds back another job. Pending decoration retries remain due independently of the comment audit. A rate-limit deadline from a comment or decoration holds all delivery on that issue until the deadline, including after restart or a newer job generation. Other comment faults leave decoration delivery independent. Terminal jobs are delivered the same way, so a failure reaches the issue once GitHub is reachable.
 
 ## Inspecting jobs
 
