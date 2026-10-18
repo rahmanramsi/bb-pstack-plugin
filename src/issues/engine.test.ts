@@ -82,7 +82,7 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
     head: started.branch,
     base: "main",
     title: GOOD.pr.title,
-    body: "## Why\nThe footer covered the button on small screens.\n\n#41, cc `@maya`.\n\nCloses #41",
+    body: `## Why\nThe footer covered the button on small screens.\n\n#41, cc \`@maya\`.\n\nCloses #41\n\n<!-- pstack:pr:${started.id} -->`,
     draft: false,
   });
   assert.deepEqual([...pr.labels], ["agent"]);

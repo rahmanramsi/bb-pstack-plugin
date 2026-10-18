@@ -324,3 +324,61 @@ test("permanent essential PR observation denial ends checking but a transport ou
     }
   }
 });
+
+test("uncertain PR creation adopts only the App-owned publication marker for this job", async () => {
+  for (const marked of [true, false]) {
+    const h = harness();
+    h.label(41); await h.settle();
+    const worker = (await h.only()).threadId!;
+    const held = h.holdAt("POST /repos/acme/web/pulls", "github");
+    await h.report(worker, GOOD);
+    await held.hit;
+    const pull = [...h.gh().issues.values()].find((issue) => issue.pr)!;
+    if (!marked) pull.pr!.body = "An unrelated pull request on the same branch.";
+    h.restart(); h.clock.now += MIN + 1;
+    await h.settle();
+    const job = await h.only();
+    assert.equal(job.outcome, marked ? "ready" : "failure");
+    if (!marked) assert.match(job.error!, /publication marker/);
+    assert.equal([...h.gh().issues.values()].filter((issue) => issue.pr).length, 1);
+    held.free();
+  }
+});
+
+test("a definite PR validation 422 with no matching publication fails instead of retrying forever", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  h.gh().outages.push({ key: "POST /repos/acme/web/pulls", status: 422, times: Infinity });
+  await h.report((await h.only()).threadId!, GOOD);
+  await h.settle();
+  const failed = await h.only();
+  assert.equal(failed.outcome, "failure");
+  assert.equal(failed.pushedSha, SHA2);
+  assert.match(failed.error!, /validation failed[\s\S]*422/);
+  h.clock.now += 60 * MIN; await h.settle();
+  assert.equal((await h.only()).error, failed.error);
+  assert.equal([...h.gh().issues.values()].filter((issue) => issue.pr).length, 0);
+});
+
+test("a dirty legacy waiting job migrates and resumes exactly once in its original environment", async () => {
+  const id = "psi_00000000-0000-0000-0000-000000000041";
+  const legacyReport = JSON.stringify({ outcome: "needs-info", questions: ["Which API?"], verification: ["Read the existing interface"], summary: "Interface contract unavailable", headSha: SHA1, acceptedAt: 1 });
+  const h = harness({ beforeAutonomyUpgrade(db, now) {
+    db.prepare(`INSERT INTO issue_jobs (id,repo,issue,generation,trigger_event_id,triggered_by,triggered_at,issue_json,project_id,host_id,base_branch,branch,state,thread_id,report_json,worker_json,created_at,updated_at)
+      VALUES (?, 'acme/web',41,1,NULL,'the bb app',?,?,'prj_web','host_worker','main','agent/issue-41-old','needs-info','thr_legacy',?,?,?,?)`)
+      .run(id, now - MIN, JSON.stringify({ title: "Preserve legacy work", body: "Finish the interface", url: "https://github.com/acme/web/issues/41", author: "maya" }), legacyReport, JSON.stringify({ providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: "high", permissionMode: "full" }), now - MIN, now - MIN);
+  } });
+  h.threads.set("thr_legacy", { id: "thr_legacy", status: "idle", archivedAt: null, deletedAt: null, createdAt: h.clock.now - MIN, updatedAt: h.clock.now - MIN, projectId: "prj_web", originPluginId: "pstack", environmentId: "env_legacy", metadata: { pstackIssue: 1, jobId: id } });
+  h.worktrees.set("env_legacy", { headSha: SHA2, dirty: true, ahead: 1 });
+  h.label(41); await h.settle();
+  const resumed = await h.only();
+  assert.equal(resumed.state, "working");
+  assert.equal(h.spawned.length, 1);
+  assert.deepEqual(h.spawned[0]!.environment, { type: "reuse", environmentId: "env_legacy" });
+  assert.equal(h.worktrees.get("env_legacy")!.dirty, true);
+  assert.equal((h.db.prepare("SELECT report_json FROM issue_jobs WHERE id = ?").get(id) as { report_json: string }).report_json, legacyReport);
+  assert.equal((h.db.prepare("SELECT report_json FROM issue_legacy_archive WHERE id = ?").get(id) as { report_json: string }).report_json, legacyReport);
+  h.restart(); await h.settle();
+  assert.equal(h.spawned.length, 1);
+  assert.ok(!h.gh().comments.get(41)!.some((comment) => comment.body.includes("Which API?")));
+});

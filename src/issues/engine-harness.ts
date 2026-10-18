@@ -224,7 +224,7 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     if (method === "GET") {
       const issue = gh.issues.get(Number(match[1]));
       if (!issue?.pr) return [404, { message: "Not Found" }];
-      return etagged({ number: issue.number, node_id: `PR_${issue.number}`, html_url: `https://github.com/acme/web/pull/${issue.number}`, state: pull.state, merged: pull.merged, merged_at: pull.merged ? iso(gh.now()) : null, draft: issue.pr.draft, mergeable: gh.mergeable, mergeable_state: gh.mergeable ? "clean" : "dirty", head: { sha: gh.refs.get(issue.pr.head), ref: issue.pr.head, repo: { full_name: REPO } }, base: { sha: gh.refs.get("main"), ref: issue.pr.base, repo: { full_name: REPO } } });
+      return etagged({ title: issue.title, body: issue.pr.body, user: { login: issue.user }, number: issue.number, node_id: `PR_${issue.number}`, html_url: `https://github.com/acme/web/pull/${issue.number}`, state: pull.state, merged: pull.merged, merged_at: pull.merged ? iso(gh.now()) : null, draft: issue.pr.draft, mergeable: gh.mergeable, mergeable_state: gh.mergeable ? "clean" : "dirty", head: { sha: gh.refs.get(issue.pr.head), ref: issue.pr.head, repo: { full_name: REPO } }, base: { sha: gh.refs.get("main"), ref: issue.pr.base, repo: { full_name: REPO } } });
     }
     if (method === "PATCH") {
       gh.issues.get(Number(match[1]))!.pr!.body = body.body;
@@ -276,7 +276,7 @@ export type FakeThread = {
   pinnedAt?: number | null;
 };
 
-export function harness() {
+export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typeof Database>, now: number) => void } = {}) {
   const clock = { now: Date.parse("2026-10-17T12:00:00Z") };
   gh = {
     issues: new Map(),
@@ -436,7 +436,10 @@ export function harness() {
   } as unknown as BbPluginApi;
 
   const db = new Database(":memory:");
-  for (const statement of MIGRATIONS) db.exec(statement);
+  for (const statement of MIGRATIONS) {
+    if (statement.includes("CREATE TABLE issue_legacy_archive")) options.beforeAutonomyUpgrade?.(db, clock.now);
+    db.exec(statement);
+  }
   let repoLine = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
   let workerRole = "codex/gpt-6.1-sol/high";
 

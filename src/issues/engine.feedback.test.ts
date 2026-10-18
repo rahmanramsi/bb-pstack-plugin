@@ -169,7 +169,7 @@ for (const point of ROUND_CRASH_POINTS) {
     assert.equal(h.pushes.length, 2, "one push per round");
     assert.equal(appReplies(h, pr).length, 1, "one inline reply");
     assert.equal(appComments(h, pr).length, 1, "one reply to the review");
-    assert.equal(h.gh().issues.get(pr)!.pr!.body, "## Why\nRenamed helpers.\n\nCloses #41");
+    assert.equal(h.gh().issues.get(pr)!.pr!.body, `## Why\nRenamed helpers.\n\nCloses #41\n\n<!-- pstack:pr:${job.id} -->`);
     assert.deepEqual([...h.gh().pulls.get(pr)!.requested], ["maya"]);
     assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", "agent:review"]);
     held.free();

@@ -256,6 +256,16 @@ export function createIssues(deps: IssuesDeps): Issues {
     };
   }
 
+  async function probePublication(job: Job, effect: Extract<Effect, { op: "open-pr" }>, repo: RepoClient): Promise<EffectOutcome> {
+    const pr = await repo.findPull(job.branch);
+    if (!pr) return { kind: "absent" };
+    const details = await repo.pull(pr.number);
+    if (!details || details.author !== await repo.appLogin() || details.body.trimEnd().split("\n").at(-1) !== effectMarker(effect.key)) return { kind: "fail", error: "the existing pull request lacks this job publication marker or App ownership" };
+    const snapshot = await repo.reviewSnapshot(pr.number);
+    if (!snapshot || snapshot.state !== "open" || snapshot.headRepository !== job.repo || snapshot.headBranch !== job.branch || snapshot.baseBranch !== job.baseBranch || snapshot.head !== job.pushedSha) return { kind: "fail", error: "the existing pull request does not match this job publication" };
+    return done({ pr });
+  }
+
   const EFFECTS: { readonly [Op in EffectOp]: EffectHandler<Op> } = {
     labels: {
       async perform(job, effect, deadline) {
@@ -337,19 +347,18 @@ export function createIssues(deps: IssuesDeps): Issues {
     "open-pr": {
       async perform(job, effect, deadline) {
         try {
-          const pr = await github.repo(job.repo, until(deadline)).createDraftPull({ head: job.branch, base: job.baseBranch, title: effect.title, body: effect.body });
+          const pr = await github.repo(job.repo, until(deadline)).createDraftPull({ head: job.branch, base: job.baseBranch, title: effect.title, body: commentBody(effect.body, effect.key) });
           return done({ pr });
         } catch (error) {
-          if (error instanceof GitHubPermanentError && error.status === 422) return { kind: "unknown", error: error.message };
+          if (error instanceof GitHubPermanentError && error.status === 422) {
+            const observed = await probePublication(job, effect, github.repo(job.repo, until(deadline)));
+            return observed.kind === "absent" ? { kind: "fail", error: `pull request validation failed and no matching publication exists: ${error.message}` } : observed;
+          }
           throw error;
         }
       },
-      async probe(job, _effect, deadline) {
-        const pr = await github.repo(job.repo, until(deadline)).findPull(job.branch);
-        if (!pr) return { kind: "absent" };
-        const snapshot = await github.repo(job.repo, until(deadline)).reviewSnapshot(pr.number);
-        if (!snapshot || snapshot.state !== "open" || snapshot.headRepository !== job.repo || snapshot.headBranch !== job.branch || snapshot.baseBranch !== job.baseBranch || snapshot.head !== job.pushedSha) return { kind: "fail", error: "the existing pull request does not match this job publication" };
-        return done({ pr });
+      async probe(job, effect, deadline) {
+        return probePublication(job, effect, github.repo(job.repo, until(deadline)));
       },
     },
     comment: {
@@ -415,7 +424,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     "edit-pr": {
       async perform(job, effect, deadline) {
         if (!job.pr) return { kind: "fail", error: "the pull request to edit is not recorded" };
-        await github.repo(job.repo, until(deadline)).editPull(job.pr.number, { body: effect.body });
+        await github.repo(job.repo, until(deadline)).editPull(job.pr.number, { body: commentBody(effect.body, `pr:${job.id}`) });
         return done();
       },
     },
