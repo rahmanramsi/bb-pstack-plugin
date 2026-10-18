@@ -123,6 +123,19 @@ const isMissing = (error: unknown) => {
   const candidate = error as { status?: unknown; code?: unknown } | null;
   return candidate?.status === 404 || candidate?.code === "thread_not_found";
 };
+const ObservationError = z.object({ status: z.number().optional(), statusCode: z.number().optional(), code: z.string().optional(), cause: z.unknown().optional() });
+function isTransientObservation(error: unknown): boolean {
+  for (let depth = 0; depth < 4; depth++) {
+    const parsed = ObservationError.safeParse(error);
+    if (!parsed.success) return false;
+    const { status, statusCode, code, cause } = parsed.data;
+    const http = status ?? statusCode;
+    if (http !== undefined) return [408, 429, 500, 502, 503, 504].includes(http);
+    if (code && ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET"].includes(code)) return true;
+    error = cause;
+  }
+  return false;
+}
 const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; environmentId: string; branch: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
@@ -450,7 +463,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           }
         } catch (error) {
           if (error instanceof GitHubSetupError || error instanceof GitHubPermanentError) return { kind: "fail", error: message(error) };
-          return error instanceof GitHubTransientError ? { kind: "retry-unissued", error: message(error), notBefore: error.notBefore } : { kind: "fail", error: `safe workspace observation failed: ${message(error)}; work retained at ${workspace.path}` };
+          return isTransientObservation(error) ? { kind: "retry-unissued", error: message(error), notBefore: null } : { kind: "fail", error: `safe workspace observation failed: ${message(error)}; work retained at ${workspace.path}` };
         }
         try {
           const thread = await bb.sdk.threads.spawn({ projectId: job.projectId, visibility: "visible", environment: { type: "reuse", environmentId: workspace.environmentId }, pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch }, prompt: recoveryPrompt(job), title: `Recover issue #${job.issue}`, providerId: settings.providerId, model: settings.model, reasoningLevel: settings.reasoningLevel, ...(settings.permissionMode ? { permissionMode: settings.permissionMode } : {}) });

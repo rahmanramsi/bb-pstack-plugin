@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createServer } from "node:http";
 import { GOOD, MIN, SHA2, harness } from "./engine-harness.ts";
 import { EFFECT_POLICY, recover } from "./job.ts";
 
@@ -118,6 +119,126 @@ test("pre-spawn transient observations grow backoff across restart and exhaust a
   assert.ok(gaps[1]! > gaps[0]!, JSON.stringify(gaps));
   assert.ok(observations.length <= 10);
   assert.equal(h.store.get(original.id)!.control.recoveries, 1);
+});
+
+for (const boundary of ["get", "status", "writers"] as const) {
+  for (const persistent of [false, true]) {
+    test(`${boundary} SDK transport failures ${persistent ? "exhaust a bounded observation budget" : "recover after restart without an uncertain spawn"}`, async () => {
+      let recovering = false;
+      let attempts = 0;
+      let wrapped = false;
+      let workerThread = "";
+      const observations: number[] = [];
+      const h = harness({ configureDeps(deps) {
+        if (wrapped) return;
+        wrapped = true;
+        const fail = () => {
+          if (!recovering || !persistent && attempts > 0) return;
+          const phase = h.store.byThread(workerThread)?.phase;
+          if (!phase || !("effects" in phase) || phase.effects[0]?.op !== "recover-worker") return;
+          observations.push(deps.clock!());
+          attempts++;
+          throw boundary === "status" ? Object.assign(new Error("SDK temporarily unavailable"), { statusCode: 503 }) : Object.assign(new Error("SDK temporarily unavailable"), { status: boundary === "get" ? 503 : 429 });
+        };
+        if (boundary === "get") {
+          const get = deps.bb.sdk.environments.get;
+          deps.bb.sdk.environments.get = async (args) => { fail(); return get(args); };
+        } else if (boundary === "status") {
+          const status = deps.bb.sdk.environments.status;
+          deps.bb.sdk.environments.status = async (args) => { fail(); return status(args); };
+        } else {
+          const list = deps.bb.sdk.threads.list;
+          deps.bb.sdk.threads.list = async (args) => { if (args?.environmentId) fail(); return list(args); };
+        }
+      } });
+      h.label(41); await h.settle();
+      const original = h.store.get((await h.only()).id)!;
+      workerThread = original.threadId!;
+      recovering = true;
+      h.store.write(original.id, original.version, recover(original, "idle worker"), h.clock.now);
+      await h.settle();
+      assert.equal((await h.only()).state, "recovering");
+      assert.equal(h.spawned.length, 1);
+      assert.equal(h.store.get(original.id)!.control.recoveryObservation!.attempts, 1);
+      for (let n = 0; n < 12 && (await h.only()).state === "recovering"; n++) {
+        const current = h.store.get(original.id)!;
+        assert.ok("nextAt" in current.phase && current.phase.nextAt !== null);
+        h.clock.now = current.phase.nextAt;
+        h.restart(); await h.settle();
+      }
+      const result = h.store.get(original.id)!;
+      assert.equal(result.control.recoveries, 1);
+      if (persistent) {
+        assert.equal((await h.only()).outcome, "failure");
+        assert.match(result.error!, /safe workspace observation exhausted/);
+        assert.equal(h.spawned.length, 1);
+        assert.ok(observations.length <= 10);
+        const gaps = observations.slice(1).map((at, n) => at - observations[n]!);
+        assert.ok(gaps[1]! > gaps[0]!, JSON.stringify(gaps));
+      } else {
+        assert.equal((await h.only()).state, "working");
+        assert.equal(h.spawned.length, 2);
+        assert.equal(h.spawned[1]!.environment.environmentId, original.control.workspace!.environmentId);
+      }
+    });
+  }
+}
+
+for (const status of [401, 403]) {
+  test(`SDK observation permission status ${status} remains terminal`, async () => {
+    let recovering = false;
+    const h = harness({ configureDeps(deps) {
+      const get = deps.bb.sdk.environments.get;
+      deps.bb.sdk.environments.get = async (args) => {
+        if (recovering) throw Object.assign(new Error("SDK access denied"), { status, cause: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }) });
+        return get(args);
+      };
+    } });
+    h.label(41); await h.settle();
+    const original = h.store.get((await h.only()).id)!;
+    recovering = true;
+    h.store.write(original.id, original.version, recover(original, "idle worker"), h.clock.now);
+    await h.settle();
+    assert.equal((await h.only()).outcome, "failure");
+    assert.equal(h.spawned.length, 1);
+    assert.equal(h.store.get(original.id)!.control.recoveryObservation, null);
+  });
+}
+
+test("an actual loopback SDK fetch disconnect uses bounded pre-spawn recovery", async (t) => {
+  const server = createServer((request) => request.socket.destroy());
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  let disconnected = false;
+  let observed = false;
+  const h = harness({ configureDeps(deps) {
+    const status = deps.bb.sdk.environments.status;
+    deps.bb.sdk.environments.status = async (args) => {
+      const phase = disconnected ? h.store.byThread(original.threadId!)?.phase : null;
+      if (phase && "effects" in phase && phase.effects[0]?.op === "recover-worker") {
+        observed = true;
+        await fetch(`http://127.0.0.1:${address.port}`);
+      }
+      return status(args);
+    };
+  } });
+  h.label(41); await h.settle();
+  const original = h.store.get((await h.only()).id)!;
+  disconnected = true;
+  h.store.write(original.id, original.version, recover(original, "idle worker"), h.clock.now);
+  await h.settle();
+  assert.equal(observed, true);
+  assert.equal((await h.only()).state, "recovering");
+  assert.equal(h.store.get(original.id)!.control.recoveryObservation!.attempts, 1);
+  disconnected = false;
+  const phase = h.store.get(original.id)!.phase;
+  assert.ok("nextAt" in phase && phase.nextAt !== null);
+  h.clock.now = phase.nextAt;
+  await h.settle();
+  assert.equal((await h.only()).state, "working");
+  assert.equal(h.spawned.length, 2);
 });
 
 test("a corrected report is retained while its asynchronous rejection notice is in flight", async () => {
