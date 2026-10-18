@@ -13,7 +13,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
-import { hostContract, type FetchInput, type FetchResult, type PushInput, type PushResult } from "./host-contract.ts";
+import { hostContract, type FetchInput, type FetchResult, type PushInput, type PushResult, type InspectCommitInput, type InspectCommitResult } from "./host-contract.ts";
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -115,6 +115,66 @@ async function withScratch<T>(worktreePath: string, tempDir: string, signal: Abo
   }
 }
 
+async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<InspectCommitResult> {
+  for (const sha of [input.sha, input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : [], ...input.ancestorShas ?? []]) {
+    if ((await git(["cat-file", "-e", `${sha}^{commit}`], env, signal)).code !== 0) return { kind: "missing-object", sha };
+  }
+  const common = await git(["merge-base", input.comparisonSha, input.sha], env, signal);
+  if (common.code !== 0) throw new Error("cannot establish a merge base for pinned Git objects");
+  const diff = await git(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", common.stdout.trim(), input.sha], env, signal);
+  const history = await git(["log", "--no-ext-diff", "--no-textconv", "--format=", "--name-only", "--no-renames", "--diff-merges=remerge", "-z", input.sha, "--not", input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : []], env, signal);
+  if (diff.code !== 0 || history.code !== 0) throw new Error("cannot inspect pinned Git objects");
+  let workflows = history.stdout.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));
+  if (!workflows) {
+    // Remerge omits octopus commits. Reconstruct each unpublished merge, including ones later reverted.
+    const octopus = await git(["rev-list", "--min-parents=3", "--parents", input.sha, "--not", input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : []], env, signal);
+    if (octopus.code !== 0) throw new Error("cannot inspect multi-parent contribution history");
+    for (const line of octopus.stdout.trim().split("\n").filter(Boolean)) {
+      const [commit, first, ...parents] = line.split(" ");
+      let merged = first!;
+      let tree = "";
+      for (const parent of parents) {
+        // Octopus has no rename detection. Upstream additions retain their original paths.
+        const merge = await git(["-c", "merge.renames=false", "merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", merged, parent], env, signal);
+        if (merge.code !== 0 && merge.code !== 1) throw new Error("cannot reconstruct multi-parent merge");
+        tree = merge.stdout.split("\n")[0]!;
+        const synthetic = await git(["-c", "user.name=pstack", "-c", "user.email=pstack@localhost", "commit-tree", tree, "-p", merged, "-p", parent, "-m", "Reconstruct merge tree"], env, signal);
+        if (synthetic.code !== 0) throw new Error("cannot record reconstructed merge parents");
+        merged = synthetic.stdout.trim();
+      }
+      const authored = await git(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", tree, commit!, "--", ".github/workflows/"], env, signal);
+      if (authored.code !== 0) throw new Error("cannot inspect multi-parent workflow contribution");
+      if (authored.stdout.length > 0) { workflows = true; break; }
+    }
+  }
+  if (input.publishedSha) {
+    const ancestor = await git(["merge-base", "--is-ancestor", input.publishedSha, input.sha], env, signal);
+    if (ancestor.code !== 0 && ancestor.code !== 1) throw new Error("cannot inspect pinned publication ancestry");
+    if (ancestor.code === 1) {
+      const oldBase = await git(["merge-base", input.comparisonSha, input.publishedSha], env, signal);
+      if (oldBase.code !== 0) throw new Error("cannot establish the published contribution base");
+      const oldContribution = await git(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", oldBase.stdout.trim(), input.publishedSha, "--", ".github/workflows/"], env, signal);
+      const replaced = await git(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", input.publishedSha, input.sha, "--", ".github/workflows/"], env, signal);
+      if (oldContribution.code !== 0 || replaced.code !== 0) throw new Error("cannot inspect replaced workflow contribution");
+      const contributed = new Set(oldContribution.stdout.split("\0").filter(Boolean));
+      workflows ||= replaced.stdout.split("\0").some((path) => contributed.has(path));
+    }
+  }
+  const ancestry = [];
+  for (const sha of input.ancestorShas ?? []) {
+    const result = await git(["merge-base", "--is-ancestor", sha, input.sha], env, signal);
+    if (result.code !== 0 && result.code !== 1) throw new Error("cannot inspect pinned Git ancestry");
+    ancestry.push({ sha, included: result.code === 0 });
+  }
+  return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: diff.stdout.length > 0, workflows, ...(input.ancestorShas ? { ancestry } : {}) };
+}
+
+async function inspectCommit(input: InspectCommitInput, tempDir: string, signal: AbortSignal): Promise<InspectCommitResult> {
+  return withScratch(input.worktreePath, tempDir, signal,
+    (scratch) => inspectObjects(input, isolatedEnv(scratch, "file:///", null), signal),
+    (detail) => { throw new Error(detail); });
+}
+
 async function push(input: PushInput & { rewrite?: boolean | undefined }, tempDir: string, signal: AbortSignal): Promise<PushResult> {
   const redact = (text: string) => text.split(input.token).join("***").trim();
   return withScratch(input.worktreePath, tempDir, signal, async (scratch): Promise<PushResult> => {
@@ -130,6 +190,9 @@ async function push(input: PushInput & { rewrite?: boolean | undefined }, tempDi
       }
     }
 
+    const classified = await inspectObjects({ worktreePath: input.worktreePath, sha: input.sha, comparisonSha: input.comparisonSha, publishedSha: input.expectedRemoteSha }, local, signal);
+    if (classified.kind === "missing-object") return { status: "rejected", reason: "missing-commit", detail: `missing comparison object ${classified.sha}` };
+    if (classified.workflows !== input.workflows) return { status: "rejected", reason: "denied", detail: "workflow classification changed" };
     const ref = `refs/heads/${input.branch}`;
     // Ancestry is checked above unless a rewrite was asked for, so the lease forces nothing else. It makes the
     // remote-state check atomic: an empty expected value means the branch must not exist yet.
@@ -193,6 +256,7 @@ async function fetchRefs(input: FetchInput, tempDir: string, signal: AbortSignal
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    inspectCommit: (input, ctx) => inspectCommit(input, ctx.experimental_paths.tempDir, ctx.signal),
     push: (input, ctx) => push(input, ctx.experimental_paths.tempDir, ctx.signal),
     pushBranch: (input, ctx) => push(input, ctx.experimental_paths.tempDir, ctx.signal),
     inspect: (input, ctx) => inspect(input.worktreePath, ctx.signal),

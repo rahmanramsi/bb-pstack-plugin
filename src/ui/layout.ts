@@ -1,7 +1,7 @@
 import type { z } from "zod";
 import { RUN_ID, type ChecklistView, type RunView, type ThreadView } from "../contract.ts";
 import type { IssueBoardSchema } from "../issues/board.ts";
-import type { JobState } from "../issues/job.ts";
+import { TERMINAL, type JobState } from "../issues/job.ts";
 
 export type Job = RunView["jobs"][number];
 export type Checklist = z.infer<typeof ChecklistView>;
@@ -105,31 +105,61 @@ export function formatDuration(milliseconds: number): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-type StatusTone = "queued" | "running" | "blocked" | "uncertain" | "succeeded" | "failed" | "skipped" | "cancelled";
+type StatusTone = "queued" | "running" | "blocked" | "uncertain" | "neutral" | "succeeded" | "failed" | "skipped" | "cancelled";
 
 export const issueStates: Record<JobState, { label: string; tone: StatusTone }> = {
   queued: { label: "Queued", tone: "queued" },
   starting: { label: "Starting worker", tone: "running" },
   working: { label: "Working", tone: "running" },
   publishing: { label: "Opening pull request", tone: "running" },
-  review: { label: "In review", tone: "blocked" },
+  checking: { label: "Checking CI", tone: "running" },
+  readifying: { label: "Marking ready", tone: "running" },
+  review: { label: "Ready for review", tone: "blocked" },
+  drafting: { label: "Returning to draft", tone: "running" },
+  repairing: { label: "Repairing CI", tone: "running" },
+  recovering: { label: "Recovering worker", tone: "running" },
   sending: { label: "Sending feedback", tone: "running" },
   respawning: { label: "Restarting worker", tone: "running" },
   addressing: { label: "Addressing feedback", tone: "running" },
   republishing: { label: "Pushing changes", tone: "running" },
   replying: { label: "Replying to reviews", tone: "running" },
-  asking: { label: "Asking for details", tone: "running" },
-  "needs-info": { label: "Needs details", tone: "uncertain" },
   tracking: { label: "Tracking sub-issues", tone: "blocked" },
   updating: { label: "Updating status", tone: "running" },
   closing: { label: "Closing", tone: "running" },
-  done: { label: "Done", tone: "succeeded" },
+  done: { label: "Outcome unknown", tone: "neutral" },
   stopping: { label: "Stopping", tone: "cancelled" },
   stopped: { label: "Stopped", tone: "cancelled" },
   sticking: { label: "Getting stuck", tone: "failed" },
   stuck: { label: "Stuck", tone: "failed" },
   ignored: { label: "Ignored", tone: "skipped" },
 };
+
+export type IssueOutcome = NonNullable<IssueJob["outcome"]>;
+
+export const issueOutcomes: Record<IssueOutcome, { label: string; tone: StatusTone }> = {
+  ready: { label: "Ready for review", tone: "blocked" },
+  merged: { label: "Merged", tone: "succeeded" },
+  "no-change": { label: "No change needed", tone: "skipped" },
+  failure: { label: "Failed", tone: "failed" },
+  "closed-unmerged": { label: "Closed without merging", tone: "failed" },
+  cancelled: { label: "Stopped", tone: "cancelled" },
+};
+
+export function issueStatus(job: Pick<IssueJob, "state" | "outcome">) {
+  return job.outcome === null ? issueStates[job.state] : issueOutcomes[job.outcome];
+}
+
+export type IssueNote = { tone: "error" | "warning" | "muted"; text: string };
+
+export function issueNotes(job: Pick<IssueJob, "state" | "error" | "limitation" | "delivery" | "poll">): IssueNote[] {
+  const notes: IssueNote[] = [];
+  if (job.error !== null) notes.push({ tone: "error", text: job.error });
+  if (job.limitation !== null) notes.push({ tone: "warning", text: job.limitation });
+  if (job.delivery.error !== null) notes.push({ tone: "error", text: `The GitHub issue status is not up to date. ${job.delivery.error} It is retried automatically.` });
+  else if (job.delivery.pending) notes.push({ tone: "muted", text: "Updating the issue status on GitHub." });
+  if (!TERMINAL.has(job.state) && job.poll.error !== null) notes.push({ tone: "error", text: `Poll error. ${job.poll.error}` });
+  return notes;
+}
 
 export function issueNext(job: Pick<IssueJob, "next">): string | null {
   if (job.next === null) return null;

@@ -4,8 +4,9 @@
  * cache and the REST wire format stay in here. Callers see domain types and three error classes.
  */
 import { createHash, createPrivateKey, createSign } from "node:crypto";
+import { z } from "zod";
 import type { PolledFeedback, PullState, RepoName, Sha } from "./job.ts";
-import { CONVENTIONAL_TITLE } from "./text.ts";
+import { COMMENT_MAX, CONVENTIONAL_TITLE, statusComment } from "./text.ts";
 
 export type GitHubCredentials = { appId: string; privateKey: string };
 
@@ -25,18 +26,22 @@ export type GitHubOptions = {
 /** 5xx, 429, rate limits and network errors. `notBefore` comes from Retry-After or X-RateLimit-Reset. */
 export class GitHubTransientError extends Error {
   readonly notBefore: number | null;
-  constructor(message: string, notBefore: number | null) {
+  readonly uncertain: boolean;
+  constructor(message: string, notBefore: number | null, uncertain = false) {
     super(message);
     this.notBefore = notBefore;
+    this.uncertain = uncertain;
   }
 }
 
 /** A response that retrying will not change. */
 export class GitHubPermanentError extends Error {
   readonly status: number;
-  constructor(message: string, status: number) {
+  readonly code: "denied" | "missing-capability" | "invalid" | "not-found";
+  constructor(message: string, status: number, code: GitHubPermanentError["code"] = status === 401 || status === 403 ? "denied" : status === 404 ? "not-found" : "invalid") {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -77,8 +82,53 @@ export type CheckResult = { name: string; status: "queued" | "in_progress" | "co
 /** A comment in an issue's conversation. */
 export type PolledComment = { id: number; author: string; body: string; createdAt: number };
 
+const WireSha = z.string().regex(/^[0-9a-f]{40}$/).transform((value) => value as Sha);
+const WireRepo = z.string().regex(/^[^/\s]+\/[^/\s]+$/).transform((value) => value.toLowerCase() as RepoName);
+const GrantSchema = z.enum(["none", "read", "write"]);
+export type Grant = z.infer<typeof GrantSchema>;
+const TargetSchema = z.object({ pr: z.number().int().positive(), head: WireSha, base: WireSha });
+export type Target = z.infer<typeof TargetSchema>;
+const CapabilitiesSchema = z.object({
+  repositoryId: z.number().int().positive(), archived: z.boolean(), defaultBranch: z.string().min(1),
+  defaultHead: WireSha, observedAt: z.number(),
+  permissions: z.object({ contents: GrantSchema, issues: GrantSchema, pullRequests: GrantSchema,
+    workflows: GrantSchema, checks: GrantSchema, statuses: GrantSchema }),
+});
+export type Capabilities = z.infer<typeof CapabilitiesSchema>;
+const CheckStateSchema = z.enum(["pending", "success", "neutral", "skipped", "failure", "cancelled", "unknown"]);
+export type CheckState = z.infer<typeof CheckStateSchema>;
+const CheckSchema = z.object({
+  id: z.string(), name: z.string(), source: z.enum(["check-run", "check-suite", "status"]), appId: z.number().nullable(),
+  head: WireSha, state: CheckStateSchema, url: z.string().nullable(),
+});
+export type Check = z.infer<typeof CheckSchema>;
+const RequiredCheckSchema = z.object({
+  name: z.string(), source: z.enum(["check-run", "status", "either"]), appId: z.number().nullable(),
+  accepted: z.array(z.enum(["success", "neutral", "skipped"])).readonly(),
+});
+export type RequiredCheck = z.infer<typeof RequiredCheckSchema>;
+const ReviewSnapshotSchema = TargetSchema.extend({
+  url: z.string(), state: z.enum(["open", "merged", "closed"]), draft: z.boolean(),
+  headRepository: WireRepo.nullable(), headBranch: z.string(), baseBranch: z.string(),
+  mergeability: z.enum(["clean", "conflicting", "unknown"]), observedAt: z.number(), complete: z.boolean(),
+  checks: z.array(CheckSchema).readonly(),
+  required: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("known"), checks: z.array(RequiredCheckSchema).readonly(), blockers: z.array(z.string()).readonly() }),
+    z.object({ kind: z.literal("unavailable"), reason: z.string(),
+      checks: z.array(RequiredCheckSchema).readonly().optional(), blockers: z.array(z.string()).readonly().optional() }),
+  ]),
+});
+export type ReviewSnapshot = z.infer<typeof ReviewSnapshotSchema>;
+export type DraftResult =
+  | { kind: "observed" | "stale" | "closed"; snapshot: ReviewSnapshot }
+  | { kind: "missing" };
+
 export type RepoClient = {
   readonly name: RepoName;
+  capabilities(input: { fresh: boolean }): Promise<Capabilities>;
+  reviewSnapshot(pr: number): Promise<ReviewSnapshot | null>;
+  setDraft(input: { expected: Target; draft: boolean }): Promise<DraftResult>;
+  upsertIssueStatus(input: { issue: number; marker: string; revision: number; body: string }): Promise<{ commentId: number }>;
   /** All issues, including closed ones, excluding pull requests. Cached for one minute unless fresh. */
   repositoryIssues(fresh?: boolean): Promise<RepositoryIssue[]>;
   /** `<slug>[bot]`. Events by it are never triggers. */
@@ -149,8 +199,8 @@ export type RepoClient = {
   reviewComment(id: number): Promise<{ author: string; body: string } | null>;
   /** Requests a review from each user who can be asked; a user GitHub refuses (422) is dropped, not an error. */
   requestReviewers(pr: number, reviewers: readonly string[]): Promise<{ requested: string[]; dropped: string[] }>;
-  /** A fresh token for this one repository with only `contents: write`, and the HTTPS remote. Revoke it after the push. */
-  pushCredentials(): Promise<{ remoteUrl: string; token: string }>;
+  /** A fresh token for this repository with contents write and, only when requested and granted, workflows write. The caller revokes it. */
+  pushCredentials(input?: { workflows: boolean }): Promise<{ remoteUrl: string; token: string }>;
   revoke(token: string): Promise<void>;
 };
 
@@ -190,6 +240,47 @@ type RawReview = { id: number; body: string | null; user: RawUser; state: string
 
 /** Whether the last line of a body is `marker`: the App appends its marker there, after any text it quotes. */
 const endsWith = (body: string, marker: string) => body.trimEnd().split("\n").at(-1) === marker;
+
+const InstallationSchema = z.object({ id: z.number().int().positive(), permissions: z.record(z.string(), GrantSchema), suspended_at: z.string().nullable().optional() });
+const RepositorySchema = z.object({ id: z.number().int().positive(), archived: z.boolean(), default_branch: z.string().min(1) });
+const RefSchema = z.object({ object: z.object({ sha: WireSha }) });
+const SnapshotPullSchema = z.object({
+  number: z.number().int().positive(), node_id: z.string().min(1), html_url: z.string(), state: z.enum(["open", "closed"]),
+  draft: z.boolean(), merged_at: z.string().nullable(), mergeable: z.boolean().nullable(), mergeable_state: z.string(),
+  head: z.object({ sha: WireSha, ref: z.string(), repo: z.object({ full_name: WireRepo }).nullable() }),
+  base: z.object({ sha: WireSha, ref: z.string(), repo: z.object({ full_name: WireRepo }) }),
+});
+type SnapshotPull = z.infer<typeof SnapshotPullSchema>;
+const SuiteSchema = z.object({ id: z.number().int().positive(), head_sha: WireSha, status: z.string(), conclusion: z.string().nullable(), app: z.object({ id: z.number().int().positive(), slug: z.string().optional() }) });
+const RunSchema = z.object({ id: z.number().int().positive(), name: z.string(), head_sha: WireSha,
+  status: z.string(), conclusion: z.string().nullable(), html_url: z.string().nullable(), app: z.object({ id: z.number().int().positive() }) });
+type SuiteObservation = { suite: z.infer<typeof SuiteSchema>; runs: z.infer<typeof RunSchema>[] };
+type CheckObservations = { checks: Check[]; placeholders: Check[]; complete: boolean };
+const StatusSchema = z.object({ id: z.number().int().positive(), context: z.string(), state: z.string(), target_url: z.string().nullable(), created_at: z.string().datetime() });
+const StatusCommentSchema = z.object({ id: z.number().int().positive(), created_at: z.string().datetime(), body: z.string().nullable(),
+  user: z.object({ login: z.string(), type: z.string() }).nullable(),
+  performed_via_github_app: z.object({ id: z.number().int().positive() }).nullable(), issue_url: z.string() });
+const PolicyCheckSchema = z.object({ context: z.string(), app_id: z.number().nullable().optional(), integration_id: z.number().nullable().optional() });
+const RulesSchema = z.array(z.object({ type: z.string(), parameters: z.unknown().optional() }));
+const RuleChecksSchema = z.object({ required_status_checks: z.array(PolicyCheckSchema), strict_required_status_checks_policy: z.boolean() });
+const LegacyPolicySchema = z.object({
+  required_status_checks: z.object({ contexts: z.array(z.string()), checks: z.array(PolicyCheckSchema).optional(), strict: z.boolean() }).nullable().optional(),
+  required_conversation_resolution: z.object({ enabled: z.boolean() }).optional(),
+  required_signatures: z.object({ enabled: z.boolean() }).optional(),
+}).passthrough();
+
+function parsed<T>(schema: z.ZodType<T>, json: unknown, context: string): T {
+  const result = schema.safeParse(json);
+  if (!result.success) throw new GitHubTransientError(`invalid GitHub response for ${context}: ${result.error.message}`, null);
+  return result.data;
+}
+
+function checkState(status: string, conclusion: string | null): CheckState {
+  if (status !== "completed") return ["queued", "in_progress", "waiting", "requested", "pending"].includes(status) ? "pending" : "unknown";
+  if (conclusion === "success" || conclusion === "neutral" || conclusion === "skipped" || conclusion === "cancelled") return conclusion;
+  if (["failure", "timed_out", "action_required", "startup_failure", "stale"].includes(conclusion ?? "")) return "failure";
+  return "unknown";
+}
 
 const PERMISSION_TTL = 10 * 60_000;
 /**
@@ -247,6 +338,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
   function notBefore(headers: Headers): number | null {
     const retryAfter = headers.get("retry-after");
     if (retryAfter && /^\d+$/.test(retryAfter)) return clock() + Number(retryAfter) * 1000;
+    if (retryAfter && Number.isFinite(Date.parse(retryAfter))) return Math.max(clock(), Date.parse(retryAfter));
     const reset = headers.get("x-ratelimit-reset");
     if (headers.get("x-ratelimit-remaining") === "0" && reset && /^\d+$/.test(reset)) return Number(reset) * 1000;
     return null;
@@ -273,7 +365,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
       });
       text = await response.text();
     } catch (error) {
-      throw new GitHubTransientError(`${method} ${url}: ${error instanceof Error ? error.message : String(error)}`, null);
+      throw new GitHubTransientError(`${method} ${url}: ${error instanceof Error ? error.message : String(error)}`, null, method !== "GET");
     }
     let json: unknown = null;
     try {
@@ -287,7 +379,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
   function failure(method: string, path: string, reply: Reply): Error {
     const message = `GitHub ${method} ${path}: ${reply.status} ${(reply.json as { message?: string } | null)?.message ?? ""}`.trim();
     const retryAt = notBefore(reply.headers);
-    if (reply.status >= 500 || reply.status === 429 || (reply.status === 403 && retryAt !== null)) return new GitHubTransientError(message, retryAt);
+    if (reply.status >= 500 || reply.status === 429 || (reply.status === 403 && retryAt !== null)) return new GitHubTransientError(message, retryAt, method !== "GET");
     return new GitHubPermanentError(message, reply.status);
   }
 
@@ -313,6 +405,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
       installations.delete(repo);
       throw new GitHubSetupError(`the GitHub App installation for ${repo} is gone`);
     }
+    if (reply.status === 401) throw new GitHubSetupError("GitHub rejected the App credentials while minting an installation token");
     if (reply.status !== 201) throw failure("POST", path, reply);
     const body = reply.json as { token: string; expires_at: string };
     return { token: body.token, expiresAt: Date.parse(body.expires_at) };
@@ -329,6 +422,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
 
   async function request(auth: Auth, method: string, path: string, init: { body?: unknown; etag?: string | null } = {}): Promise<Reply> {
     const url = path.startsWith("http") ? path : `${apiUrl}${path}`;
+    if (new URL(url).origin !== new URL(apiUrl).origin) throw new GitHubPermanentError("GitHub pagination left the configured API origin", 422);
     const authorization = async () =>
       auth.kind === "app" ? `Bearer ${appJwt()}` : auth.kind === "token" ? `Bearer ${auth.token}` : `Bearer ${await installationToken(auth.repo, auth.signal)}`;
     const sent = { ...init, signal: auth.signal };
@@ -336,6 +430,13 @@ export function createGitHub(options: GitHubOptions): GitHub {
     if (reply.status === 401 && auth.kind === "repo") {
       tokens.delete(await installationId(auth.repo, auth.signal));
       reply = await send(method, url, await authorization(), sent);
+    }
+    if (reply.status === 401 && auth.kind !== "token") throw new GitHubSetupError(`GitHub rejected the App credentials on ${method} ${path}`);
+    if (reply.status === 403 && auth.kind === "repo" && notBefore(reply.headers) === null) {
+      cache.delete(`capabilities:${auth.repo}`);
+      const id = installations.get(auth.repo);
+      if (id !== undefined) tokens.delete(id);
+      installations.delete(auth.repo);
     }
     return reply;
   }
@@ -355,7 +456,7 @@ export function createGitHub(options: GitHubOptions): GitHub {
     let reply = first ?? (await request(auth, "GET", path));
     for (;;) {
       if (reply.status !== 200) throw failure("GET", path, reply);
-      items.push(...(reply.json as T[]));
+      items.push(...(parsed(z.array(z.unknown()), reply.json, `list ${path}`) as T[]));
       const next = nextLink(reply.headers);
       if (!next) return items;
       reply = await request(auth, "GET", next);
@@ -393,9 +494,293 @@ export function createGitHub(options: GitHubOptions): GitHub {
     const auth: Auth = { kind: "repo", repo: name, signal };
     const base = `/repos/${name}`;
     const appLogin = async () => {
+      credentials();
       if (appSlug === null) appSlug = (await call<{ slug: string }>({ kind: "app", signal }, "GET", "/app")).json.slug;
       return `${appSlug}[bot]`;
     };
+    async function capabilities(input: { fresh: boolean }): Promise<Capabilities> {
+      credentials();
+      const key = `capabilities:${name}`;
+      if (input.fresh) cache.delete(key);
+      return cached(key, 60_000, async () => {
+        const installation = await request({ kind: "app", signal }, "GET", `${base}/installation`);
+        if (installation.status === 404) throw new GitHubSetupError(`the GitHub App is not installed on ${name}`);
+        if (installation.status === 401) throw new GitHubSetupError("GitHub rejected the App credentials");
+        if (installation.status !== 200) throw failure("GET", `${base}/installation`, installation);
+        const grants = parsed(InstallationSchema, installation.json, "installation grants");
+        if (grants.suspended_at) throw new GitHubSetupError(`the GitHub App installation for ${name} is suspended`);
+        installations.set(name, grants.id);
+        const repository = parsed(RepositorySchema, (await call(auth, "GET", base)).json, "repository capabilities");
+        const ref = parsed(RefSchema, (await call(auth, "GET", `${base}/git/ref/heads/${encodeURIComponent(repository.default_branch)}`)).json, "default branch");
+        const permission = (key: string): Grant => grants.permissions[key] ?? "none";
+        return CapabilitiesSchema.parse({ repositoryId: repository.id, archived: repository.archived,
+          defaultBranch: repository.default_branch, defaultHead: ref.object.sha, observedAt: clock(),
+          permissions: { contents: permission("contents"), issues: permission("issues"), pullRequests: permission("pull_requests"),
+            workflows: permission("workflows"), checks: permission("checks"), statuses: permission("statuses") } });
+      });
+    }
+
+    async function snapshotPull(pr: number): Promise<SnapshotPull | null> {
+      const reply = await request(auth, "GET", `${base}/pulls/${pr}`);
+      if (reply.status === 404) {
+        // GitHub also masks inaccessible resources with 404.
+        const grants = await capabilities({ fresh: true });
+        if (grants.permissions.pullRequests === "none") throw new GitHubPermanentError("pull request access is unavailable", 403, "missing-capability");
+        return null;
+      }
+      if (reply.status !== 200) throw failure("GET", `${base}/pulls/${pr}`, reply);
+      const pull = parsed(SnapshotPullSchema, reply.json, "pull request snapshot");
+      if (pull.number !== pr || pull.base.repo.full_name !== name) throw new GitHubTransientError("pull request identity does not match repository/number", null);
+      return pull;
+    }
+
+    async function checkObservations(head: Sha): Promise<CheckObservations> {
+      const checks: Check[] = [];
+      const placeholders: Check[] = [];
+      let complete = true;
+      async function collection<T>(path: string, field: string, schema: z.ZodType<T>): Promise<T[]> {
+        const items: T[] = [];
+        let url: string | null = path;
+        let total = 0;
+        while (url) {
+          const reply = await request(auth, "GET", url);
+          if (reply.status !== 200) throw failure("GET", url, reply);
+          const page = parsed(z.object({ total_count: z.number().int().nonnegative() }).catchall(z.unknown()), reply.json, field);
+          total = Math.max(total, page.total_count);
+          items.push(...parsed(z.array(schema), page[field], field));
+          url = nextLink(reply.headers);
+        }
+        if (items.length < total) complete = false;
+        return items;
+      }
+      const suites = await collection(`${base}/commits/${head}/check-suites?per_page=100`, "check_suites", SuiteSchema);
+      const observations: SuiteObservation[] = [];
+      const newestRuns = new Map<string, z.infer<typeof RunSchema>>();
+      for (const suite of suites) {
+        if (suite.head_sha !== head) complete = false;
+        const runs = await collection(`${base}/check-suites/${suite.id}/check-runs?filter=all&per_page=100`, "check_runs", RunSchema);
+        observations.push({ suite, runs });
+        for (const run of runs) {
+          if (run.head_sha !== head || run.app.id !== suite.app.id) complete = false;
+          const key = `${run.app.id}:${run.name}`;
+          if ((newestRuns.get(key)?.id ?? -1) < run.id) newestRuns.set(key, run);
+        }
+      }
+      for (const { suite, runs } of observations) {
+        const state = checkState(suite.status, suite.conclusion);
+        if (["success", "neutral", "skipped"].includes(state)) continue;
+        if (runs.length > 0 && !runs.some((run) => newestRuns.get(`${run.app.id}:${run.name}`)?.id === run.id)) continue;
+        const aggregate: Check = { id: `check-suite:${suite.id}`, name: suite.app.slug ?? `App ${suite.app.id}`,
+          source: "check-suite", appId: suite.app.id, head: suite.head_sha, state, url: null };
+        if (runs.length === 0 && suite.status === "queued" && suite.conclusion === null) placeholders.push(aggregate);
+        else checks.push(aggregate);
+      }
+      for (const run of newestRuns.values()) checks.push({ id: `check-run:${run.id}`, name: run.name, source: "check-run", appId: run.app.id,
+        head: run.head_sha, state: checkState(run.status, run.conclusion), url: run.html_url });
+      const statuses = parsed(z.array(StatusSchema), await pages<unknown>(auth, `${base}/commits/${head}/statuses?per_page=100`), "commit statuses");
+      const newest = new Map<string, z.infer<typeof StatusSchema>>();
+      for (const status of statuses) {
+        const old = newest.get(status.context);
+        if (!old || Date.parse(status.created_at) > Date.parse(old.created_at) || (status.created_at === old.created_at && status.id > old.id)) newest.set(status.context, status);
+      }
+      for (const status of newest.values()) checks.push({ id: `status:${status.id}`, name: status.context, source: "status", appId: null,
+        head, state: status.state === "error" ? "failure" : CheckStateSchema.catch("unknown").parse(status.state), url: status.target_url });
+      return { checks, placeholders, complete };
+    }
+
+    async function requiredPolicy(pull: SnapshotPull): Promise<ReviewSnapshot["required"]> {
+      const branch = encodeURIComponent(pull.base.ref);
+      const checks: RequiredCheck[] = [];
+      const blockers: string[] = [];
+      const limitations: string[] = [];
+      const unavailable = (reason: string): ReviewSnapshot["required"] => ({ kind: "unavailable", reason, checks, blockers });
+      const add = (item: z.infer<typeof PolicyCheckSchema>) => checks.push({ name: item.context, source: "either",
+        appId: (item.app_id ?? item.integration_id ?? -1) > 0 ? item.app_id ?? item.integration_id ?? null : null,
+        accepted: ["success", "neutral", "skipped"] });
+      const strict = (enabled: boolean) => { if (enabled && pull.mergeable_state === "behind") blockers.push("base branch must be incorporated into the head"); };
+      try {
+        const branchReply = await request(auth, "GET", `${base}/branches/${branch}`);
+        if (branchReply.status !== 200) {
+          if ([403, 404].includes(branchReply.status) && notBefore(branchReply.headers) === null) return unavailable(`branch policy observation returned ${branchReply.status}`);
+          throw failure("GET", `${base}/branches/${branch}`, branchReply);
+        }
+        const branchInfo = parsed(z.object({ protected: z.boolean(), commit: z.object({ sha: WireSha }) }), branchReply.json, "branch protection summary");
+        if (branchInfo.commit.sha !== pull.base.sha) return unavailable("base changed during policy observation");
+        let rulesUrl: string | null = `${base}/rules/branches/${branch}?per_page=100`;
+        while (rulesUrl) {
+          const reply = await request(auth, "GET", rulesUrl);
+          if (reply.status !== 200) throw failure("GET", rulesUrl, reply);
+          const rules = parsed(RulesSchema, reply.json, "active branch rules");
+          for (const rule of rules) {
+            if (rule.type === "required_status_checks") {
+              const parameters = parsed(RuleChecksSchema, rule.parameters, "required status check rule");
+              parameters.required_status_checks.forEach(add);
+              strict(parameters.strict_required_status_checks_policy);
+            } else if (rule.type === "pull_request") {
+              const parameters = parsed(z.object({ required_review_thread_resolution: z.boolean() }), rule.parameters, "pull request rule");
+              if (parameters.required_review_thread_resolution) limitations.push("required review thread resolution cannot be established from this snapshot");
+            } else if (!["creation", "deletion", "non_fast_forward", "required_linear_history"].includes(rule.type)) {
+              limitations.push(`unsupported branch requirement ${rule.type}`);
+            }
+          }
+          rulesUrl = nextLink(reply.headers);
+        }
+        if (branchInfo.protected) {
+          const protection = await request(auth, "GET", `${base}/branches/${branch}/protection`);
+          if (protection.status !== 200) {
+            if ([403, 404].includes(protection.status) && notBefore(protection.headers) === null) return unavailable(`classic branch protection is unavailable (${protection.status})`);
+            throw failure("GET", `${base}/branches/${branch}/protection`, protection);
+          }
+          const legacy = parsed(LegacyPolicySchema, protection.json, "classic branch protection");
+          if (legacy.required_conversation_resolution?.enabled || legacy.required_signatures?.enabled) limitations.push("classic protection contains requirements not observed by this snapshot");
+          if (legacy.required_status_checks) {
+            const required = legacy.required_status_checks;
+            (required.checks ?? []).forEach(add);
+            const unbound = required.contexts.filter((context) => !required.checks?.some((check) => check.context === context));
+            if (unbound.length) {
+              unbound.forEach((context) => add({ context }));
+              limitations.push("classic required status contexts lack observable App bindings");
+            }
+            strict(required.strict);
+          }
+        }
+        return limitations.length ? unavailable(limitations.join("; ")) : { kind: "known", checks, blockers };
+      } catch (error) {
+        if (error instanceof GitHubPermanentError && [403, 404].includes(error.status)) return unavailable(error.message);
+        throw error;
+      }
+    }
+
+    async function reviewSnapshot(pr: number): Promise<ReviewSnapshot | null> {
+      const before = await snapshotPull(pr);
+      if (!before) return null;
+      const observations = await checkObservations(before.head.sha);
+      const required = await requiredPolicy(before);
+      const checks = [...observations.placeholders.filter((suite) => required.checks?.some((check) =>
+        check.source !== "status" && check.appId === suite.appId)), ...observations.checks];
+      const after = await snapshotPull(pr);
+      if (!after) return null;
+      return ReviewSnapshotSchema.parse({ pr, head: after.head.sha, base: after.base.sha, url: after.html_url,
+        state: after.state === "open" ? "open" : after.merged_at ? "merged" : "closed", draft: after.draft,
+        headRepository: after.head.repo?.full_name ?? null, headBranch: after.head.ref, baseBranch: after.base.ref,
+        mergeability: after.mergeable === null ? "unknown" : after.mergeable ? "clean" : "conflicting", observedAt: clock(),
+        complete: observations.complete && JSON.stringify(before) === JSON.stringify(after), checks, required });
+    }
+
+    async function setDraft(input: { expected: Target; draft: boolean }): Promise<DraftResult> {
+      const classify = (snapshot: ReviewSnapshot | null): DraftResult => !snapshot ? { kind: "missing" }
+        : snapshot.state !== "open" ? { kind: "closed", snapshot }
+        : snapshot.head !== input.expected.head || snapshot.base !== input.expected.base || !snapshot.complete ? { kind: "stale", snapshot }
+        : { kind: "observed", snapshot };
+      const before = classify(await reviewSnapshot(input.expected.pr));
+      if (before.kind !== "observed" || before.snapshot.draft === input.draft) return before;
+      const pull = await snapshotPull(input.expected.pr);
+      if (!pull) return { kind: "missing" };
+      if (pull.head.sha !== input.expected.head || pull.base.sha !== input.expected.base || pull.state !== "open") return classify(await reviewSnapshot(input.expected.pr));
+      const mutation = input.draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
+      const inputType = input.draft ? "ConvertPullRequestToDraftInput" : "MarkPullRequestReadyForReviewInput";
+      try {
+        const reply = await request(auth, "POST", "/graphql", { body: {
+          query: `mutation($input: ${inputType}!) { ${mutation}(input: $input) { pullRequest { id isDraft } } }`,
+          variables: { input: { pullRequestId: pull.node_id } },
+        } });
+        if (reply.status !== 200) throw failure("POST", "/graphql", reply);
+        const result = parsed(z.object({ data: z.unknown().optional(), errors: z.array(z.object({ message: z.string(), type: z.string().optional() })).optional() }), reply.json, "draft mutation");
+        if (result.errors?.length) {
+          const denied = result.errors.some((error) => error.type === "FORBIDDEN" || error.type === "INSUFFICIENT_SCOPES");
+          const message = result.errors.map((error) => error.message).join("; ");
+          if (denied) throw new GitHubPermanentError(message, 403);
+          const retryAt = notBefore(reply.headers);
+          const rateLimited = result.errors.some((error) => error.type === "RATE_LIMITED");
+          const serviceFault = result.errors.some((error) => ["INTERNAL", "SERVICE_UNAVAILABLE", "TIMEOUT"].includes(error.type ?? "")
+            || (!error.type && /^(Something went wrong while executing your query|We couldn't respond to your request in time)/.test(error.message)));
+          if (rateLimited || serviceFault || (retryAt !== null && result.errors.every((error) => !error.type))) {
+            throw new GitHubTransientError(message, retryAt ?? (rateLimited ? clock() + 60_000 : null), true);
+          }
+          throw new GitHubPermanentError(message, 422);
+        }
+        parsed(z.object({ [mutation]: z.object({ pullRequest: z.object({ id: z.literal(pull.node_id), isDraft: z.boolean() }) }) }), result.data, "draft mutation result");
+      } catch (error) {
+        if (!(error instanceof GitHubTransientError)) throw error;
+        let snapshot: ReviewSnapshot | null;
+        try {
+          snapshot = await reviewSnapshot(input.expected.pr);
+        } catch (probeError) {
+          if (!(probeError instanceof GitHubTransientError)) throw probeError;
+          const cooldowns = [error.notBefore, probeError.notBefore].filter((time) => time !== null);
+          throw new GitHubTransientError(`${error.message}; draft observation failed: ${probeError.message}`,
+            cooldowns.length ? Math.max(...cooldowns) : null, true);
+        }
+        const observed = classify(snapshot);
+        if (observed.kind !== "observed" || observed.snapshot.draft === input.draft) return observed;
+        throw error;
+      }
+      const after = classify(await reviewSnapshot(input.expected.pr));
+      if (after.kind === "observed" && after.snapshot.draft !== input.draft) throw new GitHubTransientError("draft mutation has not been observed", null, true);
+      return after;
+    }
+
+    async function upsertIssueStatus(input: { issue: number; marker: string; revision: number; body: string }): Promise<{ commentId: number }> {
+      const body = statusComment(input.body, input.revision, input.marker);
+      if (!Number.isSafeInteger(input.issue) || input.issue < 1 || !Number.isSafeInteger(input.revision) || input.revision < 0 || !/^<!--[^\r\n]+-->$/.test(input.marker)) {
+        throw new GitHubPermanentError("invalid issue status identity or revision", 422);
+      }
+      if (body.length > COMMENT_MAX) throw new GitHubPermanentError(`issue status is ${body.length} characters; GitHub's limit is ${COMMENT_MAX}`, 422);
+      const login = await appLogin();
+      const appId = Number(credentials().appId);
+      const owned = (comment: z.infer<typeof StatusCommentSchema>) => comment.user?.login === login && comment.user.type === "Bot"
+        && comment.performed_via_github_app?.id === appId && endsWith(comment.body ?? "", input.marker)
+        && comment.issue_url === `${apiUrl}${base}/issues/${input.issue}`;
+      const find = async () => parsed(z.array(StatusCommentSchema), await pages<unknown>(auth, `${base}/issues/${input.issue}/comments?per_page=100`), "status comments")
+        .filter(owned).sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let comments = await find();
+        let keeper = comments[0];
+        if (!keeper) {
+          try {
+            const created = await call(auth, "POST", `${base}/issues/${input.issue}/comments`, { body: { body } });
+            parsed(z.object({ id: z.number().int().positive() }), created.json, "created status comment");
+          } catch (error) {
+            if (!(error instanceof GitHubTransientError)) throw error;
+            comments = await find();
+            if (comments.length === 0) throw error;
+          }
+          comments = await find();
+          keeper = comments[0];
+          if (!keeper) throw new GitHubTransientError("created status comment is not yet observable", null, true);
+        }
+        const current = await call(auth, "GET", `${base}/issues/comments/${keeper.id}`, { ok: [404] });
+        if (current.status === 404) continue;
+        keeper = parsed(StatusCommentSchema, current.json, "current status comment");
+        if (!owned(keeper)) continue;
+        if (keeper.body !== body) {
+          try {
+            const edited = await call(auth, "PATCH", `${base}/issues/comments/${keeper.id}`, { body: { body }, ok: [404] });
+            if (edited.status === 404) continue;
+          } catch (error) {
+            if (!(error instanceof GitHubTransientError)) throw error;
+            const probe = await call(auth, "GET", `${base}/issues/comments/${keeper.id}`, { ok: [404] });
+            if (probe.status === 404) continue;
+            const observed = parsed(StatusCommentSchema, probe.json, "status edit probe");
+            if (!owned(observed) || observed.body !== body) throw error;
+          }
+        }
+        comments = await find();
+        if (comments[0]?.id !== keeper.id) continue;
+        for (const duplicate of comments.slice(1)) {
+          const probe = await call(auth, "GET", `${base}/issues/comments/${duplicate.id}`, { ok: [404] });
+          if (probe.status === 404) continue;
+          if (!owned(parsed(StatusCommentSchema, probe.json, "duplicate status comment"))) continue;
+          await call(auth, "DELETE", `${base}/issues/comments/${duplicate.id}`, { ok: [404] });
+        }
+        const final = await call(auth, "GET", `${base}/issues/comments/${keeper.id}`, { ok: [404] });
+        if (final.status === 404) continue;
+        const observed = parsed(StatusCommentSchema, final.json, "delivered status comment");
+        if (owned(observed) && observed.body === body) return { commentId: keeper.id };
+      }
+      throw new GitHubTransientError("issue status changed during reconciliation", null, true);
+    }
+
     /** One pull request's feedback since its cursor, and its state. */
     async function pullActivity(pr: number, cursor: PullCursor | null): Promise<{ state: PullState; items: PolledFeedback[]; next: PullCursor }> {
       const was = cursor ?? { reviewComments: null, comments: null, reviews: null, pull: null };
@@ -468,6 +853,10 @@ export function createGitHub(options: GitHubOptions): GitHub {
     return {
       name,
       appLogin,
+      capabilities,
+      reviewSnapshot,
+      setDraft,
+      upsertIssueStatus,
       async repositoryIssues(fresh = false) {
         const load = async (): Promise<RepositoryIssue[]> => {
           const items = await pages<{ number: number; title: string; body: string | null; html_url: string; user: { login: string }; updated_at: string; state: "open" | "closed"; labels: ({ name: string } | string)[]; pull_request?: unknown; sub_issues_summary?: { total: number } }>(auth, `${base}/issues?state=all&sort=updated&direction=desc&per_page=100`);
@@ -672,8 +1061,14 @@ export function createGitHub(options: GitHubOptions): GitHub {
         for (const reviewer of reviewers) ((await ask([reviewer])) ? requested : dropped).push(reviewer);
         return { requested, dropped };
       },
-      async pushCredentials() {
-        const { token } = await mintToken(name, signal, { repositories: [name.split("/")[1]], permissions: { contents: "write" } });
+      async pushCredentials(input = { workflows: false }) {
+        if (input.workflows) {
+          const grants = await capabilities({ fresh: true });
+          if (grants.permissions.workflows !== "write" || grants.permissions.contents !== "write") {
+            throw new GitHubPermanentError("workflow changes require existing contents and workflows write grants", 403, "missing-capability");
+          }
+        }
+        const { token } = await mintToken(name, signal, { repositories: [name.split("/")[1]], permissions: { contents: "write", ...(input.workflows ? { workflows: "write" } : {}) } });
         return { remoteUrl: `${gitUrl}/${name}.git`, token };
       },
       async revoke(token) {

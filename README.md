@@ -44,6 +44,10 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 
 with `githubAppId` and `githubPrivateKey` set, every thread is told to use `bb pstack gh` for github. it acts on the repository behind the worktree's `origin`, as the app, with only the permissions the app was installed with. it never pushes the default branch, never force-pushes without a lease on the commit it just read, and in poteto mode opens a pr only after `gate pr` passes. for agents to be held to it, stop handing them a token of their own: turn off bb's automatic GH_TOKEN (`bb settings general machineGitCredentialsEnabled false`) and remove any custom `GH_TOKEN`. the app needs contents, pull requests, issues and checks permissions (read and write where agents write), plus workflows if agents edit `.github/workflows`.
 
+### issue jobs
+
+map a repository with `issueRepos` and label an issue `agent`. a worker thread takes it unattended to a pull request ready for review, a substantiated no-change result, or a concrete failure, recovering stalled workers and repairing ci failures and conflicts on its own. pstack never merges. setup, permissions, outcomes and limits are in [github issues to pull requests](./docs/design/issues.md).
+
 an agent can still call plain `bb thread spawn --parent-self --new-environment worktree`. when its machine is full and another machine has room for the same project and model, pstack refuses that spawn and names `bb pstack spawn` as the fix. it never refuses a fork, a person's thread, a reused environment, or a thread pstack spawned. it also lets the spawn through whenever it lacks the facts to decide. turn the `placementGuard` setting off to disable it (`bb plugin config pstack set placementGuard false`).
 
 ## development
