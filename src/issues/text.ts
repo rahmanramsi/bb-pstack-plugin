@@ -233,7 +233,7 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
       : [
           "## The branch moved",
           "",
-          `\`${job.branch}\` on GitHub is at ${head.slice(0, 7)}, past the commit pstack last pushed${job.pushedSha ? ` (${job.pushedSha.slice(0, 7)})` : ""}, for example after a suggested change was committed or the branch was updated. Run \`git fetch origin\` and merge \`origin/${job.branch}\` before you commit.`,
+          `\`${job.branch}\` on GitHub is at ${head.slice(0, 7)}, past the commit pstack last pushed${job.pushedSha ? ` (${job.pushedSha.slice(0, 7)})` : ""}, for example after a suggested change was committed or the branch was updated. Run \`bb pstack gh fetch\` and merge \`origin/${job.branch}\` before you commit.`,
           "",
         ]),
     "## Feedback",
@@ -245,7 +245,7 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     "",
     "- Decide the effort for each item. Apply mechanical feedback, such as a rename, a typo or a removed log line, directly. Take anything that changes behavior or design through `/poteto-mode`.",
     "- Answer every item above in `replies`: describe the change and its commit, or give your reason when you disagree. A question for the reviewer goes in a reply.",
-    "- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it.",
+    `- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it: run \`bb pstack gh fetch\` (plain \`git fetch\` has no GitHub credentials), then merge \`origin/${job.baseBranch}\`.`,
     "- Never run `git push`, never use `gh` or another GitHub client, and never switch or create branches.",
     "- Commit every change before you report. Untracked or uncommitted files reject the report.",
     `- If you already reported feedback round ${round}, this message is a repeated copy: stop without changing anything.`,
@@ -266,7 +266,7 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
 
 /** For a replacement worker whose worktree does not contain the branch's head on GitHub. */
 export function mergeNote(job: Job, head: Sha, base: Sha): string {
-  return `This worktree starts at ${head.slice(0, 7)}, but \`${job.branch}\` on GitHub is at ${base.slice(0, 7)}. Run \`git fetch origin\` and merge \`origin/${job.branch}\` before you commit; a report whose commit does not contain ${base.slice(0, 7)} is rejected.`;
+  return `This worktree starts at ${head.slice(0, 7)}, but \`${job.branch}\` on GitHub is at ${base.slice(0, 7)}. Run \`bb pstack gh fetch\` and merge \`origin/${job.branch}\` before you commit; a report whose commit does not contain ${base.slice(0, 7)} is rejected.`;
 }
 
 /** Standing instructions for a bound worker thread, contributed every turn so they survive compaction. */
