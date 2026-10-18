@@ -453,7 +453,6 @@ export type Action =
 
 export const MAX_NUDGES = 2;
 
-/** States a round runs through, from its start until the job enters checking, or heads to an end. */
 const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "recovering", "repairing", "sending", "respawning", "addressing", "republishing", "replying"]);
 
 /** Marks a change that takes the job out of its round as the round's end. */
@@ -549,7 +548,6 @@ function feedbackAction(job: Job, facts: Facts): Action | null {
   if (quiet > now) return { type: "sleep", until: quiet };
   if (!facts.thread || !facts.rounds || !facts.remote) return null;
   if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
-  // A failed thread cannot take the round's message; it is replaced like a gone one.
   const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
   return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
 }

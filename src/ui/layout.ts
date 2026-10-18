@@ -136,7 +136,6 @@ export const issueStates: Record<JobState, { label: string; tone: StatusTone }> 
 
 export type IssueOutcome = NonNullable<IssueJob["outcome"]>;
 
-/** What the job achieved. A pull request ready for review is not merged, and one closed without merging is not a success. */
 export const issueOutcomes: Record<IssueOutcome, { label: string; tone: StatusTone }> = {
   ready: { label: "Ready for review", tone: "blocked" },
   merged: { label: "Merged", tone: "succeeded" },
@@ -146,14 +145,12 @@ export const issueOutcomes: Record<IssueOutcome, { label: string; tone: StatusTo
   cancelled: { label: "Stopped", tone: "cancelled" },
 };
 
-/** The outcome once there is one, otherwise the current step. GitHub delivery never changes it. */
 export function issueStatus(job: Pick<IssueJob, "state" | "outcome">) {
   return job.outcome === null ? issueStates[job.state] : issueOutcomes[job.outcome];
 }
 
 export type IssueNote = { tone: "error" | "warning" | "muted"; text: string };
 
-/** Notes under a job's status, execution problems first. Delivery and polling notes sit beside the outcome and never replace it. */
 export function issueNotes(job: Pick<IssueJob, "state" | "error" | "limitation" | "delivery" | "poll">): IssueNote[] {
   const notes: IssueNote[] = [];
   if (job.error !== null) notes.push({ tone: "error", text: job.error });

@@ -44,7 +44,7 @@ A person does this once.
    - Commit statuses: read.
    - Metadata: read.
    - Workflows: read and write. This is optional. Without it, a change under `.github/workflows` fails publication with its commits kept.
-   - Administration: read. This is optional. It lets pstack read classic branch protection. Without it, a ready result carries a limitation that says the branch policy was not read.
+   - Administration: read. This is optional. It lets pstack read classic branch protection. A ready result carries a limitation when protected-branch policy cannot be read.
 2. Install the App on the target repositories.
 3. Configure pstack:
 
@@ -193,7 +193,7 @@ The job marks the pull request ready for review only when all of these hold:
 - The snapshot is complete, and the pull request still comes from the job's branch and targets its base.
 - Mergeability is clean.
 - No check on the head is pending or failing.
-- Every known required check is satisfied by a check with the same name, source, and App on the head. Checks with the same name from different Apps do not satisfy each other.
+- Every known required check is satisfied by a check with the same name and source on the head. When a requirement names an App, checks from other Apps do not satisfy it.
 - The worker's accepted local verification is for this exact head and base.
 
 A repository with no CI can become ready on local verification alone.
