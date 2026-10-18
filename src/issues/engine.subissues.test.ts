@@ -267,3 +267,38 @@ test("adopted no-change child heads replace old push pins for parents and siblin
   assert.equal(incomplete.exitCode, 1);
   assert.match(incomplete.stderr!, /include prerequisite #51.*3333333/);
 });
+
+for (const fault of ["transient", "permanent"] as const) {
+  test(`historical merged prerequisite ${fault} observations follow durable review scheduling`, async () => {
+    const h = withParent([51]);
+    await h.settle();
+    const child = await h.byIssue(51);
+    await h.report(child.threadId!, GOOD); await h.settle(); await h.advance(MIN);
+    const merged = h.store.get(child.id)!;
+    h.store.write(merged.id, merged.version, { phase: { state: "done" }, control: { ...merged.control, disposition: "merged", readiness: null, mergedHead: null } }, h.clock.now);
+    h.db.prepare("UPDATE issue_job_polls SET pr_state = 'merged' WHERE job_id = ?").run(child.id);
+    h.db.prepare("UPDATE issue_review_schedule SET next_at = ? WHERE job_id = ?").run(h.clock.now, child.id);
+    const endpoint = `GET /repos/acme/web/pulls/${merged.pr!.number}`;
+    h.gh().outages.push({ key: endpoint, status: fault === "permanent" ? 403 : 503, times: Infinity });
+    Object.assign(h.gh().pulls.get(merged.pr!.number)!, { state: "closed", merged: true });
+    h.gh().refs.set(child.branch, "3".repeat(40));
+    await h.settle();
+    const parent = await h.byIssue(50);
+    if (fault === "permanent") {
+      assert.equal(parent.outcome, "failure");
+      assert.match(parent.error!, /prerequisite.*(403|denied|Forbidden)/i);
+    } else {
+      assert.notEqual(parent.outcome, "failure");
+      assert.equal(h.store.get(parent.id)!.control.recoveries, 0);
+      const scheduled = h.db.prepare("SELECT next_at FROM issue_review_schedule WHERE job_id = ?").get(child.id) as { next_at: number };
+      assert.ok(scheduled.next_at > h.clock.now);
+      const before = scheduled.next_at;
+      h.restart(); await h.advance(15_000);
+      assert.equal((h.db.prepare("SELECT next_at FROM issue_review_schedule WHERE job_id = ?").get(child.id) as { next_at: number }).next_at, before);
+      h.gh().outages.length = 0;
+      await h.advance(before - h.clock.now);
+      assert.equal(h.store.get(child.id)!.control.mergedHead, "3".repeat(40));
+      assert.equal(h.store.get(parent.id)!.control.prerequisites[0]!.sha, "3".repeat(40));
+    }
+  });
+}
