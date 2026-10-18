@@ -32,6 +32,32 @@ Ready for review is not merged. pstack never merges a pull request.
 
 Delivery to GitHub is separate from the outcome. When the status comment, a label, a reply, or a review request cannot be written, the outcome stays as it is, and the delivery error is shown beside it and retried.
 
+## Lifecycle overview
+
+```mermaid
+flowchart TD
+  trigger[Issue trigger] --> authorize[Check actor, repository and existing grants]
+  authorize -->|Unauthorized actor| ignored[Trigger ignored]
+  authorize --> worker[Implement and verify in the assigned worktree]
+  authorize -->|Essential configuration missing| failure[Record failure and preserve work]
+  worker --> report[Save and validate the worker report]
+  report -->|Changes| publish[Push the inspected commit and open a draft PR]
+  report -->|No change needed| nochange[Record the evidence]
+  report -->|Permanent prerequisite failure| failure
+  report -->|Validation rejected| worker
+  publish --> checks[Observe current CI, mergeability and local evidence]
+  publish -->|Permanent publication denial| failure
+  checks -->|Repair needed| worker
+  checks -->|Healthy| ready[Ready for human review]
+  ready -->|Feedback| worker
+  ready -->|Human merges| merged[Merged]
+  worker -->|Stalled| recovery[Stop owned writers and recover the same worktree]
+  recovery -->|Safe reuse| worker
+  recovery -->|Unsafe or exhausted| failure
+```
+
+Every transition updates the desired issue status in the database. Independent delivery retries the issue comment and labels when GitHub recovers. A temporary outage keeps the accepted work and its pending effects. A permanent publication denial records failure without discarding the commit.
+
 ## Setup
 
 A person does this once.
@@ -126,7 +152,8 @@ A pending report binds to the first commit pstack can inspect. If the worktree c
 
 - The worktree has uncommitted or untracked changes.
 - `changes` adds no commit, or `no-change` adds one.
-- The commit pstack inspects on the host has no diff against its comparison commit: the default branch head in the first round, the round's base after that.
+- The inspected commit adds no file changes from its merge base with the comparison commit. Main-only changes do not count as the worker's contribution.
+- HEAD does not contain the current default-branch commit recorded as the verification base.
 - In a later round, HEAD does not contain the round's base, the branch's head on GitHub when the round started.
 - `gate pr` fails on the worker thread's checklist for a `changes` report.
 - `verification` is empty.
@@ -134,7 +161,7 @@ A pending report binds to the first commit pstack can inspect. If the worktree c
 - The first `changes` report has no `pr.title` or `pr.body`, the title is not one line of 10 to 72 characters, or it breaks the repository's title convention. The convention is Conventional Commits when most of the last 20 merged pull requests use it.
 - A reply is longer than GitHub's 65,536 characters as posted.
 - The body is empty, longer than 10,000 characters, or describes the process instead of the change. The check matches whole phrases such as `poteto-mode`, `pstack`, `playbook`, `the checklist`, `gate pr`, `this round`, and `the agent`, not bare words. The title, the text posted on the issue, and every reply get the same check.
-- For a sub-issue integration job, HEAD does not contain each prerequisite commit.
+- HEAD does not contain each exact prerequisite commit for a dependent sub-issue or an integrating parent. Fixed host Git operations establish ancestry independently of the SDK's displayed commit list.
 
 A rejected report goes back to the worker with every reason. After 3 rejections in a row without progress, pstack recovers the worker (see [Recovery](#recovery)). Progress means the newest rejection has fewer reasons than the best one so far, and all of them were in it. When the branch on GitHub moved since the round started, the report is refused without counting as a rejection, and the round's base moves to the new head.
 
@@ -156,13 +183,15 @@ Recovery starts when one of these happens while the job waits for a report:
 
 Recovery runs as the transit state `recovering`:
 
-1. Stop every thread in the worker's recorded environment, then read each one back. Recovery waits until every thread there is idle or in an error state.
-2. Check the recorded environment: the same host, the same path, ready, and still on the job's branch. Uncommitted files, untracked files, and local commits stay as they are.
-3. Spawn a new visible thread that reuses that environment. Its prompt restates the issue or the current round and says to keep existing work. Its plugin metadata carries the job's new epoch.
+1. Stop the bound worker and other demonstrably job-owned writers, then read them back. Unrelated threads are not stopped.
+2. Check every writer in the recorded environment, including archived threads and queued or background activity. Any surviving writer prevents reuse. Check that the environment has the same host and path, is ready, and is still on the job's branch. Uncommitted files, untracked files, and local commits stay as they are.
+3. Spawn a new visible thread that reuses that environment. Its prompt restates the issue or current round, retains repair instructions and the recovery reason, and says to keep existing work. Its plugin metadata carries the job's new epoch.
 
 Each recovery starts a new worker epoch. Reports from an earlier epoch are kept and refused. A spawn whose result is uncertain is never repeated blindly. The probe adopts a thread that names the job and the current epoch. If several match, the job fails with the workspace kept. If none appears within 5 minutes, the job fails.
 
-A job gets 2 recoveries. The count resets once, when the job's first `changes` report is accepted. When recoveries run out, or the environment cannot be safely reused, the job fails, and its reason names where the work is kept.
+Temporary pre-spawn environment observations wait and retry without claiming a spawn happened. Once a spawn call may have been issued, the probe-only rule applies. Reminder delivery is also persisted before the send. A lost SDK response can duplicate a reminder, but cannot silently discard it.
+
+A job gets 2 recoveries. The count resets once, when the job's first `changes` report is accepted. When recoveries run out, or the environment is conclusively unsafe to reuse, the job fails. Its public status names the failure category and retained commit; local details remain available in bb.
 
 A worker that keeps making progress has no time limit. pstack records no deadline for a round.
 
@@ -172,7 +201,7 @@ An accepted `changes` report enters `publishing`. The service pins three commits
 
 **Push through the host entry.** The worktree lives on a host, and the token lives on the server. The host entry (`src/host.ts`) never runs a worker's command. It offers fixed operations over Git objects:
 
-- `inspectCommit` reads the pinned commit and comparison commit from the worktree's object store and returns whether the diff is non-empty and whether it touches `.github/workflows`, including deletions, renames, and unpublished ancestors.
+- `inspectCommit` reads pinned Git objects and finds their merge base. It returns whether the worker contribution is non-empty, whether unpublished changes touch `.github/workflows`, and whether HEAD contains the requested base and prerequisite commits. Workflow classification includes deletions, renames, and reverted unpublished ancestors.
 - `push` pushes one named commit to one branch that matches `agent/issue-<n>-<slug>`. The host builds `<sha>:refs/heads/<branch>` itself.
 
 The push works like this:
@@ -182,13 +211,15 @@ The push works like this:
 - **From a scratch repository.** The worker controls the worktree's git config and hooks. The host pushes from a temporary bare repository that borrows the worktree's objects read-only through `objects/info/alternates`, with no system or global config, no hooks, no credential helper, and only the remote URL's protocol allowed.
 - **Never a rewrite.** The host checks that the commit descends from the expected head, then pushes with `--force-with-lease`. A remote that moved fails as `stale-remote`. Before treating that as final, the server reads the branch: a branch already at the commit counts as pushed. Divergent work is merged by the worker in its sandbox.
 
-Then the service opens the pull request as a draft with the `agent` label. A probe after a lost response adopts an existing pull request only when it is open, comes from the job's branch in the same repository, targets the job's base, and has the pushed commit as its head. A closed or unrelated pull request is never adopted. pstack never opens a pull request without changes.
+Then the service opens the pull request as a draft with the `agent` label. A probe after a lost response adopts an existing pull request only when it is open, owned by the App, carries this job's publication marker, comes from the job's branch in the same repository, targets the job's base, and has the pushed commit as its head. A closed or unrelated pull request is never adopted. pstack never opens a pull request without changes.
+
+A divergent remote head starts a publication repair round in the preserved worktree. The round retains the accepted commit, observed remote head, assigned feedback and remaining publication effects. Its fresh report must contain both commits and include new verification. When the remote already contains the accepted work, a verified no-change report can continue publication without an empty commit. A changed remote is never accepted as a new lease for the old commit alone.
 
 **Retries.** A temporary GitHub, host, or bb fault retries the same effect with backoff of 5 s, 15 s, 1 min, 5 min, and then 15 min, and waits longer when GitHub names a time. There is no try limit for temporary faults. A permanent fault, such as a denied grant or a rejected ref, fails the job and keeps the commits and the report.
 
 ## CI, conflicts, and readiness
 
-After publication the job rests in `checking`. On each sweep it reads a fresh snapshot of the pull request: its head and base, draft state, mergeability, every check run and commit status on the head, and the required checks from rulesets and classic branch protection.
+After publication the job rests in `checking`. A durable schedule permits a fresh pull request snapshot at most once per 60 seconds and once per reconcile. The snapshot includes head and base, draft state, mergeability, every check run and commit status on the head, and required checks from rulesets and classic branch protection. Between reads the engine waits without reusing a cached snapshot. Transient failures extend the schedule to GitHub's requested cooldown when it is longer.
 
 The job marks the pull request ready for review only when all of these hold:
 
@@ -200,13 +231,15 @@ The job marks the pull request ready for review only when all of these hold:
 
 A repository with no CI can become ready on local verification alone.
 
-**Readying is checked twice.** The transit state `readifying` converts the draft only if the head and base still match what was checked, then reads the pull request again. A change in between sends the job back to `checking`.
+Aggregate check-suite observations can keep the job pending or identify a failure, but never satisfy a named required check. The newest run is selected separately for each App and check name. An empty automatically queued suite is ignored unless known required policy binds its App; actual runs and in-progress suites remain evidence of a producer. Unknown mergeability waits for at least 60 seconds and two distinct fresh observations on the same target before a diagnostic repair starts.
 
-**Repair rounds.** When checks fail, mergeability is conflicting, or local verification is stale, the job returns the pull request to draft and starts a repair round in `repairing`. The round message lists the failures and the exact head and base, and tells the worker to fetch, merge as needed, and run checks itself. Each distinct cause, identified by its failure text with commit ids removed, gets 5 repair rounds. After that the job fails with the work kept. A new commit alone does not reset the count. While checks are still pending, the job waits. Temporary GitHub faults wait without spending a repair round. A permanent denial of the essential pull request snapshot fails the job.
+**Readying needs a fresh observation.** The transit state `readifying` converts the draft only if the head and base still match what was checked, then reads the pull request again. Conversion records the intended target. A later fresh healthy snapshot establishes readiness. Checks triggered by ready conversion clear the ready outcome while they run. They do not repeatedly turn the same target back into a draft.
+
+**Repair rounds.** When checks fail, mergeability is conflicting, or local verification is stale, the job returns the pull request to draft and starts a repair round in `repairing`. The round message lists the failures and the exact head and base, and tells the worker to fetch, merge as needed, and run checks itself. Each distinct failure cause, identified by its failure text with commit ids removed, gets 5 repair rounds. After that the job fails with the work kept. A new commit alone does not reset a failing-CI count. Fresh verification that reaches readiness closes the stale-local-evidence episode, so healthy base updates do not consume a lifetime failure budget. While checks are still pending, the job waits. Temporary GitHub faults wait without spending a repair round. A permanent denial of the essential pull request snapshot fails the job.
 
 **Branch policy that cannot be read.** Classic branch protection needs the Administration read grant, and some rules are not visible through the API. When pstack cannot read the whole policy, the job can still become ready on complete observed checks and local verification. The result carries a limitation such as "Branch policy could not be inspected… merge prerequisites are not established". Ready for review never claims that unread required checks passed.
 
-**Review keeps being checked.** A job in `review` reads the snapshot on every sweep. A new head, a new base, a failing check, a draft set by someone else, or a sub-issue that is no longer ready clears readiness, restores the draft in `drafting`, and returns the job to `checking` or a repair round. A merged pull request ends the job as Merged. A pull request closed without merging ends it as Closed without merging.
+**Review keeps being checked.** A job in `review` follows the same fresh-observation schedule. A new head, a new base, a failing check, a draft set by someone else, or a sub-issue that is no longer ready clears readiness, restores the draft in `drafting`, and returns the job to `checking` or a repair round. Known pending feedback and prerequisite regressions clear readiness even before the next PR snapshot is due. Same-target CI started by ready conversion waits without repeatedly redrafting. A merged pull request ends the job as Merged. A pull request closed without merging ends it as Closed without merging, including when it closes during a draft conversion.
 
 **Conflicts during review.** While the pull request is in review with no round open, the worker can publish a merge that resolves a conflict with `bb pstack issues sync`. The job then returns to `checking`.
 
@@ -240,16 +273,19 @@ The parent fails when a sub-issue's job fails, when blockers form a cycle, or wh
 
 ## Issue status on GitHub
 
-Each issue has one status comment owned by the App. It states the outcome or current step, the reason for a failure, any branch-policy limitation, the report summary, the pull request, the reported or preserved commit, the branch, and the verification lines.
+Each issue has one status comment owned by the App. It states the outcome or current step, a public failure category or intentional failure report, any branch-policy limitation, the report summary, the pull request, the reported or preserved commit, the branch, and the verification lines. Status generation does not copy raw runtime errors, environment identifiers or workspace paths into the comment. Intentional report text remains worker-authored. Unknown historical outcomes say Outcome unknown. Mentions and embedded pstack markers are normalized before transport adds its own status marker.
+
+A parent's public sub-issue progress stays visible during integration and after failure. It is stored separately from the instructions that tell its worker which branches to merge.
 
 The comment's desired text lives in the `issue_status` table, one row per repository and issue across all jobs on that issue. Every job write recomputes the text in the same transaction and raises the row's revision when the text changed or a newer job took over. A separate delivery loop, run after each poll and sweep, works through due rows:
 
 - It claims the row with a lease, finds every App-owned comment on the issue with the marker `<!-- pstack:issue-status:<repo>:<issue> -->`, edits the oldest, deletes the other App-owned copies, and creates the comment when none exists.
 - It acknowledges only the revision it delivered. A newer revision stays due.
-- It rewrites the comment every 60 seconds afterwards, so a deleted or edited comment is restored.
-- The status labels (`agent:working` while active, `agent:review` when ready, none once the job ends), replies, and review requests are queued on the same row with their own retry times.
+- It audits a delivered comment once an hour, so a deleted or edited comment is restored on the next audit. New desired text becomes due immediately, subject to any persisted GitHub cooldown.
+- The status labels (`agent:working` while active, `agent:review` when ready, none once the job ends), replies, and review requests are queued on the same row with their own retry times. An unchanged desired label set retains its retry time and is not rewritten on comment audits. A newer set supersedes stale issue labels without dropping replies or review requests.
+- At most four delivery leases are held across engines. Leases carry owner tokens across issue generations; an expired or replaced owner cannot settle newer work. A lost response may still require later reconciliation.
 
-A delivery error is stored on the row and shown in the app and in `issues show`. It never changes the job's outcome or holds back another job. Terminal jobs are delivered the same way, so a failure reaches the issue once GitHub is reachable.
+A delivery error is stored on the row and shown in the app and in `issues show`. It never changes the job's outcome or holds back another job. Pending decoration retries remain due independently of the hourly comment audit. Terminal jobs are delivered the same way, so a failure reaches the issue once GitHub is reachable.
 
 ## Inspecting jobs
 
@@ -292,10 +328,11 @@ The migrations in `src/store.ts` hold these tables:
 - `issue_repos`: each repository's label poll cursor, last poll time, and last poll error.
 - `issue_job_polls`: each job's poll cursor, its pull request's last state, and its last poll error.
 - `issue_jobs`: one row per job. It holds the trigger, the issue snapshot, project, host, branch, state, the outbox and its claim bookkeeping, thread, reminders, rejections, the accepted report, the pushed commit, the pull request, the round and its base, the worker's settings, the last error, `control_json` (worker epoch, recorded workspace, recovery and repair counts, readiness, outcome, and limitation), and a version for compare-and-set writes.
-- `issue_rounds`: one row per round with its kind, cause (`initial`, `feedback`, `ci`, or `conflict`), target head and base, report, pushed commit, and end.
+- `issue_rounds`: one row per round with its kind, cause (`initial`, `feedback`, `ci`, `conflict`, or `publication`), target head and base, report, pushed commit, and end. A publication repair can inherit the preceding round's assigned feedback without losing its report history.
 - `issue_feedback`: one row per counted review or comment, with the round that sent it.
 - `issue_submissions`: every report submission, raw, with its evaluation result.
 - `issue_status`: the desired status comment per issue and its delivery state.
+- `issue_review_schedule`: the earliest next fresh pull request observation for each job.
 
 The upgrade to unattended jobs runs in one transaction:
 
@@ -321,7 +358,7 @@ These are constants:
 
 - **Readiness can race a push.** GitHub has no way to mark a pull request ready only if its head is still a given commit. pstack checks before and after the conversion, but a push that lands between its last read and the conversion can leave a ready pull request on an unchecked head until the next sweep returns it to draft.
 - **The status comment converges, it is not atomic.** GitHub comment creation has no idempotency key. A lost response can leave a duplicate comment, and a slow writer can briefly restore older text. Later deliveries delete App-owned duplicates and rewrite the newest text, once GitHub is reachable, the App keeps its Issues grant, and no other writer keeps editing the comment.
-- **Recovery needs a confirmed stop.** pstack reuses a worktree only after every thread in it reads back as stopped. When that cannot be confirmed, or the environment moved, the job fails with the work kept instead of risking two writers.
+- **Recovery needs confirmed quiescence.** pstack stops owned threads and inspects every writer in the worktree. Temporary unknown observations wait. Confirmed surviving writers or changed workspace identity end recovery with work preserved. The SDK does not fence the workspace against future external writers.
 - **Eventual completion needs GitHub, bb, and the host to come back.** Temporary outages keep the job and its work, and the job resumes when the services recover.
 - **A report is evidence, not proof.** pstack checks the commit, the diff, and the gate, and records what the worker says it verified. It does not run the worker's checks again and cannot judge whether a no-change explanation is right. Reviewers and CI do that.
 
@@ -348,5 +385,4 @@ These are constants:
 - Workers use the project's default permission mode. A project whose default needs approvals can stall a worker until reminders and recovery run out.
 - Whether bb logs host RPC payloads, which carry the push token, is unverified.
 - The spawn probe relies on bb listing pinned threads first and then newest first. That order is observed, not documented.
-- Whether a round's commit contains its base is read from the commits `environments.status` lists ahead of `origin/<base>`. Whether bb caps that list is unverified.
 - Feedback is stored when it is polled. A review dismissed before its round starts is still answered.
