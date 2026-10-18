@@ -4,7 +4,7 @@
  * the row's version, in one transaction with the round history and feedback rows it implies.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { desiredLabels, STATUS_CONCURRENCY } from "./delivery.ts";
+import { desiredLabels, STATUS_CONCURRENCY, TERMINAL_STATUS_AUDIT_MS } from "./delivery.ts";
 import { statusBody } from "./text.ts";
 import type { Db } from "../store.ts";
 import {
@@ -292,7 +292,8 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND issue = ? AND state NOT IN (${placeholders(TERMINAL_LIST)})`)
       .get(repo, issue, ...TERMINAL_LIST) as JobRow | undefined;
 
-  function projectStatus(job: Job): void {
+  /** `terminatedAt` is when the job turned terminal, which moves an already delivered status to the daily audit. */
+  function projectStatus(job: Job, terminatedAt: number | null = null): void {
     if (job.phase.state === "ignored") return;
     const body = statusBody(job);
     db.prepare(`INSERT INTO issue_status (repo, issue, job_id, generation, revision, body) VALUES (?, ?, ?, ?, 1, ?)
@@ -303,6 +304,8 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       WHERE excluded.generation > issue_status.generation OR
         (excluded.job_id = issue_status.job_id AND excluded.body != issue_status.body)`)
       .run(job.repo, job.issue, job.id, job.generation, body);
+    if (terminatedAt !== null) db.prepare("UPDATE issue_status SET next_at = max(next_at,?) WHERE repo = ? AND issue = ? AND job_id = ? AND delivered_revision = revision AND error IS NULL")
+      .run(terminatedAt + TERMINAL_STATUS_AUDIT_MS, job.repo, job.issue, job.id);
     const row = db.prepare("SELECT job_id, decorations_json, desired_labels_key FROM issue_status WHERE repo = ? AND issue = ?").get(job.repo, job.issue) as { job_id: string; decorations_json: string; desired_labels_key: string | null } | undefined;
     if (!row || row.job_id !== job.id) return;
     const effect = desiredLabels(job);
@@ -437,6 +440,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
         if (waiting !== change.startRound.feedback.length) return null;
       }
       const previous = change.startRound ? get(id) : null;
+      const before = db.prepare("SELECT state FROM issue_jobs WHERE id = ?").get(id) as { state: JobState } | undefined;
       const set = columns(change);
       const names = Object.keys(set);
       const assignments = [...names.map((name) => `${name} = ?`), "version = version + 1", "runtime_revision = runtime_revision + 1", "updated_at = ?"].join(", ");
@@ -467,7 +471,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       }
       if (change.finishRound) db.prepare("UPDATE issue_rounds SET finished_at = ?, outcome_json = coalesce(outcome_json, ?) WHERE job_id = ? AND ordinal = ? AND finished_at IS NULL").run(now, JSON.stringify({ state: job.phase.state, disposition: job.control.disposition, report: job.report?.outcome ?? null }), id, job.round);
       if (change.evaluation) db.prepare("UPDATE issue_submissions SET evaluated_at = ?, result = ?, snapshot_json = ? WHERE id = ? AND evaluated_at IS NULL").run(now, change.evaluation.result, change.evaluation.snapshot ? JSON.stringify(change.evaluation.snapshot) : null, change.evaluation.submissionId);
-      projectStatus(job);
+      projectStatus(job, before && !TERMINAL.has(before.state) && TERMINAL.has(job.phase.state) ? now : null);
       return job;
     }),
     addFeedback,

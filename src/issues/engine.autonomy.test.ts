@@ -447,9 +447,9 @@ test("terminal status retries independently from labels and unrelated execution,
   assert.equal(h.gh().comments.get(41)!.length, 1);
   assert.match(h.gh().comments.get(41)![0]!.body, /Essential capability unavailable/);
   h.gh().comments.delete(41);
-  await h.advance(30 * MIN);
-  assert.equal(h.gh().comments.get(41), undefined, "a deleted terminal comment waits for the hourly audit");
-  await h.advance(30 * MIN);
+  h.clock.now += 12 * 60 * MIN; await h.settle();
+  assert.equal(h.gh().comments.get(41), undefined, "a deleted terminal comment waits for the daily audit");
+  h.clock.now += 12 * 60 * MIN; await h.settle();
   assert.equal(h.gh().comments.get(41)!.length, 1);
   assert.match(h.gh().comments.get(41)![0]!.body, /Essential capability unavailable/);
 });

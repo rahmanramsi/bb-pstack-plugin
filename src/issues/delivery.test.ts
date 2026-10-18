@@ -4,14 +4,15 @@ import { createServer } from "node:http";
 import { test, type TestContext } from "node:test";
 import Database from "better-sqlite3";
 import { MIGRATIONS } from "../store.ts";
-import { createStatusDelivery, STATUS_AUDIT_MS, STATUS_CONCURRENCY } from "./delivery.ts";
+import { createStatusDelivery, desiredLabels, STATUS_AUDIT_MS, STATUS_CONCURRENCY, TERMINAL_STATUS_AUDIT_MS } from "./delivery.ts";
 import { createGitHub, GitHubTransientError } from "./github.ts";
-import { initialControl, LABEL, type EffectOutcome, type JobId, type RepoName, type Sha } from "./job.ts";
+import { enter, initialControl, LABEL, type EffectOutcome, type JobId, type RepoName, type Sha } from "./job.ts";
 import { openIssueStore } from "./store.ts";
 import { COMMENT_MAX, statusBody, statusComment, statusMarker } from "./text.ts";
 
 const REPO = "acme/web" as RepoName;
 const SHA = "1".repeat(40) as Sha;
+const HOUR = 60 * 60_000;
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
 
 async function fixture(t: TestContext) {
@@ -148,15 +149,91 @@ test("terminal audits stay quiet while independent decoration and newer outcome 
   const marked = [...h.comments.values()].find((comment) => comment.body.includes("pstack:issue-status"))!;
   h.comments.delete(marked.id);
   await h.build()();
-  assert.equal([...h.comments.values()].filter((comment) => comment.body.includes("pstack:issue-status")).length, 0);
-  h.clock.now += STATUS_AUDIT_MS;
+  assert.equal(h.status().length, 0);
+  h.clock.now += 12 * HOUR;
   await h.build()();
-  assert.equal([...h.comments.values()].filter((comment) => comment.body.includes("pstack:issue-status")).length, 1);
-  const repaired = [...h.comments.values()].find((comment) => comment.body.includes("pstack:issue-status"))!;
+  assert.equal(h.status().length, 0);
+  h.clock.now += 12 * HOUR;
+  await h.build()();
+  assert.equal(h.status().length, 1);
+  const repaired = h.status()[0]!;
   repaired.body = "edited externally\n<!-- pstack:issue-status:acme/web:41 -->";
-  h.clock.now += STATUS_AUDIT_MS;
+  h.clock.now += TERMINAL_STATUS_AUDIT_MS;
   await h.build()();
   assert.ok(repaired.body.includes("Closed without merging"));
+});
+
+test("a delivered status adopts the daily audit when its job turns terminal without a new body", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  const control = { ...job.control, disposition: "failure" as const, publicFailure: { kind: "execution" as const } };
+  job = h.store.write(job.id, job.version, { phase: enter("sticking", [desiredLabels(job)]), control }, h.clock.now)!;
+  await h.build()();
+  const delivered = h.status()[0]!.body;
+  assert.match(delivered, /Issue #41: Failed/);
+  h.clock.now += 60_000;
+  job = h.store.write(job.id, job.version, { phase: { state: "stuck" } }, h.clock.now)!;
+  await h.build()();
+  assert.equal(h.status()[0]!.body, delivered);
+  h.comments.delete(h.status()[0]!.id);
+  h.clock.now += 12 * HOUR;
+  await h.build()();
+  assert.equal(h.status().length, 0);
+  h.clock.now += 12 * HOUR;
+  await h.build()();
+  assert.equal(h.status().length, 1);
+});
+
+test("an active job's status is audited hourly", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  job = h.store.write(job.id, job.version, { phase: { state: "review" }, threadId: "thread", pushedSha: SHA, pr: { number: 5, url: "https://github.test/pull/5" } }, h.clock.now)!;
+  await h.build()();
+  h.comments.delete(h.status()[0]!.id);
+  h.clock.now += HOUR - 1;
+  await h.build()();
+  assert.equal(h.status().length, 0);
+  h.clock.now += 1;
+  await h.build()();
+  assert.equal(h.status().length, 1);
+});
+
+test("a status delivered after its job turns terminal uses the terminal audit interval", { timeout: 5_000 }, async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  job = h.store.write(job.id, job.version, { phase: enter("sticking", [desiredLabels(job)]), control: { ...job.control, disposition: "failure", publicFailure: { kind: "execution" } } }, h.clock.now)!;
+  let reached!: () => void;
+  let release!: () => void;
+  const hit = new Promise<void>((resolve) => { reached = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => {
+    const response = await originalFetch(...args);
+    if (args[1]?.method === "POST" && String(args[0]).endsWith("/issues/41/comments")) {
+      reached();
+      await gate;
+    }
+    return response;
+  };
+  let deliver: ReturnType<typeof h.build>;
+  try { deliver = h.build(); }
+  finally { globalThis.fetch = originalFetch; }
+  const pending = deliver();
+  try {
+    await hit;
+    job = h.store.write(job.id, job.version, { phase: { state: "stuck" } }, h.clock.now)!;
+  } finally {
+    release();
+    await pending;
+  }
+  assert.equal(h.status().length, 1);
+  h.comments.delete(h.status()[0]!.id);
+  h.clock.now += 12 * HOUR;
+  await h.build()();
+  assert.equal(h.status().length, 0, "the in-flight response cannot restore the hourly schedule");
+  h.clock.now += 12 * HOUR;
+  await h.build()();
+  assert.equal(h.status().length, 1);
 });
 
 test("an ordinary comment fault leaves an unrelated decoration independent", async (t) => {

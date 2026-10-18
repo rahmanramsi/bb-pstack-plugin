@@ -4,6 +4,7 @@ import type { IssueStore } from "./store.ts";
 import { statusMarker } from "./text.ts";
 
 export const STATUS_AUDIT_MS = 60 * 60_000;
+export const TERMINAL_STATUS_AUDIT_MS = 24 * STATUS_AUDIT_MS;
 export const DELIVERY_RETRY_MS = 60_000;
 export const STATUS_CONCURRENCY = 4;
 const SETTLE_MARGIN_MS = 5_000;
@@ -39,6 +40,8 @@ export function createStatusDelivery({ store, github, clock, runEffect }: Delive
             let notBefore = 0;
             try {
               await github.repo(status.repo, AbortSignal.timeout(50_000)).upsertIssueStatus({ issue: status.issue, marker: statusMarker(status.repo, status.issue), revision: status.revision, body: status.body });
+              const projected = store.get(status.jobId);
+              nextAt = clock() + (projected?.generation === status.generation && TERMINAL.has(projected.phase.state) ? TERMINAL_STATUS_AUDIT_MS : STATUS_AUDIT_MS);
             } catch (failure) {
               error = failure instanceof Error ? failure.message : String(failure);
               notBefore = failure instanceof GitHubTransientError ? failure.notBefore ?? 0 : 0;
