@@ -7,18 +7,23 @@ import { ghCommands, repoFromRemote } from "./commands.ts";
 
 const HEAD = "a".repeat(40);
 const REMOTE = "b".repeat(40);
-const PULL: PullDetail = { number: 7, url: "https://github.com/acme/web/pull/7", title: "feat: x", body: "Body", author: "pstack[bot]", state: "open", draft: true, head: "feat/x", headSha: HEAD, base: "main" };
+const MAIN = "c".repeat(40);
+const PULL: PullDetail = { number: 7, url: "https://github.com/acme/web/pull/7", title: "feat: x", body: "Body", author: "pstack[bot]", state: "open", draft: true, head: "feat/x", headSha: HEAD, base: "main", headRepo: "acme/web" };
 
-function harness(options: { branch?: string | null; origin?: string | null; remoteSha?: string | null; push?: PushResult; issueWorker?: boolean; configured?: boolean; gate?: string } = {}) {
+function harness(options: { branch?: string | null; origin?: string | null; remoteSha?: string | null; push?: PushResult; issueWorker?: boolean; configured?: boolean; gate?: string; ahead?: number } = {}) {
   const calls: string[] = [];
   const pushes: PushBranchInput[] = [];
   const created: unknown[] = [];
   const comments: { issue: number; body: string }[] = [];
   const revoked: string[] = [];
+  const closed: number[] = [];
+  const deleted: string[] = [];
   const branch = options.branch === undefined ? "feat/x" : options.branch;
   const repo = {
     defaultBranch: async () => "main",
-    branchSha: async (name: string) => (name === "feat/x" ? (options.remoteSha === undefined ? REMOTE : options.remoteSha) : null),
+    branchSha: async (name: string) => (name === "feat/x" ? (options.remoteSha === undefined ? REMOTE : options.remoteSha) : name === "main" ? MAIN : null),
+    closePull: async (number: number) => void closed.push(number),
+    deleteBranch: async (name: string) => void deleted.push(name),
     pushCredentials: async () => ({ remoteUrl: "https://github.com/acme/web.git", token: "ghs_push" }),
     fetchCredentials: async () => ({ remoteUrl: "https://github.com/acme/web.git", token: "ghs_fetch" }),
     revoke: async (token: string) => void revoked.push(token),
@@ -48,6 +53,7 @@ function harness(options: { branch?: string | null; origin?: string | null; remo
           workspace: {
             checkout: branch === null ? { kind: "detached", headSha: HEAD } : { kind: "branch", branchName: branch, headSha: HEAD },
             workingTree: { hasUncommittedChanges: false, files: [] },
+            mergeBase: options.ahead === undefined ? null : { aheadCount: options.ahead },
           },
         }),
       },
@@ -69,7 +75,7 @@ function harness(options: { branch?: string | null; origin?: string | null; remo
   });
   const cli = defineCli({ name: "pstack", summary: "pstack", commands });
   const run = (argv: string[]) => cli.run(argv, { threadId: "thr_1", cwd: "/work/web" });
-  return { run, calls, pushes, created, comments, revoked };
+  return { run, calls, pushes, created, comments, revoked, closed, deleted };
 }
 
 test("repoFromRemote reads github.com remotes in every form and nothing else", () => {
@@ -119,6 +125,24 @@ test("a rejected push points at fetch and still revokes the token", async () => 
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr ?? "", /push rejected \(not-descendant\): diverged[\s\S]*bb pstack gh fetch/);
   assert.deepEqual(h.revoked, ["ghs_push"]);
+});
+
+test("a new branch with no commits beyond the default branch is not pushed", async () => {
+  const h = harness({ remoteSha: null, ahead: 0 });
+  const result = await h.run(["gh", "push"]);
+  assert.match(result.stderr ?? "", /has no commits that main lacks[\s\S]*Commit your work first/);
+  assert.deepEqual(h.pushes, []);
+  assert.equal((await harness({ remoteSha: null, ahead: 1 }).run(["gh", "push"])).exitCode, 0);
+  assert.equal((await harness({ remoteSha: null }).run(["gh", "push"])).exitCode, 0, "without origin/main locally, only HEAD at main's tip is refused");
+});
+
+test("gh pr close closes the pull request and deletes only its own non-default head branch", async () => {
+  const h = harness();
+  const result = await h.run(["gh", "pr", "close", "--delete-branch", "--body", "Superseded."]);
+  assert.equal(result.stdout, `Closed ${PULL.url}\nDeleted feat/x.\n`);
+  assert.deepEqual(h.closed, [7]);
+  assert.deepEqual(h.deleted, ["feat/x"]);
+  assert.deepEqual(h.comments, [{ issue: 7, body: "Superseded." }]);
 });
 
 test("gh push of a branch already at HEAD does not push", async () => {

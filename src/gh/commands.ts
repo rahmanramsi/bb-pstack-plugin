@@ -23,9 +23,9 @@ export type GhDeps = {
 
 /** Contributed to every thread's instructions while the GitHub App is configured. */
 export const GH_INSTRUCTIONS =
-  "GitHub: agents hold no GitHub token. Use `bb pstack gh` (push, fetch, pr create|view|feedback|edit|comment|reply|merge, issue view|comment, checks) for the repository behind this worktree's origin; plain `git push` and `gh` are not authenticated. See the pstack `github` skill.";
+  "GitHub: agents hold no GitHub token. Use `bb pstack gh` (push, fetch, pr create|view|feedback|edit|comment|reply|merge|close, issue view|comment, checks) for the repository behind this worktree's origin; plain `git push` and `gh` are not authenticated. See the pstack `github` skill.";
 
-type Workspace = { threadId: string; hostId: string; path: string; repo: RepoName; branch: string | null; headSha: string | null; dirty: boolean };
+type Workspace = { threadId: string; environmentId: string; hostId: string; path: string; repo: RepoName; branch: string | null; headSha: string | null; dirty: boolean };
 
 /** `owner/name` from a GitHub https, scp-like or ssh remote URL, or null for any other host. */
 export function repoFromRemote(url: string): RepoName | null {
@@ -95,6 +95,7 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
     const { checkout, workingTree } = status.workspace;
     return {
       threadId: ctx.threadId,
+      environmentId: thread.environmentId,
       hostId: environment.hostId,
       path: environment.path,
       repo,
@@ -157,6 +158,12 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
             throw new PluginCliError(`pstack does not push to ${ws.repo}'s default branch ${defaultBranch}`, { code: "default_branch", hint: "Push another branch and open a pull request with `bb pstack gh pr create`." });
           }
           const expectedRemoteSha = await repo.branchSha(branch);
+          if (expectedRemoteSha === null && !(await hasOwnCommits(bb, ws, defaultBranch, await repo.branchSha(defaultBranch)))) {
+            throw new PluginCliError(`HEAD ${ws.headSha} has no commits that ${defaultBranch} lacks, so ${branch} would only copy ${defaultBranch}`, {
+              code: "nothing_to_push",
+              hint: ws.dirty ? "Commit your changes first; uncommitted changes are never pushed." : "Commit your work first.",
+            });
+          }
           if (expectedRemoteSha === ws.headSha) {
             return input.options.json ? json({ repo: ws.repo, branch, sha: ws.headSha, pushed: false }) : { exitCode: 0, stdout: `${ws.repo} ${branch} is already at ${ws.headSha}.\n` };
           }
@@ -288,6 +295,36 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
         });
       },
     }),
+    "gh pr close": cliCommand({
+      summary: "Close a pull request without merging, optionally deleting its branch",
+      positionals: [{ name: "number", description: "Pull request number (defaults to the one for the current branch)" }],
+      options: {
+        "delete-branch": { type: "boolean", description: "Delete the head branch too, when it lives in this repository and is not the default branch" },
+        ...bodyOptions,
+      },
+      constraints: [{ kind: "at-most-one", options: ["body", "body-file"] }],
+      async run(input, ctx) {
+        const ws = await workspace(ctx);
+        refuseIssueWorker(ws.threadId, "close pull requests");
+        const text = await body(input.options, ctx, ws.threadId);
+        return withRepo(ws.repo, async (repo) => {
+          const pull = await findPull(repo, ws, input.positionals.number);
+          if (pull.state === "merged") throw new PluginCliError(`#${pull.number} is already merged`, { code: "pull_merged" });
+          if (text) await repo.comment(pull.number, text);
+          if (pull.state === "open") await repo.closePull(pull.number);
+          const lines = [pull.state === "open" ? `Closed ${pull.url}` : `${pull.url} was already closed.`];
+          if (input.options["delete-branch"]) {
+            if (pull.headRepo !== ws.repo) lines.push(`Kept ${pull.head}: it lives in ${pull.headRepo ?? "a deleted fork"}, not ${ws.repo}.`);
+            else if (pull.head === (await repo.defaultBranch())) lines.push(`Kept ${pull.head}: it is the default branch.`);
+            else {
+              await repo.deleteBranch(pull.head);
+              lines.push(`Deleted ${pull.head}.`);
+            }
+          }
+          return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
+        });
+      },
+    }),
     "gh pr reply": cliCommand({
       summary: "Answer an inline review comment in its thread",
       description: "Pass the id of the thread's first comment, shown as `thread <id>` by `bb pstack gh pr feedback`; GitHub refuses replies to replies.",
@@ -374,6 +411,17 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
       },
     }),
   };
+}
+
+/**
+ * Whether HEAD has a commit the default branch lacks. Read from the worktree against `origin/<default>`; when that
+ * ref is missing locally, only HEAD sitting exactly at the remote default tip counts as nothing.
+ */
+async function hasOwnCommits(bb: BbPluginApi, ws: Workspace, defaultBranch: string, defaultSha: string | null): Promise<boolean> {
+  if (ws.headSha === defaultSha) return false;
+  const status = await bb.sdk.environments.status({ environmentId: ws.environmentId, mergeBaseBranch: `origin/${defaultBranch}` }).catch(() => null);
+  if (status?.outcome !== "available" || !status.workspace.mergeBase) return true;
+  return status.workspace.mergeBase.aheadCount > 0;
 }
 
 async function findPull(repo: RepoClient, ws: Workspace, number: string | undefined): Promise<PullDetail> {

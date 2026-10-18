@@ -24,6 +24,7 @@ The repository comes from `remote.origin.url` in this worktree's own git config 
 | Read reviews and inline threads | `bb pstack gh pr feedback [<number>] [--json]` |
 | Answer an inline review thread | `bb pstack gh pr reply <number> <thread-id> --body-file <file>` (the id `pr feedback` prints as `thread <id>`) |
 | Merge | `bb pstack gh pr merge <number> [--method squash\|merge\|rebase] [--sha <verified-head>]` |
+| Close without merging | `bb pstack gh pr close [<number>] [--delete-branch] [--body-file <file>]` |
 | Read an issue and its comments | `bb pstack gh issue view <number> [--json]` |
 | Comment on an issue | `bb pstack gh issue comment <number> --body-file <file>` |
 | CI status | `bb pstack gh checks [<pr-number>] [--json]` |
@@ -32,13 +33,13 @@ A pull request number defaults to the one whose head is your current branch. Put
 
 ## Rules the commands enforce
 
-- **Push publishes committed HEAD only.** Commit first. Uncommitted changes stay local, and the output says so.
+- **Push publishes committed HEAD only.** Commit first. Uncommitted changes stay local, and the output says so. A new branch whose HEAD has no commits beyond the default branch is refused rather than published as a copy of it.
 - **No blind force push.** The remote branch must be absent or an ancestor of HEAD. When someone else pushed, `push` is rejected with `not-descendant` or `stale-remote`: run `bb pstack gh fetch`, rebase or merge `origin/<branch>`, and push again. After a rebase you made on purpose, `push --force-with-lease` replaces the branch, but only while it is still at the commit pstack read just before the push.
 - **The default branch is never pushed.** Land changes through a pull request.
 - **Pull requests open ready for review.** Pass `--draft` only when the playbook asks for a draft.
 - **In poteto mode, `pr create` waits for `bb pstack gate pr`.** It refuses while checklist steps are open, the same as the gate itself.
 - **Merges are pinned to a head.** `pr merge` merges only while the head is the commit you verified (`--sha`, defaulting to the head it reads now). Branch protection and required checks still apply.
-- **Issue workers do not push, open, edit or merge.** An issue worker hands its result to `bb pstack issues report`, and pstack pushes and opens the pull request itself.
+- **Issue workers do not push, open, edit, merge or close.** An issue worker hands its result to `bb pstack issues report`, and pstack pushes and opens the pull request itself.
 
 ## When a command fails
 
