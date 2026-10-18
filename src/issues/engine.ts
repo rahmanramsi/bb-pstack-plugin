@@ -32,6 +32,7 @@ import { acceptSync,
   type AcceptedReport,
   parseReport,
   awaitingThread,
+  sendingToWorker,
   containsSha,
   integrationPrerequisites,
   verifiedDeliveredHead,
@@ -429,11 +430,12 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (!workspace || !settings) return { kind: "fail", error: "safe environment reuse is unavailable; the original thread and workspace are retained" };
         try {
           const environment = await bb.sdk.environments.get({ environmentId: workspace.environmentId }).catch((error) => { if (isMissing(error)) return null; throw error; });
-          if (!environment || environment.status === "destroyed") return { kind: "fail", error: `the recorded environment ${workspace.environmentId} is missing; work location retained at ${workspace.path}` };
-          if (environment.status !== "ready" || !environment.path) return { kind: "retry-unissued", error: `the recorded environment is ${environment.status}; awaiting safe workspace observation`, notBefore: null };
+          if (!environment || environment.status === "destroyed" || environment.status === "error") return { kind: "fail", error: `the recorded environment ${workspace.environmentId} is ${environment?.status ?? "missing"}; work location retained at ${workspace.path}` };
+          if (environment.status === "creating" || environment.status === "provisioning") return { kind: "retry-unissued", error: `the recorded environment is ${environment.status}; awaiting safe workspace observation`, notBefore: null };
+          if (!environment.path) return { kind: "fail", error: `the recorded environment has no workspace path; work retained at ${workspace.path}` };
           if (environment.id !== workspace.environmentId || environment.hostId !== workspace.hostId || environment.path !== workspace.path) return { kind: "fail", error: `the recorded environment ${workspace.environmentId} cannot be safely reused; work retained at ${workspace.path}` };
           const status = await bb.sdk.environments.status({ environmentId: workspace.environmentId, mergeBaseBranch: `origin/${job.baseBranch}` });
-          if (status.outcome === "unavailable" && !["unknown_environment", "path_not_found", "not_git_repo", "workspace_type_mismatch"].includes(status.failure.code)) return { kind: "retry-unissued", error: `preserved workspace status is unavailable: ${status.failure.message}`, notBefore: null };
+          if (status.outcome === "unavailable" && status.failure.code === "unknown") return { kind: "retry-unissued", error: `preserved workspace status is unavailable: ${status.failure.message}`, notBefore: null };
           if (status.outcome !== "available" || status.workspace.checkout.kind !== "branch" || status.workspace.checkout.branchName !== workspace.branch) return { kind: "fail", error: `the preserved branch identity cannot be confirmed in ${workspace.environmentId}; workspace retained` };
           const writers = await workspaceThreads(workspace.environmentId);
           for (const writer of writers) {
@@ -443,7 +445,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           }
         } catch (error) {
           if (error instanceof GitHubSetupError || error instanceof GitHubPermanentError) return { kind: "fail", error: message(error) };
-          return { kind: "retry-unissued", error: message(error), notBefore: error instanceof GitHubTransientError ? error.notBefore : null };
+          return error instanceof GitHubTransientError ? { kind: "retry-unissued", error: message(error), notBefore: error.notBefore } : { kind: "fail", error: `safe workspace observation failed: ${message(error)}; work retained at ${workspace.path}` };
         }
         try {
           const thread = await bb.sdk.threads.spawn({ projectId: job.projectId, visibility: "visible", environment: { type: "reuse", environmentId: workspace.environmentId }, pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch }, prompt: recoveryPrompt(job), title: `Recover issue #${job.issue}`, providerId: settings.providerId, model: settings.model, reasoningLevel: settings.reasoningLevel, ...(settings.permissionMode ? { permissionMode: settings.permissionMode } : {}) });
@@ -826,6 +828,13 @@ export function createIssues(deps: IssuesDeps): Issues {
       store.finishSubmission(submission.id, "stale worker or round", clock());
       return reject("stale_report", "The report is retained but belongs to a retired worker or round.");
     }
+    if (sendingToWorker(job)) {
+      try {
+        const tree = await worktree(job);
+        if (tree.ok && !submission.intendedSha && store.bindSubmission(submission.id, tree.headSha)) submission.intendedSha = tree.headSha;
+      } catch {}
+      return reject("pending", "Report saved while the current worker message is delivered.");
+    }
     if (!REPORTING.has(job.phase.state)) {
       store.finishSubmission(submission.id, "job no longer reporting", clock());
       return reject("not_working", `job ${job.id} is ${job.phase.state}`);
@@ -913,8 +922,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!named || candidate?.epoch !== named.control.epoch || !awaitingThread(named)) return { ok: false, code: "not_issue_worker", message: "only a confirmed issue worker can report" };
       job = named;
     }
-    if (!REPORTING.has(job.phase.state) && !awaitingThread(job)) return { ok: false, code: "not_working", message: `job ${job.id} is not accepting a worker report` };
-    if (awaitingThread(job)) {
+    if (!REPORTING.has(job.phase.state) && !awaitingThread(job) && !sendingToWorker(job)) return { ok: false, code: "not_working", message: `job ${job.id} is not accepting a worker report` };
+    if (awaitingThread(job) || sendingToWorker(job)) {
       const candidate = await namedJob(threadId);
       if (!candidate || candidate.epoch !== job.control.epoch) return { ok: false, code: "stale_report", message: "the worker epoch is retired" };
     }

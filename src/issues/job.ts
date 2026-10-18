@@ -147,6 +147,7 @@ export const EFFECT_POLICY = {
 export const MAX_RECOVERIES = 2;
 export const MAX_INVALID_REPORTS = 3;
 export const MAX_REPAIRS = 5;
+export const MAX_RECOVERY_OBSERVATIONS = 8;
 const BACKOFF_MS = [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
 
 export type EffectOutcome =
@@ -273,6 +274,7 @@ export type Control = {
   milestones: readonly string[];
   readiness: ReviewTarget | null;
   mergedHead?: Sha | null;
+  recoveryObservation?: { effectKey: string; attempts: number; firstAt: number } | null;
   reviewIntent: ReviewTarget | null;
   localEvidence: { head: Sha; base: Sha } | null;
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
@@ -287,7 +289,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -587,6 +589,7 @@ function feedbackAction(job: Job, facts: Facts): Action | null {
   if (quiet > now) return { type: "sleep", until: quiet };
   if (!facts.thread || !facts.rounds || !facts.remote) return null;
   if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
+  if (facts.thread.kind === "failed" && facts.thread.retryAt && facts.thread.retryAt > now) return { type: "sleep", until: facts.thread.retryAt };
   const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
   return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
 }
@@ -741,8 +744,13 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
     }
     case "unknown":
       return { phase: { ...phase, leaseUntil: null, nextAt: backoff() }, error: outcome.error };
-    case "retry-unissued":
-      return { phase: { ...phase, tries: 0, firstAt: null, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
+    case "retry-unissued": {
+      const previous = job.control.recoveryObservation;
+      const observation = { effectKey: head.key, attempts: previous?.effectKey === head.key ? previous.attempts + 1 : 1, firstAt: previous?.effectKey === head.key ? previous.firstAt : now };
+      if (observation.attempts >= MAX_RECOVERY_OBSERVATIONS) return stick(job, `safe workspace observation exhausted: ${outcome.error}; work retained at ${job.control.workspace?.path ?? "the original environment"}`);
+      const delay = BACKOFF_MS[Math.min(observation.attempts - 1, BACKOFF_MS.length - 1)]!;
+      return { phase: { ...phase, tries: 0, firstAt: null, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, now + delay) }, control: { ...job.control, recoveryObservation: observation }, error: outcome.error };
+    }
     case "retry":
       return { phase: { ...phase, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
     case "publication-diverged": {
@@ -809,6 +817,10 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
 function close(job: Job, disposition: PullState = "merged", observedHead?: Sha): Change {
   if (disposition === "closed") return { ...stick(job, "the pull request closed without merging"), control: { ...job.control, readiness: null, disposition: "closed" } };
   return { phase: enter("closing", endingEffects(job, "close")), deadline: null, error: null, control: { ...job.control, disposition: "merged", mergedHead: observedHead ?? job.control.mergedHead ?? null, readiness: null } };
+}
+
+export function sendingToWorker(job: Job): boolean {
+  return job.threadId !== null && "effects" in job.phase && job.phase.effects[0].op === "send-round";
 }
 
 /** Waiting for its spawn to create the worker, which may report before the spawn is confirmed. */
