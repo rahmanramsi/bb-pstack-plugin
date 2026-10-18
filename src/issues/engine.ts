@@ -13,6 +13,7 @@ import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import type { HostPush, HostInspectCommit } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
+import { repoFromRemote } from "../gh/commands.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { issueBoard, type BoardFilter, type IssueBoardSchema, type IssueSummarySchema } from "./board.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
@@ -242,7 +243,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (environment.hostId !== job.hostId) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the mapped host ${job.hostId}` };
     if (environment.status !== "ready" || !environment.path) return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
     const origin = await deps.inspectOrigin(job.hostId, environment.path);
-    if (!origin || !new RegExp(`^(?:https://github\\.com/|git@github\\.com:)${job.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.git)?$`, "i").test(origin)) return { ok: false, transient: false, error: "the recorded workspace origin does not match the authorized repository" };
+    if (!origin || repoFromRemote(origin) !== job.repo.toLowerCase()) return { ok: false, transient: false, error: "the recorded workspace origin does not match the authorized repository" };
     const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
     if (status.outcome === "unavailable") return { ok: false, transient: true, error: `the worktree status is unavailable: ${status.failure.message}` };
     if (status.outcome !== "available") return { ok: false, transient: false, error: status.message };
@@ -455,15 +456,23 @@ export function createIssues(deps: IssuesDeps): Issues {
         const workspace = job.control.workspace;
         const settings = job.worker;
         if (!workspace || !settings) return { kind: "fail", error: "safe environment reuse is unavailable; the original thread and workspace are retained" };
-        const environment = await bb.sdk.environments.get({ environmentId: workspace.environmentId });
-        if (environment.hostId !== workspace.hostId || environment.path !== workspace.path || environment.status !== "ready") return { kind: "fail", error: `the recorded environment ${workspace.environmentId} cannot be safely reused; work retained at ${workspace.path}` };
-        const status = await bb.sdk.environments.status({ environmentId: workspace.environmentId, mergeBaseBranch: `origin/${job.baseBranch}` });
-        if (status.outcome !== "available" || status.workspace.checkout.kind !== "branch" || status.workspace.checkout.branchName !== workspace.branch) return { kind: "fail", error: `the preserved branch identity cannot be confirmed in ${workspace.environmentId}; workspace retained` };
-        const writers = await workspaceThreads(workspace.environmentId);
-        for (const writer of writers) {
-          if (writer.activity.activeBackgroundCommandCount > 0 || writer.activity.activeGoalCount > 0 || writer.activity.activeWorkflowCount > 0) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}: background commands, goals or workflows remain; work retained` };
-          const current = await bb.sdk.threads.get({ threadId: writer.id }).catch((error) => { if (isMissing(error)) return null; throw error; });
-          if (current && (!["idle", "error"].includes(current.status) || (current.runtime !== undefined && !["idle", "error"].includes(current.runtime.displayStatus)) || current.queuedMessageCount > 0 || current.activeBackgroundAgentCount > 0)) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}; work retained` };
+        try {
+          const environment = await bb.sdk.environments.get({ environmentId: workspace.environmentId }).catch((error) => { if (isMissing(error)) return null; throw error; });
+          if (!environment || environment.status === "destroyed") return { kind: "fail", error: `the recorded environment ${workspace.environmentId} is missing; work location retained at ${workspace.path}` };
+          if (environment.status !== "ready" || !environment.path) return { kind: "retry-unissued", error: `the recorded environment is ${environment.status}; awaiting safe workspace observation`, notBefore: null };
+          if (environment.id !== workspace.environmentId || environment.hostId !== workspace.hostId || environment.path !== workspace.path) return { kind: "fail", error: `the recorded environment ${workspace.environmentId} cannot be safely reused; work retained at ${workspace.path}` };
+          const status = await bb.sdk.environments.status({ environmentId: workspace.environmentId, mergeBaseBranch: `origin/${job.baseBranch}` });
+          if (status.outcome === "unavailable" && !["unknown_environment", "path_not_found", "not_git_repo", "workspace_type_mismatch"].includes(status.failure.code)) return { kind: "retry-unissued", error: `preserved workspace status is unavailable: ${status.failure.message}`, notBefore: null };
+          if (status.outcome !== "available" || status.workspace.checkout.kind !== "branch" || status.workspace.checkout.branchName !== workspace.branch) return { kind: "fail", error: `the preserved branch identity cannot be confirmed in ${workspace.environmentId}; workspace retained` };
+          const writers = await workspaceThreads(workspace.environmentId);
+          for (const writer of writers) {
+            if (writer.activity.activeBackgroundCommandCount > 0 || writer.activity.activeGoalCount > 0 || writer.activity.activeWorkflowCount > 0) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}: background commands, goals or workflows remain; work retained` };
+            const current = await bb.sdk.threads.get({ threadId: writer.id }).catch((error) => { if (isMissing(error)) return null; throw error; });
+            if (current && (!["idle", "error"].includes(current.status) || (current.runtime !== undefined && !["idle", "error"].includes(current.runtime.displayStatus)) || current.queuedMessageCount > 0 || current.activeBackgroundAgentCount > 0)) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}; work retained` };
+          }
+        } catch (error) {
+          if (error instanceof GitHubSetupError || error instanceof GitHubPermanentError) return { kind: "fail", error: message(error) };
+          return { kind: "retry-unissued", error: message(error), notBefore: error instanceof GitHubTransientError ? error.notBefore : null };
         }
         try {
           const thread = await bb.sdk.threads.spawn({ projectId: job.projectId, visibility: "visible", environment: { type: "reuse", environmentId: workspace.environmentId }, pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch }, prompt: recoveryPrompt(job), title: `Recover issue #${job.issue}`, providerId: settings.providerId, model: settings.model, reasoningLevel: settings.reasoningLevel, ...(settings.permissionMode ? { permissionMode: settings.permissionMode } : {}) });
@@ -503,7 +512,14 @@ export function createIssues(deps: IssuesDeps): Issues {
             workspace = { environmentId: original.environmentId, hostId: environment.hostId!, path: environment.path, branch: tree.ok ? tree.branch : "unknown" };
           }
         }
-        const threads = new Set([...(job.threadId ? [job.threadId] : []), ...(await threadsNaming(job, signal)), ...(workspace ? (await workspaceThreads(workspace.environmentId, signal)).map((thread) => thread.id) : [])]);
+        const threads = new Set([...(job.threadId ? [job.threadId] : []), ...(await threadsNaming(job, signal))]);
+        if (workspace) {
+          for (const writer of await workspaceThreads(workspace.environmentId, signal)) {
+            if (writer.originPluginId !== bb.pluginId || writer.projectId !== job.projectId || writer.createdAt < job.createdAt - 60_000 || (store.byThread(writer.id)?.id ?? job.id) !== job.id) continue;
+            const metadata = IssueMetadata.safeParse(await bb.sdk.threads.getPluginMetadata({ threadId: writer.id, signal }));
+            if (metadata.success && metadata.data.jobId === job.id && metadata.data.epoch <= job.control.epoch) threads.add(writer.id);
+          }
+        }
         for (const threadId of threads) {
           await bb.sdk.threads.stop({ threadId, signal }).catch((error) => { if (!isMissing(error)) throw error; });
           const stopped = await bb.sdk.threads.get({ threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });

@@ -161,6 +161,7 @@ export type EffectOutcome =
   | { kind: "unknown"; error: string }
   /** It did not happen, and may on a later try (5xx, rate limit, host offline). */
   | { kind: "retry"; error: string; notBefore: number | null }
+  | { kind: "retry-unissued"; error: string; notBefore: number | null }
   /** It did not happen and will not (permission denied, the remote branch moved, invalid input). */
   | { kind: "fail"; error: string; publicFailure?: PublicFailure };
 
@@ -709,6 +710,8 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
     }
     case "unknown":
       return { phase: { ...phase, leaseUntil: null, nextAt: backoff() }, error: outcome.error };
+    case "retry-unissued":
+      return { phase: { ...phase, tries: 0, firstAt: null, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
     case "retry":
       return { phase: { ...phase, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
     case "publication-diverged": {
@@ -768,7 +771,7 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
   if (!job.worker) return stick(job, "the worker thread is gone and the job has no worker settings to start another");
   const recovery = recover(job, "the feedback worker is unavailable");
   if (recovery.phase?.state !== "recovering" || !recovery.control) return recovery;
-  return { ...recovery, ...round, control: { ...recovery.control, feedbackRounds: control.feedbackRounds, workerContext: control.workerContext } };
+  return { ...recovery, ...round, control: { ...recovery.control, feedbackRounds: control.feedbackRounds, workerContext: { ...control.workerContext, recoveryReason: recovery.control.workerContext?.recoveryReason ?? null } } };
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */

@@ -609,3 +609,19 @@ test("public failure classification survives effect settlement without publishin
   const fallback = settle(current, { kind: "fail", error: "/private/worktree: offline" }, NOW);
   assert.deepEqual(fallback.control?.publicFailure, { kind: "execution" });
 });
+
+test("pre-spawn retry clears an unissued claim and retains the transport cooldown", () => {
+  const effect: Effect = { op: "recover-worker", key: "recover:x", epoch: 1 };
+  const current = job({ phase: transit("recovering", [effect], { tries: 1, firstAt: NOW }) });
+  const cooldown = NOW + 5 * MIN;
+  const change = settle(current, { kind: "retry-unissued", error: "workspace observation unavailable", notBefore: cooldown }, NOW);
+  const retry = apply(current, change);
+  assert.deepEqual(plan(retry, facts({ now: NOW + MIN })), { type: "sleep", until: cooldown });
+  const next = plan(retry, facts({ now: cooldown }));
+  assert.ok(next?.type === "effect");
+  assert.equal(next.mode, "perform");
+  const uncertain = apply(current, settle(current, { kind: "unknown", error: "spawn response lost" }, NOW));
+  const probe = plan(uncertain, facts({ now: cooldown }));
+  assert.ok(probe?.type === "effect");
+  assert.equal(probe.mode, "probe");
+});
