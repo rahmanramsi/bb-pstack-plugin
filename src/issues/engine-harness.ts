@@ -9,7 +9,7 @@ import Database from "better-sqlite3";
 import type { PushInput, PushResult } from "../host-contract.ts";
 import { parseChoice } from "../models.ts";
 import { MIGRATIONS } from "../store.ts";
-import { createIssues, type IssuesDeps } from "./engine.ts";
+import { createIssues, SWEEP_MS, type IssuesDeps } from "./engine.ts";
 import { createGitHub } from "./github.ts";
 import type { JobView, RepoName } from "./job.ts";
 import { openIssueStore, type IssueStore } from "./store.ts";
@@ -558,8 +558,11 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     for (let i = 0; i < 5; i++) await current.issues.sweep();
   };
   const advance = async (milliseconds: number) => {
-    clock.now += milliseconds;
-    await settle();
+    const end = clock.now + milliseconds;
+    while (clock.now < end) {
+      clock.now = Math.min(end, clock.now + SWEEP_MS);
+      await settle();
+    }
   };
   const byIssue = async (issue: number) => (await views()).find((job) => job.issue === issue)!;
   /** Label the issue and let the worker's first report open its pull request. */
