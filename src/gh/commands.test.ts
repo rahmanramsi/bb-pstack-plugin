@@ -10,9 +10,11 @@ const REMOTE = "b".repeat(40);
 const MAIN = "c".repeat(40);
 const PULL: PullDetail = { number: 7, url: "https://github.com/acme/web/pull/7", title: "feat: x", body: "Body", author: "pstack[bot]", state: "open", draft: true, head: "feat/x", headSha: HEAD, base: "main", headRepo: "acme/web" };
 
-function harness(options: { branch?: string | null; origin?: string | null; remoteSha?: string | null; push?: PushResult; issueWorker?: boolean; configured?: boolean; gate?: string; ahead?: number } = {}) {
+function harness(options: { branch?: string | null; origin?: string | null; remoteSha?: string | null; push?: PushResult; issueWorker?: boolean; configured?: boolean; gate?: string; ahead?: number; workflows?: boolean; missingObject?: boolean } = {}) {
   const calls: string[] = [];
   const pushes: PushBranchInput[] = [];
+  const scopes: { workflows: boolean }[] = [];
+  const inspections: { sha: string; comparisonSha: string }[] = [];
   const created: unknown[] = [];
   const comments: { issue: number; body: string }[] = [];
   const revoked: string[] = [];
@@ -21,10 +23,11 @@ function harness(options: { branch?: string | null; origin?: string | null; remo
   const branch = options.branch === undefined ? "feat/x" : options.branch;
   const repo = {
     defaultBranch: async () => "main",
+    capabilities: async () => ({ defaultHead: MAIN }),
     branchSha: async (name: string) => (name === "feat/x" ? (options.remoteSha === undefined ? REMOTE : options.remoteSha) : name === "main" ? MAIN : null),
     closePull: async (number: number) => void closed.push(number),
     deleteBranch: async (name: string) => void deleted.push(name),
-    pushCredentials: async () => ({ remoteUrl: "https://github.com/acme/web.git", token: "ghs_push" }),
+    pushCredentials: async (input: { workflows: boolean }) => (scopes.push(input), { remoteUrl: "https://github.com/acme/web.git", token: "ghs_push" }),
     fetchCredentials: async () => ({ remoteUrl: "https://github.com/acme/web.git", token: "ghs_fetch" }),
     revoke: async (token: string) => void revoked.push(token),
     createPull: async (input: unknown) => (created.push(input), { number: 7, url: PULL.url }),
@@ -69,13 +72,17 @@ function harness(options: { branch?: string | null; origin?: string | null; remo
     prGate: () => (options.gate ? { pass: false, reason: options.gate } : { pass: true }),
     host: {
       inspect: async () => (options.origin === undefined ? "git@github.com:Acme/web.git" : options.origin),
+      inspectCommit: async (_hostId, input) => {
+        inspections.push(input);
+        return options.missingObject ? { kind: "missing-object", sha: input.comparisonSha } : { kind: "inspected", ...input, nonemptyDiff: true, workflows: options.workflows ?? false };
+      },
       pushBranch: async (_hostId, input) => (pushes.push(input), options.push ?? { status: "pushed", sha: input.sha }),
       fetch: async () => ({ status: "fetched", refs: [{ branch: "main", sha: REMOTE }] }),
     },
   });
   const cli = defineCli({ name: "pstack", summary: "pstack", commands });
   const run = (argv: string[]) => cli.run(argv, { threadId: "thr_1", cwd: "/work/web" });
-  return { run, calls, pushes, created, comments, revoked, closed, deleted };
+  return { run, calls, pushes, created, comments, revoked, closed, deleted, scopes, inspections };
 }
 
 test("repoFromRemote reads github.com remotes in every form and nothing else", () => {
@@ -91,7 +98,7 @@ test("gh push sends HEAD to the current branch, expecting the remote head, and r
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, `Pushed ${HEAD} to acme/web feat/x.\n`);
   assert.deepEqual(h.calls, ["acme/web"]);
-  assert.deepEqual(h.pushes, [{ worktreePath: "/work/web", remoteUrl: "https://github.com/acme/web.git", branch: "feat/x", sha: HEAD, expectedRemoteSha: REMOTE, token: "ghs_push", rewrite: false }]);
+  assert.deepEqual(h.pushes, [{ worktreePath: "/work/web", remoteUrl: "https://github.com/acme/web.git", branch: "feat/x", sha: HEAD, expectedRemoteSha: REMOTE, comparisonSha: REMOTE, workflows: false, token: "ghs_push", rewrite: false }]);
   assert.deepEqual(h.revoked, ["ghs_push"]);
 });
 
@@ -210,10 +217,29 @@ test("GitHub's refusals become CLI errors with a hint", async () => {
       configured: () => true,
       isIssueWorker: () => false,
       prGate: () => ({ pass: true }),
-      host: { inspect: async () => "https://github.com/acme/web.git", pushBranch: async () => ({ status: "failed", detail: "" }), fetch: async () => ({ status: "failed", detail: "" }) },
+      host: { inspect: async () => "https://github.com/acme/web.git", inspectCommit: async (_hostId, input) => ({ kind: "missing-object", sha: input.sha }), pushBranch: async () => ({ status: "failed", detail: "" }), fetch: async () => ({ status: "failed", detail: "" }) },
     }),
   });
   const result = await cli.run(["gh", "issue", "comment", "3", "--body", "hi"], { threadId: "thr_1" });
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr ?? "", /403 Resource not accessible[\s\S]*lack a permission/);
+});
+
+test("gh push classifies pinned objects before requesting workflow scope and passes the same classification to the host", async () => {
+  for (const remoteSha of [REMOTE, null]) {
+    const h = harness({ remoteSha, workflows: true });
+    assert.equal((await h.run(["gh", "push"])).exitCode, 0);
+    assert.equal(h.inspections[0]?.sha, HEAD);
+    assert.equal(h.inspections[0]?.comparisonSha, remoteSha ?? MAIN);
+    assert.deepEqual(h.scopes, [{ workflows: true }]);
+    assert.equal(h.pushes[0]?.comparisonSha, remoteSha ?? MAIN);
+    assert.equal(h.pushes[0]?.workflows, true);
+  }
+});
+
+test("gh push refuses missing comparison objects before requesting a token", async () => {
+  const h = harness({ missingObject: true });
+  assert.notEqual((await h.run(["gh", "push"])).exitCode, 0);
+  assert.deepEqual(h.scopes, []);
+  assert.deepEqual(h.pushes, []);
 });
