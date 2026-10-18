@@ -164,7 +164,7 @@ The relabel comes first in `sending` and `respawning`, so the worker never gets 
 - The round starts in one store transaction: the job moves to `sending`, or to `respawning` when its thread is archived, deleted or failed, with the round ordinal plus one. The round's row is inserted in `issue_rounds`, and every item the message lists is marked with the round. An item is never sent in two rounds. The store refuses a round start that does not list every pending item. An item polled while the round was being planned then restarts the quiet period instead of starting a round of its own.
 - The round's base is the branch's head on GitHub when the round starts, kept on the job (`round_base`) and the round's row. A reviewer who commits a suggestion or presses Update branch moves it past the last push. The round's commit must contain the base, and its push expects it. When the branch moves again during the round, the report is refused with `remote_moved`, which does not count, and the base moves to the new head. A branch that no longer exists sticks the job.
 - The message is built from those items and stored in the effect, so a replay sends the same text. It stands alone. It holds the pull request URL and branch, the round number of 5, and the issue. Each item comes with its kind and id, author, file, line, diff hunk and body. An inline follow-up also shows the thread comment it answers. A one-line summary of each earlier round follows, then the rules. When the branch moved since the last push, the message says so and tells the worker to run `git fetch origin` and merge `origin/<branch>` before it commits. Comment text is fenced and marked as data from a GitHub user. The message also says that a repeated copy needs no work.
-- `addressing` behaves like `working`: reminders to an idle worker, rejected reports that go back to the worker, and `stop`.
+- `addressing` behaves like `working`: reminders to an idle or silent worker, rejected reports that go back to the worker, and `stop`.
 - A merged or closed pull request ends a job in `review` or `addressing`: it stops the worker and removes the status labels.
 - A replacement worker is a spawn of its own, keyed by the round, and starts from the pushed branch with the settings the first worker used.
 
@@ -211,13 +211,20 @@ Before the start, the service resolves the worker and checks its `provider/model
 **Limits.** These are constants:
 
 - No cap on concurrent jobs in pstack. A queued job starts as soon as its worker resolves, and bb's per-machine and global concurrency limits decide when worker threads run.
-- Two reminders to an idle worker that has not reported. After them the job keeps waiting, with the reason as its error.
+- 20 minutes with no progress anywhere in the worker's thread tree (`SILENCE_MS`) before a worker gets a reminder for silence.
+- Two reminders to a worker that stopped or went silent without reporting. After them the job keeps waiting, with the reason as its error.
 - 5 feedback rounds per pull request (`MAX_FEEDBACK_ROUNDS`). New feedback after the fifth sticks the job with the reason.
 - 2 minutes of quiet after the newest pending feedback (`FEEDBACK_QUIET_MS`) before a round starts.
 
 Past the feedback round limit the job moves to `stuck`, which stops the worker and removes its status labels. Later steps make the limits settings and add 3 CI rounds.
 
-**Reminders.** A `/poteto-mode` worker goes idle while its own pstack runs and child threads work, and their results wake it. An idle worker with an active run or child is waiting, not stopped, and gets no reminder. When it has stopped without reporting, the reminder also names `gate pr`'s open steps if the gate fails. This is the only reminder an issue worker gets: the checklist's idle nudge skips every thread pstack launched, so it never wakes a worker whose job has ended.
+**Reminders.** A `/poteto-mode` worker goes idle while its own pstack runs and child threads work, and their results wake it. An idle worker with an active or pending run or child is waiting, not stopped, and gets no reminder for being idle. When it has stopped without reporting, the reminder also names `gate pr`'s open steps if the gate fails.
+
+A waiting worker can still be stuck, for example on a child that hangs, and so can a worker that hangs mid-turn. So the service also watches the worker's thread tree: the worker, its child threads at any depth, and the hidden attempt threads of the running pstack runs any of them started. Progress is the newest event that shows work, such as a started or completed item, streamed output, or a started or completed turn. A message sent to a thread is not progress, so a reminder never counts as one. When the whole tree shows no progress for 20 minutes, the worker gets a reminder. After two, the job keeps waiting with the reason as its error. Progress in the tree clears the error, and so does an idle worker going active. A tree member held before its turn, or a run job waiting for a slot, is not silence, and the time held counts as activity once it ends. Progress more than 5 minutes after the job's last write means the work resumed, and the count starts again.
+
+Each walk costs two or three bb calls per member, so the tree is read only once 20 minutes have passed since the job's last write. After that it is read once per silence window, or once a minute while a member is held or the job waits on the silence. A tree of more than 64 threads gives no verdict.
+
+These are the only reminders an issue worker gets: the checklist's idle nudge skips every thread pstack launched, so it never wakes a worker whose job has ended.
 
 **Draft and ready.** The pull request opens as a draft. The service marks it ready after the first round once CI on its head commit passes. This differs from Opening a PR, which opens every pull request ready. Here the service owns readiness, and a red first push is common.
 
@@ -236,8 +243,9 @@ A label from a user without write access becomes an `ignored` row with the reaso
 **Modules.** The feature lives under `src/issues/`:
 
 - `job.ts`: the state machine, `plan`, `settle`, `acceptReport`, `EFFECT_POLICY`, the report schemas, and which feedback and commands count. Pure.
-- `text.ts`: the worker and round prompts, the reminder, and the checks and sanitizing applied to everything posted on GitHub. Pure.
+- `text.ts`: the worker and round prompts, the reminders, and the checks and sanitizing applied to everything posted on GitHub. Pure.
 - `store.ts`: SQL for `issue_repos`, `issue_jobs`, `issue_rounds`, and `issue_feedback`.
+- `tree.ts`: the walk of the worker's thread tree for progress, over narrow reads that `server.ts` supplies.
 - `github.ts`: the GitHub App client. It owns the App JWT, installation tokens, ETags, pagination, rate limits, and the permission cache, and maps responses to domain types and three error classes.
 - `engine.ts`: `createIssues()`, the one surface `server.ts` uses. It returns the CLI commands, `register()` for thread events and the `pstack-issues` service, `instructions(threadId)`, and `sweep()`, one awaited pass of the service for tests. Its `EFFECTS` table says how to perform and probe each effect; a missing entry or a probe its policy does not use fails the build.
 - `commands.ts`: `bb pstack issues` and the settings.
@@ -275,9 +283,9 @@ The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. 
 
 - An issue edited after work starts is sent to the worker as a note. Is that enough, or should a large edit restart the job?
 - Two jobs that touch the same files are not coordinated. Conflicts surface as conflict rounds.
-- Workers use the project's default permission mode. A project whose default is `accept-edits` may stall an unattended worker on approval prompts until the round's 4 hours run out.
+- Workers use the project's default permission mode. A project whose default is `accept-edits` may stall an unattended worker on approval prompts. Its tree then goes silent, and after the reminders the job waits with the reason as its error.
 - Whether bb logs host RPC payloads, which carry the push token, is unverified.
-- The reminder to an idle worker compares the thread's `updatedAt` with the job's last write. If bb does not bump `updatedAt` when a turn ends, no reminder is sent and the job sticks at the round's deadline instead. When pstack cannot count the worker's active runs and children, it treats the worker as waiting, with the same fallback.
+- The reminder to an idle worker compares the thread's `updatedAt` with the job's last write. If bb does not bump `updatedAt` when a turn ends, no idle reminder is sent. The silence reminders still come once the tree shows no progress for 20 minutes, and then the job waits. When pstack cannot count the worker's active runs and children, it treats the worker as waiting, with the same fallback.
 - The spawn probe's early stop relies on bb listing pinned threads first and then newest first. That order is observed, not documented. If it changes, the probe can miss a late thread, and the job sticks after the spawn's grace period.
 - Whether bb fetches before creating a worktree from `origin/<base>` is unverified. A stale remote-tracking ref only makes the worker start from an older base; the new-commit check measures against the same ref.
 - The host RPC API is experimental. A breaking SDK change affects only `src/host.ts` and its contract.
@@ -285,4 +293,5 @@ The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. 
 - Whether a round's commit contains its base is read from the commits `environments.status` lists ahead of `origin/<base>`. Whether bb caps that list is unverified. A cap could reject a report that contains the base when the worker added many commits.
 - Answering a follow-up on the comment its `in_reply_to_id` names assumes GitHub sets that field to the thread's first comment for replies made in the web UI. The REST docs require a top-level comment for replies but do not say what `in_reply_to_id` holds for a reply to a reply.
 - Feedback is stored when it is polled. A review dismissed after that, but before its round starts, is still sent and answered.
-- The round message is queued behind a turn that is still running, never steered into it. A worker that never goes idle sticks at the round's deadline.
+- The round message is queued behind a turn that is still running, never steered into it. A worker that keeps working takes the message only when its turn ends, since the round's deadline is no longer enforced. One that hangs mid-turn cannot take the silence reminders either, but after them its job still waits with the reason as its error.
+- Progress is read from thread events by type. A provider that does its work without writing any of those events looks silent, gets reminders it does not need, and then shows the silence error while it works.
