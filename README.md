@@ -38,6 +38,15 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 | `bb pstack run status <id>` / `run stop <id>` | a run's progress and results, or stop it. |
 | `bb pstack checklist begin <playbook>` | copies a playbook's steps into the thread's checklist. `checklist done <id> --evidence …`, `checklist skip <id> --reason …` and `checklist add` close and extend it. |
 | `bb pstack gate pr` / `gate done` | exit 1 while checklist steps are open. `/poteto-mode` runs them before it opens a PR and before its final reply. |
+| `bb pstack gh push` / `fetch` / `pr …` / `issue …` / `checks` | github for agents through pstack's github app, so agents never hold a token. pushes and fetches run on the worktree's machine with a short-lived token that never enters the agent's environment. see the [`github`](./skills/github/SKILL.md) skill. |
+
+### github access through the pstack app
+
+with `githubAppId` and `githubPrivateKey` set, every thread is told to use `bb pstack gh` for github. it acts on the repository behind the worktree's `origin`, as the app, with only the permissions the app was installed with. it never pushes the default branch, never force-pushes without a lease on the commit it just read, and in poteto mode opens a pr only after `gate pr` passes. for agents to be held to it, stop handing them a token of their own: turn off bb's automatic GH_TOKEN (`bb settings general machineGitCredentialsEnabled false`) and remove any custom `GH_TOKEN`. the app needs contents, pull requests, issues and checks permissions (read and write where agents write), plus workflows if agents edit `.github/workflows`.
+
+### issue jobs
+
+map a repository with `issueRepos` and label an issue `agent`. a worker thread takes it unattended to a pull request ready for review, a substantiated no-change result, or a concrete failure, recovering stalled workers and repairing ci failures and conflicts on its own. pstack never merges. setup, permissions, outcomes and limits are in [github issues to pull requests](./docs/design/issues.md).
 
 an agent can still call plain `bb thread spawn --parent-self --new-environment worktree`. when its machine is full and another machine has room for the same project and model, pstack refuses that spawn and names `bb pstack spawn` as the fix. it never refuses a fork, a person's thread, a reused environment, or a thread pstack spawned. it also lets the spawn through whenever it lacks the facts to decide. turn the `placementGuard` setting off to disable it (`bb plugin config pstack set placementGuard false`).
 
@@ -161,6 +170,7 @@ to keep [`/poteto-mode`](./skills/poteto-mode/SKILL.md) on across turns, add a l
 | [`/reflect`](./skills/reflect/SKILL.md) | a long task landed and you want the recipe captured as a skill edit. |
 | [`/correct`](./skills/correct/SKILL.md) | you keep correcting agents for the same mistakes. mines history for mistake classes, fixes each at the highest level that works (architecture, then types, lint, and ci, then tests, with docs last), and keeps a table pairing each rule with what enforces it. |
 | [`/teach`](./skills/teach/SKILL.md) | you want to actually understand a change or subsystem, not just have it summarized. runs how + why and weaves one plain explanation, built up diagram by diagram. |
+| [`/github`](./skills/github/SKILL.md) | an agent needs github: push, pull requests, issues, checks. agents hold no token; this goes through pstack's github app. |
 | [`/tdd`](./skills/tdd/SKILL.md) | you're fixing a bug and there's a cheap local test path. write the failing test first, then the fix. |
 | [`/benchmark-checklist`](./skills/benchmark-checklist/SKILL.md) | you ran a benchmark or measured a speedup or regression. vets the number (limiter, tuning, errors, repeat runs, end-to-end relevance) before you report or act on it. |
 | [`/no-comments`](./skills/no-comments/SKILL.md) | strip comments before review; spawns Comment Sicko, fixes accepted findings, offers encodings for claimed constraints. |

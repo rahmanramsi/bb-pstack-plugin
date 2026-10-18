@@ -2,14 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MIN, REPO, harness } from "./engine-harness.ts";
 
-/** Label #41 and let its worker thread vanish, so the job sticks. */
+/** Label #41 with a spawn that never creates its worker, so the job sticks after the grace period. */
 async function stuckJob() {
   const h = harness();
+  h.failures.spawn.push({ create: "never" });
   h.label(41);
   await h.engine().issues.sweep();
-  const working = await h.only();
-  Object.assign(h.threads.get(working.threadId!)!, { archivedAt: h.clock.now });
-  await h.settle();
+  for (let minute = 0; minute < 7; minute++) {
+    h.clock.now += MIN;
+    await h.engine().issues.sweep();
+  }
   const stuck = await h.only();
   assert.equal(stuck.state, "stuck");
   return { h, stuck };
@@ -35,7 +37,7 @@ test("retrying a stuck job starts a new worker on a new branch, replaces it in t
   const listed = (await h.engine().run(["issues", "list"])).stdout!;
   assert.doesNotMatch(listed, new RegExp(stuck.id), "the replaced stuck job leaves the default list");
   const all = (await h.engine().run(["issues", "list", "--all"])).stdout!;
-  assert.match(all, new RegExp(`${stuck.id}.*the worker thread was archived`));
+  assert.match(all, new RegExp(`${stuck.id}.*the spawn may not have happened`));
   assert.doesNotMatch(all, /retry: /, "a replaced stuck job gets no retry hint");
 
   const again = await h.engine().run(["issues", "retry", stuck.id]);
@@ -66,7 +68,7 @@ test("retry refuses an open job, a worker thread, a role the host cannot run, an
   await refused(stuck.id, /an issue worker cannot retry issue jobs/, other.threadId!);
 
   h.setWorkerRole("codex/gpt-missing/high");
-  await refused(stuck.id, /issue worker cannot run on host host_worker: codex\/gpt-missing\/high: not in the host's catalog/);
+  await refused(stuck.id, /no issue job can start on host host_worker: codex\/gpt-missing\/high: not in the host's catalog/);
   h.setWorkerRole("codex/gpt-6.1-sol/high");
 
   h.setRepo({ repo: REPO, projectId: "prj_web", hostId: "host_server" });
@@ -84,24 +86,28 @@ test("retry refuses an open job, a worker thread, a role the host cannot run, an
   await refused(stuck.id, /acme\/web#41 is closed/);
 });
 
-function withParent() {
+function withParent(subIssues = [51, 52]) {
   const h = harness();
   const gh = h.gh();
   for (const number of [51, 52]) gh.issues.set(number, { number, title: `Part ${number}`, body: `Do part ${number}.`, user: "maya", updatedAt: h.clock.now, labels: new Set() });
-  gh.issues.set(50, { number: 50, title: "Checkout redesign", body: "The whole checkout flow.", user: "maya", updatedAt: h.clock.now, labels: new Set(), subIssues: [51, 52] });
+  gh.issues.set(50, { number: 50, title: "Checkout redesign", body: "The whole checkout flow.", user: "maya", updatedAt: h.clock.now, labels: new Set(), subIssues });
   h.label(50);
   return h;
 }
 
-/** A parent tracking #51 and #52, with #51's stuck job retried. */
+/** A parent tracking #51 and #52, with #51's stuck job retried. Only #51 exists when the spawn fails. */
 async function retriedChild() {
-  const h = withParent();
+  const h = withParent([51]);
+  h.failures.spawn.push({ create: "never" });
   await h.settle();
+  h.gh().issues.get(50)!.subIssues = [51, 52];
+  for (let minute = 0; minute < 7; minute++) {
+    h.clock.now += MIN;
+    await h.settle();
+  }
   const parent = await h.byIssue(50);
   const child = await h.byIssue(51);
-  Object.assign(h.threads.get(child.threadId!)!, { archivedAt: h.clock.now });
-  await h.settle();
-  assert.equal((await h.byIssue(51)).state, "stuck");
+  assert.equal(child.state, "stuck");
   assert.equal((await h.byIssue(50)).state, "tracking", "#52 still progresses");
 
   const retried = await h.engine().run(["issues", "retry", child.id]);
@@ -129,7 +135,7 @@ test("the parent tracks a retried child's outcome, not the job it retried", asyn
   await h.settle();
   assert.equal((await h.byIssue(50)).state, "stuck");
   const status = (h.gh().comments.get(50) ?? []).find((comment) => comment.body.includes("Sub-issues:"))!;
-  assert.match(status.body, /#51 Part 51 \(stopped, needs a person\)/);
+  assert.match(status.body, /#51 Part 51 \(stopped\)/);
 });
 
 test("a sub-issue's job is retryable only while its parent tracks; retrying the stuck parent starts its open sub-issues again", async () => {

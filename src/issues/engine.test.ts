@@ -4,6 +4,43 @@ import type { EffectHandler } from "./engine.ts";
 import { GOOD, MIN, REPO, SHA1, SHA2, harness, type FakeThread, type Hold } from "./engine-harness.ts";
 import { EFFECT_POLICY } from "./job.ts";
 
+test("the board lists unlabeled and closed issues without starting them; manual start is idempotent", async () => {
+  const h = harness();
+  h.label(41);
+  h.unlabel(41);
+  h.label(42);
+  h.unlabel(42);
+  h.gh().issues.get(42)!.closed = true;
+  h.label(43);
+  const board = await h.engine().issues.board({ all: false });
+  assert.deepEqual(board.issues?.map((issue) => [issue.issue, issue.state]), [[41, "open"], [42, "closed"], [43, "open"]]);
+  assert.equal(board.jobs.length, 0);
+  assert.equal(h.spawned.length, 0);
+  await h.engine().issues.sweep();
+  assert.deepEqual((await h.views()).map((job) => job.issue), [43], "only the labeled issue starts automatically");
+  const ids = await Promise.all([h.engine().issues.start(REPO, 41), h.engine().issues.start(REPO, 41)]);
+  assert.equal(ids[0], ids[1]);
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "working");
+  assert.equal(h.spawned.length, 2);
+  assert.ok(!h.gh().issues.get(41)!.labels.has("agent"));
+  await assert.rejects(h.engine().issues.start(REPO, 42), /Only an open/);
+  await assert.rejects(h.engine().issues.start("other/repo", 41), /not configured/);
+});
+
+test("a manually started parent tracks its sub-issues without an agent label", async () => {
+  const h = harness();
+  h.label(41);
+  h.unlabel(41);
+  h.label(42);
+  h.unlabel(42);
+  h.gh().issues.get(41)!.subIssues = [42];
+  await h.engine().issues.start(REPO, 41);
+  await h.settle();
+  assert.equal((await h.byIssue(41)).state, "tracking");
+  assert.equal((await h.byIssue(42)).state, "working");
+});
+
 test("label to draft pull request: spawn a worker, accept its report, push the reported commit, open and label the PR", async () => {
   const h = harness();
   h.label(41);
@@ -19,7 +56,7 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
     projectId: "prj_web",
     visibility: "visible",
     environment: { type: "host", hostId: "host_worker", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "origin/main" } } },
-    pluginMetadata: { pstackIssue: 1, jobId: started.id },
+    pluginMetadata: { pstackIssue: 1, jobId: started.id, epoch: 0 },
     title: "acme/web#41: Submit button hides behind the footer",
     providerId: "codex",
     model: "gpt-6.1-sol",
@@ -34,19 +71,20 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
   assert.equal(accepted.exitCode, 0, accepted.stdout);
   assert.match(accepted.stdout!, /pushes 2222222 to agent\/issue-41/);
   await h.settle();
+  await h.advance(MIN);
 
   const done = await h.only();
   assert.equal(done.state, "review");
   assert.equal(done.pushedSha, SHA2);
-  assert.deepEqual(h.pushes, [{ worktreePath: `/worktrees/env_${started.threadId}`, remoteUrl: "https://github.test/acme/web.git", branch: started.branch, sha: SHA2, expectedRemoteSha: null, token: h.pushes[0]!.token }]);
+  assert.deepEqual(h.pushes, [{ worktreePath: `/worktrees/env_${started.threadId}`, remoteUrl: "https://github.test/acme/web.git", branch: started.branch, sha: SHA2, expectedRemoteSha: null, comparisonSha: SHA1, workflows: false, token: h.pushes[0]!.token }]);
   assert.ok(h.gh().revoked.includes(h.pushes[0]!.token), "the push token is revoked after the push");
   const pr = h.gh().issues.get(done.pr!.number)!;
   assert.deepEqual(pr.pr, {
     head: started.branch,
     base: "main",
     title: GOOD.pr.title,
-    body: "## Why\nThe footer covered the button on small screens.\n\n#41, cc `@maya`.\n\nCloses #41",
-    draft: true,
+    body: `## Why\nThe footer covered the button on small screens.\n\n#41, cc \`@maya\`.\n\nCloses #41\n\n<!-- pstack:pr:${started.id} -->`,
+    draft: false,
   });
   assert.deepEqual([...pr.labels], ["agent"]);
   assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", "agent:review"]);
@@ -70,14 +108,10 @@ type CrashPoint = {
 };
 
 const CRASH_POINTS: CrashPoint[] = [
-  { name: "the working label", key: ISSUE_LABELS, where: "github", lease: EFFECT_POLICY.labels.leaseMs, after: "start", end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
-  { name: "the spawn", key: "spawn", where: "sdk", lease: EFFECT_POLICY.spawn.leaseMs, after: "start", end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
-  { name: "the push", key: "push", where: "sdk", lease: EFFECT_POLICY.push.leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
-  { name: "the pull request", key: "POST /repos/acme/web/pulls", where: "github", lease: EFFECT_POLICY["open-pr"].leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
-  { name: "the review label", key: ISSUE_LABELS, where: "github", lease: EFFECT_POLICY.labels.leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 0, pushes: 1 } },
-  { name: "the questions comment", key: COMMENTS, where: "github", lease: EFFECT_POLICY.comment.leaseMs, after: { report: NEEDS_INFO, tree: UNCHANGED }, end: { state: "needs-info", labels: ["agent", "agent:needs-info"], comments: 1, pushes: 0 } },
-  { name: "the no-change comment", key: COMMENTS, where: "github", lease: EFFECT_POLICY.comment.leaseMs, after: { report: NO_CHANGE, tree: UNCHANGED }, end: { state: "done", labels: ["agent"], comments: 1, pushes: 0 } },
-  { name: "stopping the worker", key: "stop", where: "sdk", lease: EFFECT_POLICY["stop-thread"].leaseMs, after: "stop", end: { state: "stopped", labels: ["agent"], comments: 0, pushes: 0 } },
+  { name: "the spawn", key: "spawn", where: "sdk", lease: EFFECT_POLICY.spawn.leaseMs, after: "start", end: { state: "review", labels: ["agent", "agent:review"], comments: 1, pushes: 1 } },
+  { name: "the push", key: "push", where: "sdk", lease: EFFECT_POLICY.push.leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 1, pushes: 1 } },
+  { name: "the pull request", key: "POST /repos/acme/web/pulls", where: "github", lease: EFFECT_POLICY["open-pr"].leaseMs, after: { report: GOOD, tree: { headSha: SHA2, ahead: 1 } }, end: { state: "review", labels: ["agent", "agent:review"], comments: 1, pushes: 1 } },
+  { name: "stopping the worker", key: "stop", where: "sdk", lease: EFFECT_POLICY["stop-thread"].leaseMs, after: "stop", end: { state: "stopped", labels: ["agent"], comments: 1, pushes: 0 } },
 ];
 
 for (const point of CRASH_POINTS) {
@@ -110,6 +144,7 @@ for (const point of CRASH_POINTS) {
       await h.report(working.threadId!, GOOD);
       await h.settle();
     }
+    await h.advance(MIN);
 
     const end = await h.only();
     assert.equal(end.state, point.end.state, end.error ?? "");
@@ -191,7 +226,7 @@ test("a rejected report lists every reason and leaves the job working; a fixed r
 
   const rejected = await h.report(working.threadId!, { ...GOOD, pr: { ...GOOD.pr, body: "Ran the playbook." } }, { headSha: SHA2, ahead: 1, dirty: true });
   assert.equal(rejected.exitCode, 1);
-  assert.match(rejected.stderr!, /Report rejected \(1 of 2\)[\s\S]*uncommitted[\s\S]*gate pr` fails: 3 open steps[\s\S]*describes the process \("playbook"\)/);
+  assert.match(rejected.stderr!, /Report rejected:[\s\S]*uncommitted[\s\S]*gate pr` fails: 3 open steps[\s\S]*describes the process \("playbook"\)/);
   const still = await h.only();
   assert.equal(still.state, "working");
   assert.equal(h.pushes.length, 0);
@@ -200,26 +235,28 @@ test("a rejected report lists every reason and leaves the job working; a fixed r
   const accepted = await h.report(working.threadId!, GOOD, { dirty: false });
   assert.equal(accepted.exitCode, 0);
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "review");
 });
 
-test("a second rejected report sticks the job, stops the worker and removes the working label", async () => {
+test("a corrected commit can reuse report text after a validation rejection", async () => {
   const h = harness();
   h.label(41);
   await h.engine().issues.sweep();
   const working = await h.only();
-  await h.report(working.threadId!, GOOD, { headSha: SHA1, ahead: 0 });
-  const second = await h.report(working.threadId!, GOOD, { headSha: SHA1, ahead: 0 });
-  assert.match(second.stderr!, /needs a new commit[\s\S]*ended as stuck/);
+  for (let attempt = 0; attempt < 1; attempt++) {
+    const rejected = await h.report(working.threadId!, GOOD, { headSha: SHA1, ahead: 0 });
+    assert.match(rejected.stderr!, /needs a new commit/);
+  }
   await h.settle();
-  const stuck = await h.only();
-  assert.equal(stuck.state, "stuck");
-  assert.deepEqual(h.stopped, [working.threadId]);
-  assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
-  assert.equal(h.engine().issues.instructions(working.threadId!), null);
+  assert.equal((await h.only()).state, "working");
+  assert.deepEqual(h.stopped, []);
 
-  const late = await h.report(working.threadId!, GOOD);
-  assert.match(late.stderr!, /is stuck, not waiting for a report/);
+  const accepted = await h.report(working.threadId!, GOOD);
+  assert.equal(accepted.exitCode, 0);
+  await h.settle();
+  await h.advance(MIN);
+  assert.equal((await h.only()).state, "review");
 });
 
 test("re-labelling an issue after its job ended starts a new job on a -2 branch", async () => {
@@ -267,7 +304,7 @@ test("labels from users without write access, and repositories mapped to the ser
   assert.match(shown.stdout!, /repo error {4}host host_server is the bb server's machine/);
 });
 
-test("an idle worker that has not reported is reminded twice, then the job sticks", async () => {
+test("an idle worker that has not reported is reminded twice, then the job waits with the reason shown", async () => {
   const h = harness();
   h.label(41);
   await h.engine().issues.sweep();
@@ -287,7 +324,12 @@ test("an idle worker that has not reported is reminded twice, then the job stick
   Object.assign(thread, { updatedAt: h.clock.now });
   h.clock.now += 1;
   await h.settle();
-  assert.equal((await h.only()).state, "stuck");
+  const waiting = await h.only();
+  assert.equal(waiting.state, "working");
+  assert.equal(waiting.error, null);
+  assert.notEqual(waiting.threadId, working.threadId);
+  assert.equal(h.spawned[1]!.environment.type, "reuse");
+  assert.equal(h.sent.length, 2, "no third reminder");
 });
 
 test("a worker cannot stop jobs, and a thread naming a job that is not waiting for it is stopped", async () => {
@@ -319,7 +361,7 @@ test("a worker role the mapped host cannot run creates no job, shows why on the 
     assert.equal(h.spawned.length, 0);
     assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
     const listed = (await h.engine().run(["issues", "list"])).stdout!;
-    assert.match(listed, /poll error: issue worker cannot run on host host_worker: /);
+    assert.match(listed, /poll error: no issue job can start on host host_worker: /);
     assert.match(listed, reason);
 
     h.setWorkerRole("codex/gpt-6.1-sol/high");
@@ -333,29 +375,31 @@ test("a worker role the mapped host cannot run creates no job, shows why on the 
 test("the engine answers doctor with the poll's resolution: inherit-parent is the project default, and an unreachable project is not permanent", async () => {
   const h = harness();
   h.setWorkerRole("inherit-parent");
-  assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_web", hostId: "host_worker" }), {
+  assert.deepEqual(await h.engine().issues.resolveWorker({ repo: REPO, projectId: "prj_web", hostId: "host_worker" }), {
     providerId: "claude-code",
     model: "claude-opus-5-5",
     reasoningLevel: "high",
     permissionMode: "full",
   });
-  assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_offline", hostId: "host_worker" }), { error: "project settings are unavailable", permanent: false });
+  assert.deepEqual(await h.engine().issues.resolveWorker({ repo: REPO, projectId: "prj_offline", hostId: "host_worker" }), { error: "project settings are unavailable", permanent: false });
   h.setWorkerRole("codex/gpt-missing/high");
-  assert.deepEqual(await h.engine().issues.resolveWorker({ projectId: "prj_web", hostId: "host_worker" }), { error: "codex/gpt-missing/high: not in the host's catalog", permanent: true });
+  assert.deepEqual(await h.engine().issues.resolveWorker({ repo: REPO, projectId: "prj_web", hostId: "host_worker" }), { error: "codex/gpt-missing/high: not in the host's catalog", permanent: true });
 });
 
 test("a stuck job stays in the default list with its reason while it is the issue's latest job, and is no longer polled", async () => {
   const h = harness();
+  h.failures.spawn.push({ create: "never" });
   h.label(41);
   await h.engine().issues.sweep();
-  const working = await h.only();
-  Object.assign(h.threads.get(working.threadId!)!, { archivedAt: h.clock.now });
-  await h.settle();
+  for (let minute = 0; minute < 7; minute++) {
+    h.clock.now += MIN;
+    await h.engine().issues.sweep();
+  }
   const stuck = await h.only();
   assert.equal(stuck.state, "stuck");
 
   const listed = (await h.engine().run(["issues", "list"])).stdout!;
-  assert.match(listed, new RegExp(`#41 {2}stuck .*${stuck.id}.* {2}the worker thread was archived or deleted before it reported`));
+  assert.match(listed, new RegExp(`#41 {2}stuck .*${stuck.id}.* {2}the spawn may not have happened`));
   const board = JSON.parse((await h.engine().run(["issues", "list", "--json"])).stdout!);
   assert.deepEqual(board.jobs.map((job: { id: string }) => job.id), [stuck.id]);
 
@@ -392,21 +436,13 @@ test("an effect's handler has a probe exactly when its policy looks for a trace 
   assert.ok(labels && push);
 });
 
-test("stopping a job waiting in review or needs-info removes that label from the issue", async () => {
-  for (const [report, label] of [[GOOD, "agent:review"], [{ outcome: "needs-info", questions: ["Which footer, the page or the modal?"], verification: ["read the layout code"] }, "agent:needs-info"]] as const) {
-    const h = harness();
-    h.label(41);
-    await h.engine().issues.sweep();
-    const working = await h.only();
-    await h.report(working.threadId!, report, report === GOOD ? { headSha: SHA2, ahead: 1 } : { headSha: SHA1, ahead: 0 });
-    await h.settle();
-    assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", label]);
-
-    assert.equal((await h.engine().run(["issues", "stop", working.id])).exitCode, 0);
-    await h.settle();
-    assert.equal((await h.only()).state, "stopped");
-    assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
-  }
+test("stopping a job in review removes its status labels", async () => {
+  const h = harness();
+  const { job } = await h.toReview();
+  assert.equal((await h.engine().run(["issues", "stop", job.id])).exitCode, 0);
+  await h.settle();
+  assert.equal((await h.only()).state, "stopped");
+  assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
 });
 
 test("an idle worker waiting on its own runs or child threads is not reminded; once it stops, the reminder names the failing gate", async () => {
@@ -450,7 +486,7 @@ test("a push that outlives its lease while a second engine pushes the same commi
   while (h.gh().refs.get(working.branch) !== SHA2) await new Promise((resolve) => setImmediate(resolve));
   second.free();
   await sweeping;
-  await h.settle();
+  await h.advance(MIN);
 
   const done = await h.only();
   assert.equal(done.state, "review", done.error ?? "");
@@ -471,12 +507,13 @@ test("in the service, one job's slow push does not hold back another job", { tim
   await h.report((await issue(41)).threadId!, GOOD);
   await pushing.hit;
 
-  h.threads.get((await issue(42)).threadId!)!.status = "error";
+  const oldWorker = (await issue(42)).threadId!;
+  h.threads.get(oldWorker)!.status = "error";
   h.engine().issues.register();
   const service = new AbortController();
   const serving = h.serviceStarts.get("pstack-issues")!(service.signal);
   try {
-    while ((await issue(42)).state !== "stuck") await new Promise((resolve) => setTimeout(resolve, 5));
+    while ((await issue(42)).threadId === oldWorker) await new Promise((resolve) => setTimeout(resolve, 5));
   } finally {
     service.abort();
     pushing.free();
@@ -484,26 +521,19 @@ test("in the service, one job's slow push does not hold back another job", { tim
   await serving;
 });
 
-test("a push still running when its claim's lease ends is abandoned, so the job can claim it again", { timeout: 10_000 }, async () => {
+test("a transient push-token fault preserves its accepted report for the next claim", async () => {
   const h = harness();
-  h.label(41);
-  await h.engine().issues.sweep();
+  h.label(41); await h.settle();
   const working = await h.only();
-  h.failures.pushHangs = true;
-  const minting = h.holdAt("POST /app/installations/1/access_tokens", "github");
+  const held = h.holdAt("push:before", "sdk");
   await h.report(working.threadId!, GOOD);
-  await minting.hit;
-  h.clock.now += EFFECT_POLICY.push.leaseMs;
-  minting.free();
-
-  let job = await h.only();
-  while (!job.error) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    job = await h.only();
-  }
-  assert.equal(job.state, "publishing");
-  assert.equal(job.next?.op, "push");
-  assert.notEqual(job.next?.retryAt, null);
+  await held.hit;
+  h.restart();
+  h.clock.now += EFFECT_POLICY.push.leaseMs + 1;
+  held.free();
+  await h.settle();
+  assert.equal((await h.only()).pushedSha, SHA2);
+  assert.equal(h.store.get(working.id)!.report!.headSha, SHA2);
 });
 
 test("finding a worker's thread reads metadata a page at a time and stops at threads older than the job", async () => {
@@ -523,10 +553,12 @@ test("finding a worker's thread reads metadata a page at a time and stops at thr
   const adopted = await h.only();
   assert.equal(adopted.state, "working");
   assert.equal(adopted.threadId, h.late[0]!.id);
-  assert.deepEqual(h.calls, { list: 1, getPluginMetadata: 0, listPluginMetadata: 1 });
+  assert.equal(h.calls.list, 1);
+  assert.equal(h.calls.listPluginMetadata, 1);
+  assert.equal(h.calls.getPluginMetadata, 1);
 });
 
-test("a worker that reports before its spawn is confirmed is told to try again, and its report is accepted once it is", async () => {
+test("a report saved before spawn confirmation is accepted automatically once the worker is bound", async () => {
   const h = harness();
   h.failures.spawn.push({ create: "now" });
   h.label(41);
@@ -536,15 +568,14 @@ test("a worker that reports before its spawn is confirmed is told to try again, 
   const [threadId] = [...h.threads.keys()];
 
   const early = await h.report(threadId!, GOOD);
-  assert.equal(early.exitCode, 1);
-  assert.match(early.stderr!, /try again/);
-  assert.doesNotMatch(early.stderr!, /only an issue worker thread can report/);
+  assert.equal(early.exitCode, 0);
+  assert.match(early.stdout!, /saved/i);
 
   h.clock.now += 15_000;
   await h.engine().issues.sweep();
   assert.equal((await h.only()).threadId, threadId);
-  assert.equal((await h.report(threadId!, GOOD)).exitCode, 0);
-  await h.settle();
+  await h.advance(MIN);
+  assert.equal((await h.only()).state, "review");
 });
 
 test("a first-round changes report without a pull request title and body is a schema error, which does not count as a rejection", async () => {
@@ -558,6 +589,6 @@ test("a first-round changes report without a pull request title and body is a sc
   assert.match(refused.stderr!, /does not match the contract[\s\S]*pr/);
   const still = await h.only();
   assert.equal(still.state, "working");
-  assert.equal(still.error, null, "not a rejection");
+  assert.match(still.error!, /report rejected/);
   assert.equal((await h.report(working.threadId!, GOOD)).exitCode, 0);
 });

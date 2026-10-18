@@ -216,3 +216,112 @@
 .ps-confirm { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .ps-confirm .ps-stop { margin-left: 0; }
 .pstack .ps-toggle[aria-pressed=true] { background: var(--secondary); color: var(--foreground); }
+
+/* Issue catalog */
+.ps-issue-page { container-type: inline-size; padding: 24px; }
+.ps-issue-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+.ps-issue-heading h2 { font-size: 20px; font-weight: 600; letter-spacing: -.02em; line-height: 1.4; margin: 0 0 4px; }
+.ps-issue-heading p { color: var(--muted-foreground); font-size: 13px; margin: 0; }
+.pstack .ps-list-button { height: 30px; min-height: 30px; padding: 4px 10px; flex-shrink: 0; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); color: var(--foreground); }
+.pstack .ps-list-button:hover:not(:disabled), .pstack .ps-list-icon:hover { background: var(--state-hover); }
+.pstack .ps-list-button svg, .ps-list-icon svg { flex-shrink: 0; width: 14px; height: 14px; }
+.pstack .ps-list-icon { width: 28px; height: 30px; padding: 6px; color: var(--muted-foreground); }
+.ps-issue-toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
+.ps-issue-search { position: relative; flex: 1; min-width: 160px; }
+.ps-issue-search > svg { position: absolute; top: 10px; left: 11px; color: var(--muted-foreground); pointer-events: none; }
+.ps-issue-search input, .ps-issue-page select { height: 36px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); color: var(--foreground); font: inherit; font-size: 12px; }
+.ps-issue-search input { width: 100%; padding: 7px 10px 7px 34px; }
+.ps-issue-search input::placeholder { color: var(--muted-foreground); }
+.ps-issue-page select { padding: 6px 28px 6px 10px; max-width: 240px; text-overflow: ellipsis; }
+.ps-issue-page :is(input, select):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.ps-issue-notice { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; }
+.ps-issue-table { border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+.ps-issue-tablebar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.ps-issue-tabs { display: flex; align-items: center; gap: 4px; }
+.ps-issue-tabs button { display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 4px 9px; border: 0; border-radius: 5px; background: transparent; color: var(--muted-foreground); cursor: pointer; font: inherit; font-size: 12px; }
+.ps-issue-tabs button:hover { background: var(--state-hover); }
+.ps-issue-tabs button[aria-pressed=true] { background: var(--secondary); color: var(--foreground); font-weight: 600; }
+.ps-issue-tabs button span { font-size: 11px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.ps-issue-tablebar select { height: 30px; border-color: transparent; color: var(--muted-foreground); max-width: 190px; }
+.ps-issue-grid { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+.ps-issue-grid th { padding: 9px 12px; text-align: left; font-size: 11px; font-weight: 500; background: var(--muted); color: var(--muted-foreground); }
+.ps-issue-grid th:first-child { width: auto; }
+.ps-issue-grid th:nth-child(2) { width: 110px; }
+.ps-issue-grid th:nth-child(3) { width: 110px; }
+.ps-issue-grid th:nth-child(4) { width: 90px; }
+.ps-issue-grid th:nth-child(5) { width: 140px; }
+.ps-issue-grid td { padding: 13px 12px; border-top: 1px solid var(--border); vertical-align: middle; }
+.ps-issue-grid tbody tr:hover { background: var(--state-hover); }
+.ps-issue-main { position: relative; padding-left: 38px !important; }
+.ps-issue-main > div { min-width: 0; }
+.ps-issue-state-icon { display: inline-flex; align-items: center; gap: 6px; color: var(--success-foreground); }
+.ps-issue-main > .ps-issue-state-icon { position: absolute; left: 13px; top: 17px; }
+.ps-issue-state-icon[data-state=closed] { color: var(--muted-foreground); }
+.ps-issue-open { display: block; max-width: 100%; border: 0; padding: 0; background: transparent; color: var(--foreground); font: inherit; font-size: 13px; font-weight: 500; line-height: 1.55; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.ps-issue-open:hover { text-decoration: underline; text-underline-offset: 3px; }
+.ps-issue-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; color: var(--muted-foreground); font-size: 11px; }
+.ps-issue-meta > span { overflow-wrap: anywhere; }
+.ps-issue-labels { display: inline-flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.ps-issue-label { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted-foreground); font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.ps-issue-label[data-agent=true] { color: var(--timeline-accent); border-color: color-mix(in srgb, var(--timeline-accent) 35%, var(--border)); background: color-mix(in srgb, var(--timeline-accent) 7%, transparent); }
+.ps-issue-assignee { overflow-wrap: anywhere; color: var(--muted-foreground); }
+.ps-issue-updated { color: var(--muted-foreground); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ps-issue-row-actions > button, .ps-issue-row-actions > div { display: inline-flex; vertical-align: middle; }
+.ps-issue-start { flex-direction: column; align-items: flex-start; gap: 6px; }
+.ps-issue-start p { font-size: 11px; margin: 0; white-space: normal; }
+.ps-issue-problem { font-size: 11px; line-height: 1.5; margin: 5px 0 0; }
+.ps-issue-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; padding: 48px 16px; }
+.ps-issue-empty > svg { width: 28px; height: 28px; color: var(--muted-foreground); }
+.ps-issue-empty h3 { font-size: 14px; font-weight: 500; margin: 0; }
+.ps-issue-empty p { margin: 0; color: var(--muted-foreground); }
+.ps-issue-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-top: 12px; font-size: 11px; color: var(--muted-foreground); }
+.ps-issue-footer code { font-family: inherit; color: var(--foreground); }
+.ps-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.ps-issue-skeleton td { padding: 18px 16px; }
+.ps-issue-skeleton span { display: block; height: 12px; width: 60%; background: var(--secondary); border-radius: 3px; }
+.ps-issue-skeleton span + span { margin-top: 9px; width: 30%; height: 9px; }
+.ps-issue-detail-nav { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 24px; }
+.ps-issue-detail-nav .ps-list-button { border-color: transparent; }
+.ps-issue-detail-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; border-bottom: 1px solid var(--border); padding-bottom: 22px; }
+.ps-issue-detail-heading h2 { font-size: 23px; font-weight: 600; line-height: 1.4; margin: 5px 0 12px; overflow-wrap: anywhere; letter-spacing: -.02em; }
+.ps-issue-detail-heading p { font-size: 12px; margin: 0; overflow-wrap: anywhere; }
+.ps-issue-detail-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: var(--muted-foreground); }
+.ps-issue-detail-layout { display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 32px; padding: 24px 0; }
+.ps-issue-body { min-width: 0; font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; }
+.ps-issue-body pre { max-width: 100%; overflow: auto; }
+.ps-issue-body img { max-width: 100%; height: auto; }
+.ps-issue-body :is(p, ul, ol) { margin: 0 0 14px; }
+.ps-issue-body :is(h1,h2,h3,h4) { font-weight: 600; margin: 20px 0 10px; }
+.ps-issue-sidebar section { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid var(--border); min-width: 0; }
+.ps-issue-sidebar h3 { margin: 0; font-size: 12px; font-weight: 600; }
+.ps-issue-sidebar p { font-size: 12px; margin: 0; overflow-wrap: anywhere; }
+.ps-issue-history { border-top: 1px solid var(--border); }
+.ps-issue-history summary { padding: 14px 0; font-weight: 500; cursor: pointer; }
+.ps-issue-history summary span { color: var(--muted-foreground); margin-left: 8px; }
+@container (max-width: 850px) {
+  .ps-issue-grid th:nth-child(2), .ps-issue-grid td.ps-issue-assignee { display: none; }
+  .ps-issue-toolbar { flex-wrap: wrap; }
+  .ps-issue-search { flex-basis: 100%; }
+  .ps-issue-toolbar select { flex: 1; max-width: none; min-width: 0; }
+}
+@container (max-width: 620px) {
+  .ps-issue-grid, .ps-issue-grid tbody { display: block; }
+  .ps-issue-grid thead { display: none; }
+  .ps-issue-grid tbody tr { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 14px 12px; border-top: 1px solid var(--border); }
+  .ps-issue-grid tbody tr:first-child { border-top: 0; }
+  .ps-issue-grid td { display: block; border: 0; padding: 0; }
+  .ps-issue-grid td.ps-issue-main { grid-column: 1 / -1; padding-left: 26px !important; }
+  .ps-issue-main > .ps-issue-state-icon { left: 0; top: 3px; }
+  .ps-issue-grid td.ps-issue-updated { display: none; }
+  .ps-issue-grid td.ps-issue-row-actions { text-align: right; }
+  .ps-issue-grid td.ps-issue-worker { align-self: center; }
+  .ps-issue-detail-layout { grid-template-columns: minmax(0,1fr); gap: 24px; }
+  .ps-issue-detail-heading { flex-wrap: wrap; }
+  .ps-issue-detail-heading h2 { font-size: 20px; }
+  .ps-issue-heading { align-items: flex-start; }
+  .ps-issue-tablebar { padding: 8px; }
+  .ps-issue-tabs { gap: 0; }
+  .ps-issue-tabs button { padding: 5px 7px; }
+  .ps-issue-tablebar select { font-size: 11px; }
+}
+@media (max-width: 500px) { .ps-issue-page { padding: 16px 12px; } }

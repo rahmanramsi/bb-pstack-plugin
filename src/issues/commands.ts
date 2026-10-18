@@ -51,7 +51,7 @@ export const ISSUE_SETTINGS = {
   issueRepos: {
     type: "string",
     label: "Issue repositories",
-    description: "One `owner/name project=<projectId> host=<hostId>` line per repository whose `agent`-labeled issues pstack works on.",
+    description: "One `owner/name project=<projectId> host=<hostId>` line per repository where pstack runs issue workers. The agent label starts work automatically; open issues can also be started from the Issues panel.",
     experimental_multiline: true,
     experimental_schema: z.string().superRefine((value, ctx) => {
       const parsed = parseIssueRepos(value);
@@ -114,6 +114,9 @@ function formatShow(job: ListedJob, repo: RepoView, now: number): string {
     ["pushed", job.pushedSha],
     ["round", job.round > 1 ? `feedback round ${job.round - 1} of ${MAX_FEEDBACK_ROUNDS}` : null],
     ["summary", job.summary],
+    ["outcome", job.outcome],
+    ["limitation", job.limitation],
+    ["delivery", job.delivery.error ?? (job.delivery.pending ? "pending" : "delivered")],
     ["error", job.error],
     ["polled", job.poll.polledAt === null ? "not yet" : age(job.poll.polledAt, now)],
     ["poll error", job.poll.error],
@@ -130,6 +133,7 @@ export function issueCommands(deps: {
   repos: () => readonly RepoMapping[];
   clock: () => number;
   report(threadId: string, text: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
+  sync(threadId: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
   stop(id: JobId, by: string): Promise<boolean>;
   retry(id: JobId): Promise<{ ok: true; job: Job } | { ok: false; code: string; message: string }>;
 }): Record<string, PluginCliCommand> {
@@ -202,6 +206,17 @@ export function issueCommands(deps: {
         if (!ctx.threadId) throw new PluginCliError("only an issue worker thread can report", { code: "thread_required" });
         const text = await readThreadFile(bb, { threadId: ctx.threadId, cwd: ctx.cwd, path: input.options.file!, errorCode: "report_file_unreadable" });
         const result = await deps.report(ctx.threadId, text);
+        if (!result.ok) throw new PluginCliError(result.message, { code: result.code });
+        return { exitCode: 0, stdout: `${result.message}\n` };
+      },
+    }),
+    "issues sync": cliCommand({
+      summary: "Issue workers only: while the pull request is in review, have pstack push a merge that resolves a conflict",
+      description:
+        "Commit the merge of origin/<base> (or of the branch's head on GitHub) first. HEAD must contain the branch's head on GitHub, so the push only adds commits. It is not a feedback round: no replies are posted and no review is requested.",
+      async run(_input, ctx) {
+        if (!ctx.threadId) throw new PluginCliError("only an issue worker thread can sync", { code: "thread_required" });
+        const result = await deps.sync(ctx.threadId);
         if (!result.ok) throw new PluginCliError(result.message, { code: result.code });
         return { exitCode: 0, stdout: `${result.message}\n` };
       },
