@@ -599,6 +599,12 @@ export type ReviewFact =
 
 function checkReview(job: Job, facts: Facts): Action | null {
   const review = facts.review;
+  const knownTarget = job.control.readiness;
+  const pendingChildren = facts.children?.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change");
+  const blocked = Boolean(facts.blockers?.length || pendingChildren);
+  if (job.phase.state === "review" && knownTarget && (facts.feedback?.pending.length || blocked) && review?.kind !== "observed") {
+    return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `known-regression:${job.id}:${job.version}`, target: knownTarget, draft: true }]), control: { ...job.control, readiness: null, ...(blocked ? { localEvidence: null } : {}) } } };
+  }
   if (!review) return null;
   if (review.kind === "unavailable") return review.permanent ? { type: "change", change: stick(job, review.reason) } : null;
   if (review.state !== "open") return { type: "change", change: close(job, review.state) };
