@@ -13,6 +13,7 @@ import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import type { HostPush } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
+import { hostId, pickHost, type Facts as PlacementFacts, type Hold, type HostId } from "../placement.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
 import {
@@ -32,6 +33,8 @@ import {
   counts,
   moreFacts,
   isReasoningLevel,
+  needsMachine,
+  owesSpawn,
   plan,
   settle,
   stop as stopChange,
@@ -82,6 +85,8 @@ export type IssuesDeps = {
    * while the host is offline.
    */
   checkWorker: (hostId: string, tuple: string) => Promise<string | null>;
+  /** Placement's facts for a worker on any machine with a worktree of the project and `provider/model` at `level`. */
+  machines: (query: { projectId: string; model: string; level: string }) => Promise<PlacementFacts>;
   /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
   activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
@@ -110,6 +115,9 @@ const isMissing = (error: unknown) => {
 const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
+
+/** What a pick needs beyond the job rows, read with the other facts; or why it could not be read. */
+type MachineInputs = { facts: PlacementFacts; model: string; exclude: ReadonlyMap<HostId, string> } | { error: string };
 
 /** The machine the job's worker runs on: set by the change that planned its first spawn, which the table's CHECK holds. */
 function workerHost(job: Job): string {
@@ -413,7 +421,27 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function gather(job: Job): Promise<Facts> {
+  async function machineInputs(job: Job, worker: WorkerSettings): Promise<MachineInputs> {
+    const model = `${worker.providerId}/${worker.model}`;
+    try {
+      const [facts, { primaryHostId }] = await Promise.all([deps.machines({ projectId: job.projectId, model, level: worker.reasoningLevel }), bb.sdk.system.config()]);
+      // The server's machine holds the App's private key, so no worker runs there.
+      return { facts, model, exclude: new Map(primaryHostId ? [[hostId.parse(primaryHostId), "the bb server's machine"]] : []) };
+    } catch (error) {
+      return { error: `could not read the machines: ${message(error)}` };
+    }
+  }
+
+  /** Picks the machine from the inputs gather read and the rows that owe a spawn now, each counted against its machine. */
+  function pickNow(facts: Facts, machine: MachineInputs | null): Facts {
+    if (!machine) return facts;
+    if ("error" in machine) return { ...facts, machine: { wait: machine.error } };
+    const holds = store.list({ all: false }).flatMap((row): Hold[] => (owesSpawn(row) && row.host.id !== null ? [{ hostId: hostId.parse(row.host.id), threadId: null, settledAt: null }] : []));
+    const pick = pickHost(machine.facts, holds, { model: machine.model }, machine.exclude, facts.now);
+    return { ...facts, machine: pick.hostId === null ? { wait: pick.why } : { hostId: pick.hostId } };
+  }
+
+  async function gather(job: Job): Promise<{ facts: Facts; machine: MachineInputs | null }> {
     const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, machine: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
@@ -445,7 +473,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       if (wanted.includes("gate")) facts.gate = deps.prGate(threadId);
     }
-    return facts;
+    const worker = needsMachine(job, facts);
+    return { facts, machine: worker ? await machineInputs(job, worker) : null };
   }
 
   function childFacts(parent: Job): ChildFact[] | null {
@@ -487,7 +516,10 @@ export function createIssues(deps: IssuesDeps): Issues {
     for (let step = 0; step < MAX_STEPS; step++) {
       const job = store.get(id);
       if (!job) return;
-      const action = plan(job, await gather(job));
+      const { facts, machine } = await gather(job);
+      // No await from the pick to apply's write, which comes before its first await: jobs reconciled in the same sweep
+      // resume from gather one after another, so each pick counts the rows the ones before it wrote.
+      const action = plan(job, pickNow(facts, machine));
       if (!action || action.type === "sleep") return;
       await apply(job, action);
     }
@@ -730,7 +762,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
     const now = clock();
     let cursor = store.repoPoll(mapping.repo).poll as PollCursor | null;
-    if (mapping.hostId === primaryHostId) {
+    if (mapping.hostId !== null && mapping.hostId === primaryHostId) {
       store.saveRepoPoll(mapping.repo, cursor, now, `host ${mapping.hostId} is the bb server's machine; map ${mapping.repo} to another host`);
       return;
     }

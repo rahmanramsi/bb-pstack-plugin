@@ -405,18 +405,18 @@ export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
 }
 
 /**
- * Whether plan() needs a machine picked for an automatic job: it is queued with no open blockers and a resolved worker,
- * or in review with a round due and its worker gone or failed, so the next step spawns one.
+ * The worker settings plan() needs a machine picked for, or null when it needs none: an automatic job queued with no
+ * open blockers and a resolved worker, or in review with a round due and its worker gone or failed.
  */
-export function needsMachine(job: Job, facts: Facts): boolean {
-  if (job.host.pinned) return false;
+export function needsMachine(job: Job, facts: Facts): WorkerSettings | null {
+  if (job.host.pinned) return null;
   switch (job.phase.state) {
     case "queued":
-      return !facts.blockers?.length && facts.worker !== null && !("error" in facts.worker);
+      return !facts.blockers?.length && facts.worker && !("error" in facts.worker) ? facts.worker : null;
     case "review":
-      return (facts.thread?.kind === "gone" || facts.thread?.kind === "failed") && !!facts.remote?.head && job.worker !== null;
+      return (facts.thread?.kind === "gone" || facts.thread?.kind === "failed") && facts.remote?.head ? job.worker : null;
     default:
-      return false;
+      return null;
   }
 }
 

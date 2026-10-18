@@ -122,7 +122,7 @@ const AUTO = { pinned: false, id: null } as const;
 
 test("an automatic job starts on the machine picked for it, and waits with the reason, never stuck, while none is eligible", () => {
   const queued = job({ host: AUTO });
-  assert.equal(needsMachine(queued, facts({ worker: WORKER })), true);
+  assert.deepEqual(needsMachine(queued, facts({ worker: WORKER })), WORKER);
   assert.equal(plan(queued, facts({ worker: WORKER })), null, "no machine fact gathered, nothing to decide");
 
   const reason = "no machine is eligible: mini: no checkout of this project";
@@ -138,12 +138,12 @@ test("an automatic job starts on the machine picked for it, and waits with the r
 
 test("a machine is picked only for an automatic job whose next step spawns a worker", () => {
   const auto = job({ host: AUTO });
-  assert.equal(needsMachine(job(), facts({ worker: WORKER })), false, "pinned");
-  assert.equal(needsMachine(auto, facts({ worker: WORKER, blockers: ["#51"] })), false, "blocked");
-  assert.equal(needsMachine(auto, facts({ worker: WORKER, blockers: [] })), true, "unblocked");
-  assert.equal(needsMachine(auto, facts({ worker: { error: "project settings are unavailable", permanent: false } })), false, "no worker");
-  assert.equal(needsMachine(auto, facts()), false, "worker not gathered");
-  assert.equal(needsMachine(job({ host: { pinned: false, id: "host_b" }, phase: { state: "working" }, threadId: "thr_w" }), facts({ thread: { kind: "gone" } })), false, "working");
+  assert.equal(needsMachine(job(), facts({ worker: WORKER })), null, "pinned");
+  assert.equal(needsMachine(auto, facts({ worker: WORKER, blockers: ["#51"] })), null, "blocked");
+  assert.deepEqual(needsMachine(auto, facts({ worker: WORKER, blockers: [] })), WORKER, "unblocked");
+  assert.equal(needsMachine(auto, facts({ worker: { error: "project settings are unavailable", permanent: false } })), null, "no worker");
+  assert.equal(needsMachine(auto, facts()), null, "worker not gathered");
+  assert.equal(needsMachine(job({ host: { pinned: false, id: "host_b" }, phase: { state: "working" }, threadId: "thr_w", worker: WORKER }), facts({ thread: { kind: "gone" } })), null, "working");
 });
 
 test("an outbox owes a spawn until the spawn settles, and a stop drops the debt", () => {
@@ -517,8 +517,8 @@ test("a worker thread gone by the time a round starts is replaced from the pushe
 test("an automatic job's replacement worker gets a fresh machine, and its feedback waits while none is eligible", () => {
   const review = inReview({ host: { pinned: false, id: "host_a" } });
   const gone = facts({ ...pending([inline(1, NOW - 5 * MIN)]), thread: { kind: "gone" } });
-  assert.equal(needsMachine(review, gone), true);
-  assert.equal(needsMachine(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]) })), false, "a live worker takes the round itself");
+  assert.deepEqual(needsMachine(review, gone), WORKER, "the replacement runs the job's worker settings");
+  assert.equal(needsMachine(review, facts({ ...pending([inline(1, NOW - 5 * MIN)]) })), null, "a live worker takes the round itself");
   assert.equal(plan(review, gone), null);
 
   const moved = (plan(review, { ...gone, machine: { hostId: "host_c" } }) as { change: Change }).change;

@@ -229,6 +229,7 @@ test("a worker thread that failed while its pull request waited for review is re
   const h = harness();
   const { job, pr } = await h.toReview();
   h.threads.get(job.threadId!)!.status = "error";
+  h.fleet.set("host_big", { limit: 64 });
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
@@ -239,6 +240,7 @@ test("a worker thread that failed while its pull request waited for review is re
   assert.equal(h.spawned.length, 2);
   assert.equal(h.sent.length, 0);
   assert.match(h.spawned[1]!.prompt, new RegExp(`"commentId": ${comments[0]}`));
+  assert.equal(h.spawned[1]!.environment.hostId, "host_worker", "a pinned job's replacement stays on its machine");
 });
 
 test("a report from a repeated copy of an earlier round's message is refused without counting against the current round", async () => {

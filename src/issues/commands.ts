@@ -8,23 +8,25 @@ import { issueBoard, listed, repoView, type ListedJob, type RepoView } from "./b
 import { JOB_ID, MAX_FEEDBACK_ROUNDS, type JobId, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
 
-export type RepoMapping = { repo: RepoName; projectId: string; hostId: string };
+/** `hostId` null: each job's machine is picked when the job starts. */
+export type RepoMapping = { repo: RepoName; projectId: string; hostId: string | null };
 
-/** `issueRepos`: one `owner/name project=<id> host=<id>` line per repository; `#` starts a comment. */
+/** `issueRepos`: one `owner/name project=<id> [host=<id>|host=auto]` line per repository; `#` starts a comment. */
 export function parseIssueRepos(text: string): { ok: true; repos: RepoMapping[] } | { ok: false; errors: string[] } {
   const repos: RepoMapping[] = [];
   const errors: string[] = [];
   text.split(/\r?\n/).forEach((raw, index) => {
     const line = raw.replace(/#.*$/, "").trim();
     if (line === "") return;
-    const match = /^([\w.-]+\/[\w.-]+)\s+project=(\S+)\s+host=(\S+)$/.exec(line);
+    const match = /^([\w.-]+\/[\w.-]+)\s+project=(\S+)(?:\s+host=(\S+))?$/.exec(line);
     if (!match) {
-      errors.push(`line ${index + 1}: expected "owner/name project=<projectId> host=<hostId>"`);
+      errors.push(`line ${index + 1}: expected "owner/name project=<projectId> [host=<hostId>|host=auto]"`);
       return;
     }
     const repo = match[1]!.toLowerCase() as RepoName;
+    const host = match[3];
     if (repos.some((existing) => existing.repo === repo)) errors.push(`line ${index + 1}: ${repo} appears twice`);
-    else repos.push({ repo, projectId: match[2]!, hostId: match[3]! });
+    else repos.push({ repo, projectId: match[2]!, hostId: host === undefined || host === "auto" ? null : host });
   });
   return errors.length > 0 ? { ok: false, errors } : { ok: true, repos };
 }
@@ -51,7 +53,8 @@ export const ISSUE_SETTINGS = {
   issueRepos: {
     type: "string",
     label: "Issue repositories",
-    description: "One `owner/name project=<projectId> host=<hostId>` line per repository whose `agent`-labeled issues pstack works on.",
+    description:
+      "One `owner/name project=<projectId> [host=<hostId>]` line per repository whose `agent`-labeled issues pstack works on. Without `host=`, or with `host=auto`, each job runs on the machine with the most free slots among those with a checkout of the project and the issue worker's model, never the bb server's machine.",
     experimental_multiline: true,
     experimental_schema: z.string().superRefine((value, ctx) => {
       const parsed = parseIssueRepos(value);
