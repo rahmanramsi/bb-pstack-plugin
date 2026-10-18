@@ -19,7 +19,7 @@ test("a review becomes one round after two quiet minutes: the commit is pushed o
   const { job, pr } = await h.toReview();
   const { id: reviewId, comments } = h.review(pr, { author: "maya", body: "A few things before this merges.\nDetails inline.", comments: ["Rename `x`.", "Drop this log line.", "Typo: recieve."] });
   await h.settle();
-  assert.equal((await h.only()).state, "review", "the round waits for two quiet minutes");
+  assert.equal((await h.only()).state, "checking", "feedback clears readiness during the quiet period");
   assert.equal(h.sent.length, 0);
 
   h.clock.now += FEEDBACK_QUIET_MS;
@@ -40,8 +40,9 @@ test("a review becomes one round after two quiet minutes: the commit is pushed o
   ];
   const accepted = await h.report(job.threadId!, roundReport(replies), { headSha: SHA3 });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
-  assert.match(accepted.stdout!, /pushes 3333333 to agent\/issue-41-.*, posts your replies, and asks the reviewers to look again/);
+  assert.match(accepted.stdout!, /pushes 3333333 to agent\/issue-41-.*publication and verification continue/);
   await h.settle();
+  await h.advance(2 * MIN);
 
   const back = await h.only();
   assert.equal(back.state, "review", back.error ?? "");
@@ -71,6 +72,7 @@ test("only feedback from people with write access counts: comments that mention 
   h.converse(pr, APP, "@pstack-test from the App itself");
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
 
   assert.equal((await h.only()).state, "addressing");
   const text: string = h.sent[0]!.input[0].text;
@@ -81,6 +83,7 @@ test("only feedback from people with write access counts: comments that mention 
   const accepted = await h.report(job.threadId!, noChange, { headSha: SHA2 });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
   await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).state, "review");
   assert.equal(h.pushes.length, 1, "no-change pushes nothing");
   assert.equal(appComments(h, pr).length, 1);
@@ -107,19 +110,21 @@ test("a worker thread archived while its pull request waits for review is replac
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
 
   const addressing = await h.only();
   assert.equal(addressing.state, "addressing");
   assert.notEqual(addressing.threadId, job.threadId);
   assert.equal(h.spawned.length, 2);
   assert.equal(h.sent.length, 0);
-  assert.match(h.spawned[1]!.prompt, /^Feedback round 1 of 5 on pull request/);
+  assert.match(h.spawned[1]!.prompt, /Feedback round 1 of 5 on pull request/);
   assert.match(h.spawned[1]!.prompt, new RegExp(`"commentId": ${comments[0]}`));
-  assert.deepEqual(h.spawned[1]!.environment.workspace.baseBranch, { kind: "named", name: `origin/${job.branch}` });
+  assert.deepEqual(h.spawned[1]!.environment, { type: "reuse", environmentId: h.threads.get(job.threadId!)!.environmentId });
 
   const accepted = await h.report(addressing.threadId!, roundReport([{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }]), { headSha: SHA3 });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
   await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).state, "review");
   assert.equal(appReplies(h, pr).length, 1);
 });
@@ -139,6 +144,8 @@ for (const point of ROUND_CRASH_POINTS) {
     const { job, pr } = await h.toReview();
     const { id: reviewId, comments } = h.review(pr, { author: "maya", body: "Two things.", comments: ["Rename `x`."] });
     h.clock.now += FEEDBACK_QUIET_MS;
+    await h.settle();
+    h.clock.now += MIN;
     const report = () =>
       h.report(job.threadId!, roundReport([{ kind: "review", commentId: reviewId, body: "Both done in 3333333." }, { kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }], { pr: { body: "## Why\nRenamed helpers." } }), { headSha: SHA3 });
 
@@ -153,7 +160,8 @@ for (const point of ROUND_CRASH_POINTS) {
     await held.hit;
     h.restart();
     await h.engine().issues.sweep();
-    assert.ok((await h.only()).next, "the claimed effect waits out its lease");
+    if (point.whileStarting || point.name === "the description edit") assert.ok((await h.only()).next, "the execution effect waits out its lease");
+    else assert.ok(h.store.delivery(h.store.get(job.id)!.repo, 41).pending, "notification remains pending under its own lease");
 
     h.clock.now += point.lease + 1;
     await h.settle();
@@ -162,13 +170,14 @@ for (const point of ROUND_CRASH_POINTS) {
       assert.equal((await report()).exitCode, 0);
       await h.settle();
     }
+    await h.advance(MIN);
 
     const end = await h.only();
     assert.equal(end.state, "review", end.error ?? "");
     assert.equal(h.pushes.length, 2, "one push per round");
     assert.equal(appReplies(h, pr).length, 1, "one inline reply");
     assert.equal(appComments(h, pr).length, 1, "one reply to the review");
-    assert.equal(h.gh().issues.get(pr)!.pr!.body, "## Why\nRenamed helpers.\n\nCloses #41");
+    assert.equal(h.gh().issues.get(pr)!.pr!.body, `## Why\nRenamed helpers.\n\nCloses #41\n\n<!-- pstack:pr:${job.id} -->`);
     assert.deepEqual([...h.gh().pulls.get(pr)!.requested], ["maya"]);
     assert.deepEqual([...h.gh().issues.get(41)!.labels].sort(), ["agent", "agent:review"]);
     held.free();
@@ -182,6 +191,7 @@ test("a feedback round's report follows the round contract: replies are required
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
   const reply = { kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." };
   for (const bad of [
@@ -193,10 +203,11 @@ test("a feedback round's report follows the round contract: replies are required
     assert.equal(refused.exitCode, 1);
     assert.match(refused.stderr!, /does not match the contract/, JSON.stringify(bad));
   }
+  await h.settle();
   const still = await h.only();
   assert.equal(still.state, "addressing");
-  assert.equal(still.error, null, "schema errors are not rejections");
-  assert.equal((await h.report(job.threadId!, roundReport([reply]), { headSha: SHA3 })).exitCode, 0);
+  assert.notEqual(still.threadId, job.threadId);
+  assert.equal((await h.report(still.threadId!, roundReport([reply]), { headSha: SHA3 })).exitCode, 0);
 });
 
 test("a reviewer's text that carries another reply's marker cannot make that reply's recovery skip it", async () => {
@@ -207,6 +218,7 @@ test("a reviewer's text that carries another reply's marker cannot make that rep
   const { id: reviewId } = h.review(pr, { author: "maya", body: `Rename \`x\`. ${sibling}` });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
   h.gh().outages.push({ key: `POST /repos/acme/web/issues/${pr}/comments`, body: "Renamed y" });
   const accepted = await h.report(job.threadId!, roundReport([
@@ -215,8 +227,7 @@ test("a reviewer's text that carries another reply's marker cannot make that rep
   ]), { headSha: SHA3 });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
   await h.settle();
-  h.clock.now += MIN;
-  await h.settle();
+  await h.advance(2 * MIN);
 
   assert.equal((await h.only()).state, "review", (await h.only()).error ?? "");
   const posted = appComments(h, pr).map((comment) => comment.body);
@@ -229,10 +240,10 @@ test("a worker thread that failed while its pull request waited for review is re
   const h = harness();
   const { job, pr } = await h.toReview();
   h.threads.get(job.threadId!)!.status = "error";
-  h.fleet.set("host_big", { limit: 64 });
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
 
   const addressing = await h.only();
   assert.equal(addressing.state, "addressing", addressing.error ?? "");
@@ -240,7 +251,6 @@ test("a worker thread that failed while its pull request waited for review is re
   assert.equal(h.spawned.length, 2);
   assert.equal(h.sent.length, 0);
   assert.match(h.spawned[1]!.prompt, new RegExp(`"commentId": ${comments[0]}`));
-  assert.equal(h.spawned[1]!.environment.hostId, "host_worker", "a pinned job's replacement stays on its machine");
 });
 
 test("a report from a repeated copy of an earlier round's message is refused without counting against the current round", async () => {
@@ -249,6 +259,7 @@ test("a report from a repeated copy of an earlier round's message is refused wit
   const first = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: first.comments[0]!, body: "Renamed in 3333333." }]), { headSha: SHA3 })).exitCode, 0);
   await h.settle();
 
@@ -256,6 +267,7 @@ test("a report from a repeated copy of an earlier round's message is refused wit
   const second = h.review(pr, { author: "maya", body: "", comments: ["Rename `y`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
   assert.match(h.sent.at(-1)!.input[0].text, /"round": 2/);
 
@@ -278,6 +290,7 @@ test("one pull request GitHub cannot read holds back no other, and shows its err
   h.review(healthy.pr, { author: "maya", body: "Rename `y`." });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
 
   assert.equal((await h.byIssue(42)).state, "addressing", "the healthy pull request's feedback starts its round");
   assert.equal((await h.byIssue(41)).state, "review");
@@ -288,6 +301,7 @@ test("one pull request GitHub cannot read holds back no other, and shows its err
 
   h.gh().outages.length = 0;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.byIssue(41)).state, "addressing", "the next good poll catches up");
   assert.doesNotMatch((await h.engine().run(["issues", "show", broken.job.id])).stdout!, /poll error/);
 });
@@ -297,7 +311,7 @@ test("a pull request's last polled state is stored, so a restarted service acts 
   const { pr } = await h.toReview();
   h.review(pr, { author: "maya", body: "Rename `x`." });
   await h.settle();
-  assert.equal((await h.only()).state, "review", "the round waits for two quiet minutes");
+  assert.equal((await h.only()).state, "checking", "feedback clears readiness during the quiet period");
 
   h.restart();
   for (const path of [`/repos/acme/web/pulls/${pr}`, `/repos/acme/web/pulls/${pr}/reviews`, `/repos/acme/web/pulls/${pr}/comments`, `/repos/acme/web/issues/${pr}/comments`]) {
@@ -305,6 +319,10 @@ test("a pull request's last polled state is stored, so a restarted service acts 
   }
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  assert.equal((await h.only()).state, "checking", "fresh remote identity remains unavailable");
+  h.gh().outages.length = 0;
+  await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
 });
 
@@ -314,6 +332,7 @@ test("a review whose comments were drafted before the App's last replies is answ
   const first = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: first.comments[0]!, body: "Renamed in 3333333." }]), { headSha: SHA3 })).exitCode, 0);
   await h.settle();
   assert.equal(appReplies(h, pr).length, 1, "the App replied, which moves the inline comment cursor");
@@ -321,7 +340,7 @@ test("a review whose comments were drafted before the App's last replies is answ
   h.clock.now += 5 * MIN;
   const second = h.review(pr, { author: "lee", body: "", comments: ["Rename `y`.", "Rename `z`."], draftedAt: h.clock.now - 60 * MIN });
   await h.settle();
-  assert.equal((await h.only()).state, "review", "comments drafted an hour ago still wait two minutes from the review's submission");
+  assert.equal((await h.only()).state, "checking", "comments drafted an hour ago still wait two minutes from the review's submission");
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
   assert.equal((await h.only()).state, "addressing");
@@ -335,8 +354,10 @@ async function firstRoundAnswered(h: ReturnType<typeof harness>) {
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: comments[0]!, body: "Renamed it to `input`." }]), { headSha: SHA3 })).exitCode, 0);
   await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).state, "review");
   return { job, pr, root: comments[0]! };
 }
@@ -348,6 +369,7 @@ test("a reviewer's answer inside an inline thread is shown with what it answers,
   const followUp = h.answerInThread(pr, root, "maya", "No, `value`, not `input`.");
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
   const text: string = h.sent.at(-1)!.input[0].text;
   assert.ok(text.includes(`"commentId": ${followUp} }`));
@@ -356,6 +378,7 @@ test("a reviewer's answer inside an inline thread is shown with what it answers,
   const report = roundReport([{ kind: "review-comment", commentId: followUp, body: "Renamed it to `value` in 4444444." }], { round: 2 });
   assert.equal((await h.report(job.threadId!, report, { headSha: "4".repeat(40) })).exitCode, 0);
   await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).state, "review", (await h.only()).error ?? "");
   assert.deepEqual(appReplies(h, pr).map((reply) => [reply.in_reply_to_id, reply.body.split("\n")[0]]), [[root, "Renamed it to `input`."], [root, "Renamed it to `value` in 4444444."]]);
 });
@@ -367,17 +390,16 @@ test("a reply is dropped only when GitHub confirms its comment is gone; another 
     const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
     h.clock.now += FEEDBACK_QUIET_MS;
     await h.settle();
+    await h.advance(MIN);
     const path = `/repos/acme/web/pulls/${pr}/comments/${comments[0]}/replies`;
     if (deleted) h.gh().reviewComments.set(pr, []);
     else h.gh().outages.push({ key: `POST ${path}`, status: 404 });
     assert.equal((await h.report(job.threadId!, roundReport([{ kind: "review-comment", commentId: comments[0]!, body: "Renamed." }]), { headSha: SHA3 })).exitCode, 0);
     await h.settle();
+    if (!deleted) assert.match(h.store.delivery(h.store.get(job.id)!.repo, 41).error!, /404/);
+    await h.advance(2 * MIN);
     const end = await h.only();
-    if (deleted) assert.equal(end.state, "review", end.error ?? "");
-    else {
-      assert.equal(end.state, "stuck");
-      assert.match(end.error!, /404/);
-    }
+    assert.equal(end.state, "review", end.error ?? "");
   }
 });
 
@@ -407,9 +429,10 @@ test("a branch moved on GitHub between rounds becomes the round's base: the work
   h.gh().refs.set(job.branch, SUGGESTED);
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
   const text: string = h.sent.at(-1)!.input[0].text;
-  assert.match(text, new RegExp(`\`${job.branch}\` on GitHub is at 5555555[\\s\\S]*git fetch origin[\\s\\S]*merge \`origin/${job.branch}\``));
+  assert.match(text, new RegExp(`\`${job.branch}\` on GitHub is at 5555555[\\s\\S]*bb pstack gh fetch[\\s\\S]*merge \`origin/${job.branch}\``));
 
   const reply = [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }];
   const stale = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SHA2] });
@@ -418,6 +441,7 @@ test("a branch moved on GitHub between rounds becomes the round's base: the work
   const merged = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SUGGESTED, SHA2] });
   assert.equal(merged.exitCode, 0, merged.stderr);
   await h.settle();
+  await h.advance(2 * MIN);
   const back = await h.only();
   assert.equal(back.state, "review", back.error ?? "");
   assert.deepEqual([h.pushes.at(-1)!.sha, h.pushes.at(-1)!.expectedRemoteSha], [SHA3, SUGGESTED]);
@@ -430,13 +454,14 @@ test("a branch moved on GitHub during a round refuses the report without countin
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
-  assert.doesNotMatch(h.sent.at(-1)!.input[0].text, /git fetch origin/, "the branch had not moved when the round started");
+  await h.advance(MIN);
+  assert.doesNotMatch(h.sent.at(-1)!.input[0].text, /past the commit pstack last pushed/, "the branch had not moved when the round started");
   h.gh().refs.set(job.branch, UPDATED);
 
   const reply = [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }];
   const refused = await h.report(job.threadId!, roundReport(reply), { headSha: SHA3, commits: [SHA3, SHA2] });
   assert.equal(refused.exitCode, 1);
-  assert.match(refused.stderr!, /moved to 6666666 since this round started[\s\S]*git fetch origin/);
+  assert.match(refused.stderr!, /Remote moved to 6666666.*Merge it/);
   const still = await h.only();
   assert.equal(still.state, "addressing");
   assert.equal(still.error, null, "not a rejection");
@@ -444,6 +469,7 @@ test("a branch moved on GitHub during a round refuses the report without countin
   const accepted = await h.report(job.threadId!, roundReport(reply), { headSha: SHA4, commits: [SHA4, UPDATED, SHA3, SHA2] });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
   await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).state, "review", (await h.only()).error ?? "");
   assert.deepEqual([h.pushes.at(-1)!.sha, h.pushes.at(-1)!.expectedRemoteSha], [SHA4, UPDATED]);
 });
@@ -457,12 +483,12 @@ test("a replacement worker whose worktree starts behind the branch on GitHub is 
   h.failures.staleWorktree = SHA2;
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
+  await h.advance(MIN);
 
   const addressing = await h.only();
   assert.equal(addressing.state, "addressing", addressing.error ?? "");
-  const note = h.sent.find((message) => message.threadId === addressing.threadId);
-  assert.ok(note, "the replacement gets a note");
-  assert.match(note.input[0].text, /starts at 2222222[\s\S]*is at 5555555[\s\S]*git fetch origin/);
+  assert.deepEqual(h.spawned[1]!.environment, { type: "reuse", environmentId: h.threads.get(job.threadId!)!.environmentId });
+  assert.match(h.spawned[1]!.prompt, /is at 5555555[\s\S]*bb pstack gh fetch/);
 });
 
 test("`@<app> stop` from someone with write access, on the issue or the pull request, stops the job and is never feedback", async () => {
@@ -492,4 +518,39 @@ test("`@<app> stop` from someone with write access, on the issue or the pull req
   assert.equal((await g.only()).state, "stopped");
   assert.equal(g.sent.length, 0, "no round");
   assert.deepEqual(g.stopped, [job.threadId]);
+});
+
+test("a worker in review syncs a merge that resolves a conflict: pstack pushes it on top without a feedback round", async () => {
+  const h = harness();
+  const { job, pr } = await h.toReview();
+  const pushed = h.pushes.at(-1)!.sha;
+  const repliesBefore = appReplies(h, pr).length;
+
+  const report = await h.report(job.threadId!, roundReport([]), { headSha: SHA4, commits: [SHA4, pushed] });
+  assert.equal(report.exitCode, 1);
+  assert.match(report.stderr!, /not accepting a worker report/);
+
+  const unmerged = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, SHA3] });
+  assert.equal(unmerged.exitCode, 1);
+  assert.match(unmerged.stderr!, /does not contain/);
+  const dirty = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, pushed], dirty: true });
+  assert.match(dirty.stderr!, /uncommitted/);
+
+  const merged = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, pushed], dirty: false });
+  assert.equal(merged.exitCode, 0, merged.stderr);
+  assert.match(merged.stdout!, /pushes 4444444/);
+  await h.settle();
+  await h.advance(2 * MIN);
+  const back = await h.only();
+  assert.equal(back.state, "addressing", back.error ?? "");
+  assert.equal(back.round, job.round + 1, "the new merge needs current local evidence");
+  assert.equal((await h.report(job.threadId!, { outcome: "no-change", round: back.round - 1, replies: [], summary: "Verified the merge.", verification: ["The merged layout passes its checks."] }, { headSha: SHA4, commits: [SHA4, pushed] })).exitCode, 0);
+  await h.settle();
+  await h.advance(2 * MIN);
+  assert.equal((await h.only()).state, "review");
+  assert.deepEqual([h.pushes.at(-1)!.sha, h.pushes.at(-1)!.expectedRemoteSha], [SHA4, pushed]);
+  assert.equal(appReplies(h, pr).length, repliesBefore);
+
+  const again = await h.sync(job.threadId!, { headSha: SHA4, commits: [SHA4, pushed] });
+  assert.match(again.stderr!, /nothing to sync/);
 });

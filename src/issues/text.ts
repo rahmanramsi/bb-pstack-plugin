@@ -146,7 +146,7 @@ export function progressBody(children: readonly ChildFact[]): string {
       : !child.job
         ? "not started"
         : TERMINAL.has(child.job.state)
-          ? `${child.job.merged ? "merged" : child.job.state}, needs a person`
+          ? `${child.job.merged ? "merged" : child.job.disposition === "no-change" ? "no change needed" : child.job.state}`
           : child.job.state === "queued" || child.job.state === "review"
             ? CHILD_STATE[child.job.state]
             : CHILD_STATE.open;
@@ -155,6 +155,14 @@ export function progressBody(children: readonly ChildFact[]): string {
   const closed = children.filter((child) => child.state === "closed").length;
   return [`**Sub-issues: ${closed} of ${children.length} closed**`, "", ...children.map(line)].join("\n");
 }
+
+const AUTONOMOUS_WORK = [
+  "This is an unattended GitHub job. The human reviews the pull request; do not ask for decisions or confirmation in the worker thread, use an interactive question tool, or stop after presenting a plan.",
+  "Choose reasonable defaults from the issue, repository conventions, and existing behavior. Make reversible implementation, design, and scope decisions yourself, including when a playbook would normally ask the human. Pass these instructions to any delegates.",
+  "Deliver the smallest useful baseline as a draft pull request, even when some requirements remain uncertain. Put material assumptions, remaining limitations, and unresolved product choices in the pull request description so the reviewer can decide there. Continue with the parts you can implement.",
+  "Run the relevant checks and report their actual results. Do not claim unperformed checks passed or bypass report validation. This authorizes work in the assigned branch and submission through the report command, not merging, deployment, or destructive external actions.",
+  "If an essential prerequisite prevents any useful baseline, report `failure` with a concrete `reason`, the work you preserved, and checks attempted. Failure may retain dirty or untracked files. Unavailable tooling is a failure or a disclosed limitation, never evidence of no-change. Report no-change only with issue-specific evidence that no implementation is needed.",
+].join("\n");
 
 /** The first message. It stands alone, so a replacement thread or a compacted context can act on it. */
 export function workerPrompt(job: Job): string {
@@ -166,7 +174,11 @@ export function workerPrompt(job: Job): string {
     fenced(`${job.snapshot.title}\n\n${job.snapshot.body.trim() || "(no description)"}`),
     "",
     ...parentSection(job),
+    ...job.control.prerequisites.map((item) => `Include prerequisite #${item.issue}. Fetch with bb pstack gh fetch, then merge origin/${item.branch} at ${item.sha} before implementing and verifying this issue.`),
+    ...(job.progress ? ["## Integration", "", fenced(job.progress), ""] : []),
     "## Rules",
+    "",
+    AUTONOMOUS_WORK,
     "",
     `- This worktree's commits become the pull request. pstack pushes them to \`${job.branch}\` and opens a draft pull request against \`${job.baseBranch}\` after it accepts your report.`,
     "- `bb pstack issues report` is this run's built-in PR tool. Use it in place of a forge CLI wherever Opening a PR says to create or update a pull request.",
@@ -182,7 +194,7 @@ export function workerPrompt(job: Job): string {
     REPORT_EXAMPLE,
     "```",
     "",
-    "`outcome` is `changes` (with `pr`), `no-change` (the issue needs no code change; `summary` is the reason posted on the issue), or `needs-info` (with `questions` posted on the issue). Every outcome lists `verification`: each check you ran and its result.",
+    "`outcome` is `changes` (with `pr`), `no-change` (the issue needs no code change; `summary` is the reason posted on the issue), or `failure` (with a concrete `reason` and preserved work). Every outcome lists `verification`: each check you ran and its result.",
     "A rejected report exits 1 with every reason. Fix them and report again.",
   ].join("\n");
 }
@@ -219,9 +231,11 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     fenced(item.body.trim() || "(no text)"),
     "",
   ]);
-  const earlier = rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Feedback round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
+  const earlier = rounds.filter((round) => round.ordinal < ordinal).map((round) => `- ${round.ordinal === 1 ? "The first round" : `Work round ${round.ordinal - 1}`}: ${round.summary ?? "no summary"}`);
+  const feedbackRound = job.control.feedbackRounds + (ordinal > job.round ? 1 : 0);
+  const label = pending.length && feedbackRound > 0 ? `Feedback round ${feedbackRound} of ${MAX_FEEDBACK_ROUNDS}` : `Work round ${round}`;
   return [
-    `Feedback round ${round} of ${MAX_FEEDBACK_ROUNDS} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
+    `${label} on pull request ${job.pr?.url ?? "(not recorded)"} (branch \`${job.branch}\`), which resolves GitHub issue #${job.issue} in ${job.repo} (${job.snapshot.url}). Address the feedback below and report the result with \`bb pstack issues report\`.`,
     "",
     "## The issue",
     "",
@@ -233,7 +247,7 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
       : [
           "## The branch moved",
           "",
-          `\`${job.branch}\` on GitHub is at ${head.slice(0, 7)}, past the commit pstack last pushed${job.pushedSha ? ` (${job.pushedSha.slice(0, 7)})` : ""}, for example after a suggested change was committed or the branch was updated. Run \`git fetch origin\` and merge \`origin/${job.branch}\` before you commit.`,
+          `\`${job.branch}\` on GitHub is at ${head.slice(0, 7)}, past the commit pstack last pushed${job.pushedSha ? ` (${job.pushedSha.slice(0, 7)})` : ""}, for example after a suggested change was committed or the branch was updated. Run \`bb pstack gh fetch\` and merge \`origin/${job.branch}\` before you commit.`,
           "",
         ]),
     "## Feedback",
@@ -244,11 +258,12 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
     "## Rules",
     "",
     "- Decide the effort for each item. Apply mechanical feedback, such as a rename, a typo or a removed log line, directly. Take anything that changes behavior or design through `/poteto-mode`.",
-    "- Answer every item above in `replies`: describe the change and its commit, or give your reason when you disagree. A question for the reviewer goes in a reply.",
-    "- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it.",
+    "- Continue as an unattended GitHub job: make reasonable decisions and do not ask for confirmation in the worker thread. If feedback leaves a product choice unresolved, implement the useful parts and explain your assumption or limitation in `replies` for review on the pull request.",
+    "- Answer every item above in `replies`: describe the change and its commit, or give your reason when you disagree. A question for the reviewer goes in a reply and must not stop work on the other items.",
+    `- Add commits on top of the pushed ones. Never rewrite pushed history: no rebase, amend, squash or reset. Resolve a conflict with the base branch by merging it: run \`bb pstack gh fetch\` (plain \`git fetch\` has no GitHub credentials), then merge \`origin/${job.baseBranch}\`.`,
     "- Never run `git push`, never use `gh` or another GitHub client, and never switch or create branches.",
     "- Commit every change before you report. Untracked or uncommitted files reject the report.",
-    `- If you already reported feedback round ${round}, this message is a repeated copy: stop without changing anything.`,
+    `- If you already reported work round ${round}, this message is a repeated copy: stop without changing anything.`,
     "",
     "## Report",
     "",
@@ -266,15 +281,18 @@ export function roundPrompt(job: Job, ordinal: number, pending: readonly Feedbac
 
 /** For a replacement worker whose worktree does not contain the branch's head on GitHub. */
 export function mergeNote(job: Job, head: Sha, base: Sha): string {
-  return `This worktree starts at ${head.slice(0, 7)}, but \`${job.branch}\` on GitHub is at ${base.slice(0, 7)}. Run \`git fetch origin\` and merge \`origin/${job.branch}\` before you commit; a report whose commit does not contain ${base.slice(0, 7)} is rejected.`;
+  return `This worktree starts at ${head.slice(0, 7)}, but \`${job.branch}\` on GitHub is at ${base.slice(0, 7)}. Run \`bb pstack gh fetch\` and merge \`origin/${job.branch}\` before you commit; a report whose commit does not contain ${base.slice(0, 7)} is rejected.`;
 }
 
 /** Standing instructions for a bound worker thread, contributed every turn so they survive compaction. */
 export function workerInstructions(job: Job): string {
   return [
     `This thread works on GitHub issue #${job.issue} in ${job.repo} for pstack.`,
+    AUTONOMOUS_WORK,
+    "No report requests information. Resolve ordinary uncertainty and deliver a useful baseline, or report a concrete failure.",
     "`bb pstack issues report --file <path>` is this run's built-in PR tool: pstack validates the report, pushes the reported commit, opens or updates the pull request, and posts your replies to review comments.",
-    "Never run `git push`, never use `gh`, and never switch or create branches. Commit everything before reporting. After the first push, add commits and never rewrite pushed history.",
+    "Never run `git push`, never use `gh`, and never switch or create branches. Commit changes before reporting success. A failure report preserves dirty files. After the first push, add commits and never rewrite pushed history.",
+    "Fetch with `bb pstack gh fetch`; plain `git fetch` has no GitHub credentials. While the pull request is in review with no feedback round open, publish a merge that resolves a conflict with `bb pstack issues sync`.",
     ...(job.snapshot.parent ? [`This issue is a sub-issue of #${job.snapshot.parent.number}. Resolve only #${job.issue}; never close the parent.`] : []),
     "The pull request title and body describe the change for a reviewer who never saw this thread: follow `.github/pull_request_template.md` when it exists, else the descriptions section of Opening a PR, with no process context.",
   ].join("\n");
@@ -284,7 +302,119 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
   return [
     "You stopped without reporting. Write your report JSON to a file and run:",
     "`bb pstack issues report --file <path>`",
+    AUTONOMOUS_WORK,
+    ...(job.round > 1 ? ["For this feedback round, report `changes` or `no-change` with `replies`; put any unresolved decision in a reply on the pull request."] : []),
     ...(gate && !gate.pass && job.pushedSha === null ? [`A \`changes\` report needs \`bb pstack gate pr\` to pass, and it fails: ${gate.reason}`] : []),
     `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}.`,
   ].join("\n");
+}
+
+const ISSUE_STAGE: Record<Job["phase"]["state"], string> = {
+  queued: "Queued",
+  starting: "Starting the worker",
+  working: "Implementing and verifying",
+  publishing: "Publishing changes",
+  checking: "Checking CI",
+  review: "Checking CI",
+  addressing: "Addressing feedback",
+  tracking: "Tracking sub-issues",
+  updating: "Updating sub-issue progress",
+  recovering: "Recovering work",
+  repairing: "Repairing CI or conflicts",
+  readifying: "Preparing review",
+  drafting: "Returning the pull request to draft",
+  closing: "Recording the result",
+  stopping: "Stopping work",
+  sticking: "Recording failure",
+  sending: "Sending feedback to the worker",
+  respawning: "Starting a replacement worker",
+  republishing: "Publishing verified updates",
+  replying: "Replying to feedback",
+  ignored: "Trigger ignored",
+  done: "Outcome unknown",
+  stopped: "Stopped",
+  stuck: "Failed",
+};
+
+const TRUNCATED = "[Truncated to fit GitHub's comment limit.]";
+const CLIP_GAP = "\n\n";
+const STATUS_PROSE_ENTITIES: Record<string, string> = { "&": "&amp;", "<": "&lt;", "`": "&#96;", "~": "&#126;", "\\": "&#92;" };
+const MAX_PROSE_GROWTH = Math.max(2, ...Object.values(STATUS_PROSE_ENTITIES).map((entity) => entity.length));
+
+export function statusMarker(repo: Job["repo"], issue: number): string {
+  return `<!-- pstack:issue-status:${repo}:${issue} -->`;
+}
+
+/** The status comment as posted: the body, then its revision, then the identity marker on the last line. */
+export function statusComment(body: string, revision: number, marker: string): string {
+  return `${body.trimEnd()}\n\n<!-- pstack:status-revision:${revision} -->\n${marker}`;
+}
+
+function allocate(lengths: readonly number[], room: number): number[] {
+  const limits = lengths.map(() => 0);
+  const order = lengths.map((_, index) => index).sort((a, b) => lengths[a]! - lengths[b]!);
+  order.forEach((index, rank) => {
+    limits[index] = Math.min(lengths[index]!, Math.floor(room / (order.length - rank)));
+    room -= limits[index]!;
+  });
+  return limits;
+}
+
+function clipped(text: string, limit: number): string {
+  const end = /[\uD800-\uDBFF]/.test(text[limit - 1] ?? "") ? limit - 1 : limit;
+  return text.slice(0, end);
+}
+
+function statusProse(text: string): string {
+  return issueText(unmarked(text).replace(/[&<`~\\]/g, (char) => STATUS_PROSE_ENTITIES[char]!));
+}
+
+/**
+ * The status comment's body, within GitHub's limit once `statusComment` wraps it. The outcome and the fixed facts come
+ * first. The report's prose and the sub-issue progress follow with Markdown's structural characters as entities, so
+ * they cannot hide what comes after them, and only they are cut. The store keeps the full report.
+ */
+export function statusBody(job: Job): string {
+  const result = job.control.disposition;
+  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : ISSUE_STAGE[job.phase.state];
+  const failure = job.control.publicFailure;
+  let reason: string | null = null;
+  let reported: string | null = null;
+  if (result === "failure") {
+    switch (failure?.kind) {
+      case "workflow-permission": reason = "Workflow changes require a workflow write permission that is unavailable. The work is preserved."; break;
+      case "publication-denied": reason = "Repository permissions denied publication. The work is preserved."; break;
+      case "prerequisite": reason = `Prerequisite work did not complete${failure.issues.length ? ` for ${failure.issues.map((issue) => `#${issue}`).join(", ")}` : ""}.`; break;
+      case "verification": reason = "The current contribution could not be verified for review. The work is preserved."; break;
+      case "recovery-exhausted": reason = "Automatic worker recovery was exhausted. The work is preserved."; break;
+      case "report": reported = failure.reason; break;
+      case "execution":
+      case undefined: reason = "Execution failed. The work is preserved."; break;
+      default: { const exhaustive: never = failure; return exhaustive; }
+    }
+  }
+  const fixed = [
+    `Issue #${job.issue}: ${status}`,
+    job.control.policyLimitation,
+    reason ? `Reason: ${reason}` : null,
+    job.pr ? `Pull request: ${job.pr.url}` : null,
+    job.report?.headSha ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : job.control.preservedSha ? `Preserved commit: ${job.control.preservedSha}` : null,
+    `Branch: \`${job.branch}\``,
+  ].flatMap((part) => (part ? [issueText(part)] : []));
+  const verification = (job.report?.verification ?? []).map((line) => `- ${line}`).join("\n\n");
+  const prose = [
+    { label: "", text: job.control.childrenProgress },
+    { label: "", text: job.report?.summary ?? null },
+    { label: "Reason: ", text: reported },
+    { label: "", text: verification || null },
+  ];
+  const render = (limits: readonly number[]) => [
+    ...fixed,
+    ...prose.map(({ label, text }, index) => text && (text.length <= limits[index]! ? `${label}${statusProse(text)}` : `${label}${statusProse(clipped(text, limits[index]!))}${CLIP_GAP}${TRUNCATED}`)),
+  ].filter(Boolean).join("\n\n");
+  const full = render(prose.map(() => Infinity));
+  const budget = COMMENT_MAX - statusComment("", Number.MAX_SAFE_INTEGER, statusMarker(job.repo, job.issue)).length;
+  if (full.length <= budget) return full;
+  const room = Math.max(0, Math.floor((budget - render(prose.map(() => 0)).length) / MAX_PROSE_GROWTH));
+  return render(allocate(prose.map(({ text }) => text?.length ?? 0), room));
 }

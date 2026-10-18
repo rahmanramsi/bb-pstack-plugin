@@ -3,7 +3,7 @@ import { Markdown, useBbNavigate, useRpc, type PluginNavPanelProps } from "@get-
 import { Button } from "../../components/ui/button.tsx";
 import { TERMINAL, canStop, machineLabel } from "../issues/job.ts";
 import type { rpcContract } from "../rpc.ts";
-import { formatAge, issueNext, issueStates, type IssueJob, type IssueRepo } from "./layout.ts";
+import { formatAge, issueNext, issueNotes, issueStatus, type IssueJob, type IssueNote, type IssueRepo } from "./layout.ts";
 import { useIssueBoard } from "./live.ts";
 import { LoadMessage, useNow } from "./views.tsx";
 
@@ -69,13 +69,21 @@ function IssueLabels({ labels }: { labels: string[] }) {
 }
 
 function WorkerStatus({ job }: { job: IssueJob | null }) {
-  return job ? <span className="ps-status" data-state={issueStates[job.state].tone}>{issueStates[job.state].label}</span> : <span className="ps-muted">Not started</span>;
+  if (!job) return <span className="ps-muted">Not started</span>;
+  const status = issueStatus(job);
+  return <span className="ps-status" data-state={status.tone}>{status.label}</span>;
+}
+
+const noteClass: Record<IssueNote["tone"], string> = { error: "ps-error", warning: "ps-warning", muted: "ps-muted" };
+
+function IssueNotes({ notes }: { notes: readonly IssueNote[] }) {
+  return <>{notes.map((note) => <p key={note.text} className={noteClass[note.tone]}>{note.text}</p>)}</>;
 }
 
 function IssueListRow({ entry: { issue, job }, now, onOpen, refresh }: { entry: IssueEntry; now: number; onOpen: () => void; refresh: () => void }) {
   const navigate = useBbNavigate();
   const active = job !== null && !TERMINAL.has(job.state);
-  const problem = job?.error || job?.poll.error;
+  const problem = job ? issueNotes(job).find((note) => note.tone === "error")?.text : undefined;
   return <tr>
     <td className="ps-issue-main"><span className="ps-issue-state-icon" data-state={issue.state}><IssueIcon kind={issue.state === "open" ? "issue" : "closed"} /></span><div><button type="button" className="ps-issue-open" onClick={onOpen}>{issue.title}</button><div className="ps-issue-meta"><span>{issue.repo}</span><span>#{issue.issue}</span><IssueLabels labels={issue.labels} /></div>{problem ? <p className="ps-error ps-issue-problem">{problem}</p> : null}</div></td>
     <td className="ps-issue-assignee"><span className="ps-sr-only">Assignee: </span>{issue.assignees.length ? issue.assignees.join(", ") : <span className="ps-muted">Unassigned</span>}</td>
@@ -92,7 +100,7 @@ function IssueDetail({ entry: { issue, job }, jobs, now, back, refresh }: { entr
     <div className="ps-issue-detail-nav"><Button variant="ghost" size="sm" className="ps-list-button" onClick={back}><IssueIcon kind="back" />Issues</Button><Button variant="ghost" size="sm" className="ps-list-button" onClick={() => navigate.openUrl(issue.issueUrl)}>Open in GitHub<IssueIcon kind="external" /></Button></div>
     <div className="ps-issue-detail-heading"><div><p className="ps-muted">{issue.repo} #{issue.issue}</p><h2>{issue.title}</h2><div className="ps-issue-detail-meta"><span className="ps-issue-state-icon" data-state={issue.state}><IssueIcon kind={issue.state === "open" ? "issue" : "closed"} />{issue.state === "open" ? "Open" : "Closed"}</span>{issue.author ? <span>Opened by {issue.author}</span> : null}<span>Updated {formatAge(issue.updatedAt, now)}</span></div></div>{issue.state === "open" && !active ? <StartIssue issue={issue} refresh={refresh} /> : null}</div>
     <div className="ps-issue-detail-layout"><article className="ps-issue-body"><Markdown content={issue.body || "No description provided."} /></article><aside className="ps-issue-sidebar">
-      <section><h3>Worker</h3><WorkerStatus job={job} />{active && job.threadId ? <Button variant="outline" size="sm" className="ps-list-button" onClick={() => { if (job.threadId) navigate.toThread(job.threadId); }}>Open worker thread</Button> : null}{job?.pr ? <Button variant="outline" size="sm" className="ps-list-button" onClick={() => { if (job.pr) navigate.openUrl(job.pr.url); }}>Pull request #{job.pr.number}<IssueIcon kind="external" /></Button> : null}{job && canStop(job.state) ? <StopIssueJob id={job.id} issue={issue.issue} refresh={refresh} /> : null}{issue.startError ? <p className="ps-muted">{issue.startError}</p> : null}{job?.error ? <p className="ps-error">{job.error}</p> : null}{job?.poll.error ? <p className="ps-error">{job.poll.error}</p> : null}{job && issueNext(job) ? <p className="ps-muted">{issueNext(job)}</p> : null}</section>
+      <section><h3>Worker</h3><WorkerStatus job={job} />{active && job.threadId ? <Button variant="outline" size="sm" className="ps-list-button" onClick={() => { if (job.threadId) navigate.toThread(job.threadId); }}>Open worker thread</Button> : null}{job?.pr ? <Button variant="outline" size="sm" className="ps-list-button" onClick={() => { if (job.pr) navigate.openUrl(job.pr.url); }}>Pull request #{job.pr.number}<IssueIcon kind="external" /></Button> : null}{job && canStop(job.state) ? <StopIssueJob id={job.id} issue={issue.issue} refresh={refresh} /> : null}{issue.startError ? <p className="ps-muted">{issue.startError}</p> : null}{job ? <IssueNotes notes={issueNotes(job)} /> : null}{job && issueNext(job) ? <p className="ps-muted">{issueNext(job)}</p> : null}</section>
       <section><h3>Assignees</h3><p>{issue.assignees.join(", ") || "Unassigned"}</p></section><section><h3>Labels</h3>{issue.labels.length ? <IssueLabels labels={issue.labels} /> : <p className="ps-muted">No labels</p>}</section>
     </aside></div>
     {jobs.length ? <details className="ps-issue-history"><summary>Worker history <span>{jobs.length}</span></summary><ul className="ps-task-list">{jobs.map((item) => <IssueRow key={item.id} job={item} now={now} onThread={navigate.toThread} refresh={refresh} />)}</ul></details> : null}
@@ -129,14 +137,14 @@ function RepoSection({ repo, jobs, empty, now, onThread, refresh }: {
   </section>;
 }
 
-function IssueRow({ job, now, onThread, refresh }: { job: IssueJob; now: number; onThread: ((threadId: string) => void) | null; refresh: () => void }) {
+export function IssueRow({ job, now, onThread, refresh }: { job: IssueJob; now: number; onThread: ((threadId: string) => void) | null; refresh: () => void }) {
   const navigate = useBbNavigate();
-  const state = issueStates[job.state];
+  const status = issueStatus(job);
   const next = issueNext(job);
   const threadId = job.threadId;
   const pr = job.pr;
   return <li className="ps-issue">
-    <div className="ps-issue-line"><span className="ps-issue-title"><strong>#{job.issue}</strong> {job.title}</span><span className="ps-status" data-state={state.tone}>{state.label}</span></div>
+    <div className="ps-issue-line"><span className="ps-issue-title"><strong>#{job.issue}</strong> {job.title}</span><span className="ps-status" data-state={status.tone}>{status.label}</span></div>
     {next === null ? null : <p className="ps-muted">{next}</p>}
     <p className="ps-muted"><code>{job.branch}</code> · {machineLabel(job.host)} · updated {formatAge(job.updatedAt, now)}</p>
     <div className="ps-issue-links">
@@ -147,8 +155,7 @@ function IssueRow({ job, now, onThread, refresh }: { job: IssueJob; now: number;
         : <Button type="button" variant="ghost" size="sm" className="ps-action" aria-label={`Open pull request #${pr.number} on GitHub`} onClick={() => navigate.openUrl(pr.url)}>PR #{pr.number}</Button>}
       {canStop(job.state) ? <StopIssueJob id={job.id} issue={job.issue} refresh={refresh} /> : null}
     </div>
-    {job.error === null ? null : <p className="ps-error">{job.error}</p>}
-    {TERMINAL.has(job.state) || job.poll.error === null ? null : <p className="ps-error">Poll error. {job.poll.error}</p>}
+    <IssueNotes notes={issueNotes(job)} />
   </li>;
 }
 

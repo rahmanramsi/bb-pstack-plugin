@@ -10,7 +10,7 @@ import type { PushInput, PushResult } from "../host-contract.ts";
 import { parseChoice } from "../models.ts";
 import { createPlacement } from "../placement.ts";
 import { MIGRATIONS } from "../store.ts";
-import { createIssues } from "./engine.ts";
+import { createIssues, SWEEP_MS, type IssuesDeps } from "./engine.ts";
 import { createGitHub } from "./github.ts";
 import type { JobView, RepoName } from "./job.ts";
 import { openIssueStore, type IssueStore } from "./store.ts";
@@ -59,6 +59,15 @@ type GitHubState = {
   outages: { key: string; body?: string; status?: number; times?: number }[];
   nextId: number;
   now: () => number;
+  grants: Record<string, string>;
+  mergeable: boolean | null;
+  protected: boolean;
+  policyUnavailable: boolean;
+  checkRuns: { id: number; name: string; head_sha: string; status: string; conclusion: string | null; html_url: string | null; app: { id: number } }[];
+  requiredChecks: { context: string; app_id: number }[];
+  draftConversions: boolean[];
+  suiteState: { status: string; conclusion: string | null };
+  readyStartsCI: boolean;
 };
 
 let server: ReturnType<typeof createServer>;
@@ -87,14 +96,14 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     if (!gh.pulls.has(number)) gh.pulls.set(number, { state: "open", merged: false, requested: new Set() });
     return gh.pulls.get(number)!;
   };
-  if (method === "GET" && path === "/repos/acme/web/installation") return [200, { id: 1 }];
+  if (method === "GET" && path === "/repos/acme/web/installation") return [200, { id: 1, permissions: gh.grants }];
   if (method === "POST" && path === "/app/installations/1/access_tokens") return [201, { token: `ghs_${gh.nextId++}`, expires_at: iso(gh.now() + 60 * MIN) }];
   if (method === "DELETE" && path === "/installation/token") {
     gh.revoked.push(String(headers.authorization).replace("Bearer ", ""));
     return [204];
   }
   if (method === "GET" && path === "/app") return [200, { slug: "pstack-test" }];
-  if (method === "GET" && path === "/repos/acme/web") return [200, { default_branch: "main" }];
+  if (method === "GET" && path === "/repos/acme/web") return [200, { id: 1, archived: false, default_branch: "main" }];
   if (method === "GET" && path === "/repos/acme/web/issues") {
     const since = url.searchParams.get("since");
     const items = [...gh.issues.values()]
@@ -123,16 +132,36 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
   }
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/sub_issues$/.exec(path)) && method === "GET") return [200, (issueOf(match[1]!)!.subIssues ?? []).map((n) => linked(gh.issues.get(n)!))];
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/dependencies\/blocked_by$/.exec(path)) && method === "GET") return [200, (issueOf(match[1]!)!.blockedBy ?? []).map((n) => linked(gh.issues.get(n)!))];
-  if ((match = /^\/repos\/acme\/web\/issues\/comments\/(\d+)$/.exec(path)) && method === "PATCH") {
-    const comment = [...gh.comments.values()].flat().find((candidate) => candidate.id === Number(match![1]))!;
-    comment.body = body.body;
-    comment.updated_at = iso(gh.now());
-    return [200, comment];
+  if ((match = /^\/repos\/acme\/web\/issues\/comments\/(\d+)$/.exec(path))) {
+    const found = [...gh.comments.entries()].flatMap(([issue, comments]) => comments.map((comment) => ({ issue, comment }))).find(({ comment }) => comment.id === Number(match![1]));
+    if (!found) return [404, { message: "Not Found" }];
+    if (method === "DELETE") { gh.comments.set(found.issue, gh.comments.get(found.issue)!.filter((comment) => comment.id !== found.comment.id)); return [204]; }
+    if (method === "PATCH") { found.comment.body = body.body; found.comment.updated_at = iso(gh.now()); }
+    return [200, { ...found.comment, user: { ...found.comment.user, type: found.comment.user.login === APP ? "Bot" : "User" }, performed_via_github_app: found.comment.user.login === APP ? { id: 1 } : null, issue_url: `${base}/repos/acme/web/issues/${found.issue}` }];
   }
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/events$/.exec(path)) && method === "GET") return [200, gh.events.get(Number(match[1])) ?? []];
   if ((match = /^\/repos\/acme\/web\/collaborators\/([^/]+)\/permission$/.exec(path))) {
     const permission = gh.permissions.get(decodeURIComponent(match[1]!));
     return permission ? [200, { permission }] : [404, { message: "Not Found" }];
+  }
+  if (method === "GET" && /^\/repos\/acme\/web\/commits\/[^/]+\/check-suites$/.test(path)) return [200, { total_count: gh.checkRuns.length ? 1 : 0, check_suites: gh.checkRuns.length ? [{ id: 1, head_sha: path.split("/")[5], ...gh.suiteState, app: { id: gh.checkRuns[0]!.app.id, slug: "ci" } }] : [] }];
+  if (method === "GET" && path === "/repos/acme/web/check-suites/1/check-runs") return [200, { total_count: gh.checkRuns.length, check_runs: gh.checkRuns }];
+  if (method === "GET" && /^\/repos\/acme\/web\/commits\/[^/]+\/statuses$/.test(path)) return [200, []];
+  if (method === "GET" && path === "/repos/acme/web/branches/main") return [200, { protected: gh.protected, commit: { sha: gh.refs.get("main") } }];
+  if (method === "GET" && path === "/repos/acme/web/rules/branches/main") return [200, gh.requiredChecks.length ? [{ type: "required_status_checks", parameters: { required_status_checks: gh.requiredChecks, strict_required_status_checks_policy: false } }] : []];
+  if (method === "GET" && path === "/repos/acme/web/branches/main/protection") return gh.policyUnavailable ? [403, { message: "admin grant is unavailable" }] : [200, { required_status_checks: { contexts: gh.requiredChecks.map((check) => check.context), checks: gh.requiredChecks, strict: false } }];
+  if (method === "POST" && path === "/graphql") {
+    const id = Number(body.variables.input.pullRequestId.replace("PR_", ""));
+    const issue = gh.issues.get(id)!;
+    const draft = body.query.includes("convertPullRequestToDraft");
+    issue.pr!.draft = draft;
+    gh.draftConversions.push(draft);
+    if (!draft && gh.readyStartsCI) {
+      gh.suiteState = { status: "in_progress", conclusion: null };
+      gh.checkRuns = gh.checkRuns.map((run) => ({ ...run, status: "in_progress", conclusion: null }));
+    }
+    const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
+    return [200, { data: { [mutation]: { pullRequest: { id: `PR_${id}`, isDraft: draft } } } }];
   }
   if (method === "GET" && path === "/repos/acme/web/pulls") {
     if (url.searchParams.get("state") === "closed") return [200, [{ title: "feat(ui): dark mode", merged_at: "x" }, { title: "fix: crash", merged_at: "x" }]];
@@ -151,7 +180,8 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     return sha ? [200, { object: { sha } }] : [404, { message: "Not Found" }];
   }
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/labels$/.exec(path)) && method === "POST") {
-    const issue = issueOf(match[1]!)!;
+    const issue = issueOf(match[1]!);
+    if (!issue) return [404, { message: "Not Found" }];
     for (const label of body.labels) {
       issue.labels.add(label);
       const events = gh.events.get(issue.number) ?? [];
@@ -162,14 +192,15 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     return [200, [...issue.labels].map((name) => ({ name }))];
   }
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/labels\/(.+)$/.exec(path)) && method === "DELETE") {
-    const issue = issueOf(match[1]!)!;
+    const issue = issueOf(match[1]!);
+    if (!issue) return [404, { message: "Not Found" }];
     if (!issue.labels.delete(decodeURIComponent(match[2]!))) return [404, { message: "Label does not exist" }];
     touch(issue);
     return [200, []];
   }
   if ((match = /^\/repos\/acme\/web\/issues\/(\d+)\/comments$/.exec(path))) {
     const comments = gh.comments.get(Number(match[1])) ?? [];
-    if (method === "GET") return etagged(updatedSince(comments));
+    if (method === "GET") return etagged(updatedSince(comments).map((comment) => ({ ...comment, user: { ...comment.user, type: comment.user.login === APP ? "Bot" : "User" }, performed_via_github_app: comment.user.login === APP ? { id: 1 } : null, issue_url: `${base}/repos/acme/web/issues/${Number(match![1])}` })));
     const comment = { id: gh.nextId++, body: body.body, user: { login: APP }, created_at: iso(gh.now()), updated_at: iso(gh.now()) };
     gh.comments.set(Number(match[1]), [...comments, comment]);
     return [201, comment];
@@ -201,7 +232,11 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
   }
   if ((match = /^\/repos\/acme\/web\/pulls\/(\d+)$/.exec(path))) {
     const pull = pullOf(match[1]!);
-    if (method === "GET") return etagged({ state: pull.state, merged: pull.merged });
+    if (method === "GET") {
+      const issue = gh.issues.get(Number(match[1]));
+      if (!issue?.pr) return [404, { message: "Not Found" }];
+      return etagged({ title: issue.title, body: issue.pr.body, user: { login: issue.user }, number: issue.number, node_id: `PR_${issue.number}`, html_url: `https://github.com/acme/web/pull/${issue.number}`, state: pull.state, merged: pull.merged, merged_at: pull.merged ? iso(gh.now()) : null, draft: issue.pr.draft, mergeable: gh.mergeable, mergeable_state: gh.mergeable ? "clean" : "dirty", head: { sha: gh.refs.get(issue.pr.head), ref: issue.pr.head, repo: { full_name: REPO } }, base: { sha: gh.refs.get("main"), ref: issue.pr.base, repo: { full_name: REPO } } });
+    }
     if (method === "PATCH") {
       gh.issues.get(Number(match[1]))!.pr!.body = body.body;
       return [200, {}];
@@ -251,9 +286,14 @@ export type FakeThread = {
   metadata: Record<string, unknown>;
   pinnedAt?: number | null;
   hostId?: string;
+  queuedMessageCount?: number;
+  activeBackgroundAgentCount?: number;
+  activeBackgroundCommandCount?: number;
+  activeGoalCount?: number;
+  activeWorkflowCount?: number;
 };
 
-export function harness() {
+export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typeof Database>, now: number) => void; configureDeps?: (deps: IssuesDeps) => void } = {}) {
   const clock = { now: Date.parse("2026-10-17T12:00:00Z") };
   gh = {
     issues: new Map(),
@@ -262,18 +302,20 @@ export function harness() {
     reviewComments: new Map(),
     reviews: new Map(),
     pulls: new Map(),
-    refs: new Map(),
+    refs: new Map([["main", SHA1]]),
     permissions: new Map([["maya", "write"], ["lee", "admin"], ["drive-by", "read"]]),
     revoked: [],
     holds: [],
     outages: [],
     nextId: 1000,
     now: () => clock.now,
+    grants: { contents: "write", issues: "write", pull_requests: "write", workflows: "write", checks: "read", statuses: "read" },
+    mergeable: true, protected: false, policyUnavailable: false, checkRuns: [], requiredChecks: [], draftConversions: [], suiteState: { status: "completed", conclusion: "success" }, readyStartsCI: false,
   };
 
   const threads = new Map<string, FakeThread>();
   /** `commits`: what HEAD contains past `origin/main`; by default HEAD and every commit pstack pushed. */
-  type Worktree = { headSha: string; dirty: boolean; ahead: number; commits?: string[] };
+  type Worktree = { headSha: string; dirty: boolean; ahead: number; commits?: string[]; ancestors?: string[] };
   const worktrees = new Map<string, Worktree>();
   const files = new Map<string, string>();
   const spawned: Record<string, any>[] = [];
@@ -281,7 +323,7 @@ export function harness() {
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, staleWorktree: null as string | null, machines: null as string | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null, machines: null as string | null };
   const fleet = new Map<string, Machine>([["host_server", {}], ["host_worker", {}]]);
   const machine = (id: string) => ({ connected: true, phase: "active", limit: 4, checkout: true, catalog: [...CATALOG], ...fleet.get(id) });
   const hostOf = (thread: FakeThread) => thread.hostId ?? "host_worker";
@@ -289,6 +331,7 @@ export function harness() {
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
   const threadReads = { count: 0 };
+  const queued = new Set<string>();
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
   const held = async (key: string) => {
@@ -301,8 +344,9 @@ export function harness() {
 
   const createThread = (args: Record<string, any>): FakeThread => {
     const id = `thr_w${++next}`;
-    const thread: FakeThread = { id, status: "active", archivedAt: null, deletedAt: null, createdAt: clock.now, updatedAt: clock.now, projectId: args.projectId, originPluginId: "pstack", environmentId: `env_${id}`, metadata: args.pluginMetadata, hostId: args.environment.hostId };
+    const thread: FakeThread = { id, status: "active", archivedAt: null, deletedAt: null, createdAt: clock.now, updatedAt: clock.now, projectId: args.projectId, originPluginId: "pstack", environmentId: args.environment.type === "reuse" ? args.environment.environmentId : `env_${id}`, metadata: args.pluginMetadata, hostId: args.environment.type === "host" ? args.environment.hostId : [...threads.values()].find((candidate) => candidate.environmentId === args.environment.environmentId)?.hostId };
     // A replacement starts from the branch as the host last fetched it: GitHub's head, unless the test makes it stale.
+    if (args.environment.type === "reuse") return thread;
     const base: string = args.environment.workspace.baseBranch.name;
     const head = base.startsWith("origin/agent/") ? (failures.staleWorktree ?? gh.refs.get(base.slice("origin/".length)) ?? SHA1) : SHA1;
     worktrees.set(thread.environmentId, { headSha: head, dirty: false, ahead: 0 });
@@ -311,6 +355,7 @@ export function harness() {
 
   const sdk = {
     threads: {
+      queuedMessages: { list: async ({ threadId }: { threadId: string }) => failures.scheduledRetryAt !== null ? [{ payload: { kind: "retry" }, sendAt: failures.scheduledRetryAt }] : queued.has(threadId) ? [{ payload: { kind: "message" }, sendAt: null }] : [] },
       async get({ threadId }: { threadId: string }) {
         threadReads.count++;
         const thread = threads.get(threadId);
@@ -328,11 +373,11 @@ export function harness() {
         return { id: thread.id };
       },
       /** bb's order: pinned threads first, then newest first. */
-      async list({ offset = 0, limit = 50, projectId }: { offset?: number; limit?: number; projectId?: string }) {
+      async list({ offset = 0, limit = 50, projectId, environmentId, archived = false }: { offset?: number; limit?: number; projectId?: string; environmentId?: string; archived?: boolean }) {
         calls.list++;
         return [...threads.values()]
-          .filter((thread) => thread.archivedAt === null && (!projectId || thread.projectId === projectId))
-          .map((thread) => ({ ...thread, pinnedAt: thread.pinnedAt ?? null }))
+          .filter((thread) => (archived ? thread.archivedAt !== null : thread.archivedAt === null) && (!projectId || thread.projectId === projectId) && (!environmentId || thread.environmentId === environmentId))
+          .map((thread) => ({ ...thread, pinnedAt: thread.pinnedAt ?? null, activity: { activeBackgroundAgentCount: thread.activeBackgroundAgentCount ?? 0, activeBackgroundCommandCount: thread.activeBackgroundCommandCount ?? 0, activeGoalCount: thread.activeGoalCount ?? 0, activeWorkflowCount: thread.activeWorkflowCount ?? 0, activePlanModeCount: 0 } }))
           .sort((a, b) => (b.pinnedAt === null ? 0 : 1) - (a.pinnedAt === null ? 0 : 1) || b.createdAt - a.createdAt)
           .slice(offset, offset + limit);
       },
@@ -353,7 +398,7 @@ export function harness() {
       async stop({ threadId }: { threadId: string }) {
         stopped.push(threadId);
         const thread = threads.get(threadId);
-        if (thread) thread.status = "idle";
+        if (thread && !failures.stopUnconfirmed) thread.status = "idle";
         await held("stop");
         return {};
       },
@@ -373,6 +418,7 @@ export function harness() {
         return [{ id: "git-worktree", availability: { status: "available" } }];
       },
       async status({ environmentId, mergeBaseBranch }: { environmentId: string; mergeBaseBranch: string }) {
+        if (failures.workspaceUnavailable) throw new Error("worker host offline");
         assert.equal(mergeBaseBranch, "origin/main");
         const tree = worktrees.get(environmentId)!;
         return {
@@ -435,7 +481,10 @@ export function harness() {
   } as unknown as BbPluginApi;
 
   const db = new Database(":memory:");
-  for (const statement of MIGRATIONS) db.exec(statement);
+  for (const statement of MIGRATIONS) {
+    if (statement.includes("CREATE TABLE issue_legacy_archive")) options.beforeAutonomyUpgrade?.(db, clock.now);
+    db.exec(statement);
+  }
   let repoLine: { repo: RepoName; projectId: string; hostId: string | null } = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
   let workerRole = "codex/gpt-6.1-sol/high";
 
@@ -447,15 +496,30 @@ export function harness() {
       get(target, key: keyof IssueStore) {
         const value = target[key];
         if (typeof value !== "function") return value;
-        return (...args: unknown[]) => (life.dead && ["get", "write", "due", "byThread"].includes(key) ? (key === "due" ? [] : null) : (value as Function).apply(target, args));
+        return (...args: unknown[]) => {
+          if (life.dead) {
+            if (["due", "statuses", "pendingSubmissions"].includes(key)) return [];
+            if (["get", "write", "byThread", "claimDecoration"].includes(key)) return null;
+            if (key === "claimStatus") return false;
+            if (["decorate", "settleStatus", "settleDecoration", "finishSubmission"].includes(key)) return;
+          }
+          return (value as Function).apply(target, args);
+        };
       },
     });
     const limits = () => JSON.stringify({ globalLimit: null, hosts: [...fleet.keys()].map((id) => ({ id, effectiveLimit: machine(id).limit })) });
     const placement = createPlacement(bb, { clock: () => clock.now, exec: async () => limits() });
-    const issues = createIssues({
+    const deps: IssuesDeps = {
       bb,
       store,
       github: createGitHub({ credentials: () => ({ appId: "1", privateKey }), apiUrl: base, gitUrl: "https://github.test", clock: () => clock.now }),
+      inspectOrigin: async () => "https://github.com/acme/web.git",
+      inspectCommit: async (_hostId, input) => {
+        if (failures.missingObject) return { kind: "missing-object", sha: failures.missingObject };
+        const tree = worktrees.get(input.worktreePath.slice("/worktrees/".length));
+        const ancestors = [SHA1, ...tree?.ancestors ?? tree?.commits ?? [tree?.headSha, ...pushes.map((push) => push.sha)]];
+        return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows, ...(input.ancestorShas ? { ancestry: input.ancestorShas.map((sha) => ({ sha, included: sha === input.sha || ancestors.includes(sha) })) } : {}) };
+      },
       hostPush: async (hostId: string, input: PushInput, signal?: AbortSignal): Promise<PushResult> => {
         const worker = [...threads.values()].find((thread) => input.worktreePath === `/worktrees/${thread.environmentId}`)!;
         assert.equal(hostId, hostOf(worker), "the push runs on the machine with the worktree");
@@ -467,6 +531,7 @@ export function harness() {
           });
         }
         await held("push:before");
+        if (failures.pushRejected) return { status: "rejected", reason: failures.pushRejected, detail: "push rejected by fixture" };
         if ((gh.refs.get(input.branch) ?? null) !== input.expectedRemoteSha) return { status: "rejected", reason: "stale-remote", detail: "[rejected] (stale info)" };
         gh.refs.set(input.branch, input.sha);
         await held("push");
@@ -485,7 +550,9 @@ export function harness() {
         return placement.facts(query);
       },
       clock: () => clock.now,
-    });
+    };
+    options.configureDeps?.(deps);
+    const issues = createIssues(deps);
     const cli = defineCli({ name: "pstack", summary: "pstack", commands: issues.commands });
     return { issues, crash: () => (life.dead = true), run: (argv: string[], threadId?: string) => cli.run(argv, { threadId, cwd: "/worktrees/x" }) };
   }
@@ -519,8 +586,21 @@ export function harness() {
     files.set("/worktrees/x/report.json", JSON.stringify(value));
     return current.run(["issues", "report", "--file", "report.json"], threadId);
   };
+  /** The worker commits a merge and asks pstack to push it while in review. */
+  const sync = async (threadId: string, tree: Partial<Worktree>) => {
+    const environmentId = threads.get(threadId)!.environmentId;
+    worktrees.set(environmentId, { ...worktrees.get(environmentId)!, ...tree });
+    return current.run(["issues", "sync"], threadId);
+  };
   const settle = async () => {
     for (let i = 0; i < 5; i++) await current.issues.sweep();
+  };
+  const advance = async (milliseconds: number) => {
+    const end = clock.now + milliseconds;
+    while (clock.now < end) {
+      clock.now = Math.min(end, clock.now + SWEEP_MS);
+      await settle();
+    }
   };
   const byIssue = async (issue: number) => (await views()).find((job) => job.issue === issue)!;
   /** Label the issue and let the worker's first report open its pull request. */
@@ -530,6 +610,7 @@ export function harness() {
     const working = await byIssue(issue);
     await report(working.threadId!, GOOD);
     await settle();
+    await advance(MIN);
     const job = await byIssue(issue);
     assert.equal(job.state, "review", job.error ?? "");
     return { job, pr: job.pr!.number };
@@ -572,18 +653,22 @@ export function harness() {
   };
 
   return {
+    db,
+    worktrees,
     clock,
     gh: () => gh,
     threads,
     late,
     calls,
     threadReads,
+    queued,
     spawned,
     sent,
     stopped,
     pushes,
     failures,
     fleet,
+    advance,
     work,
     events,
     services,
@@ -599,6 +684,7 @@ export function harness() {
     only,
     byIssue,
     report,
+    sync,
     settle,
     restart,
     overlap,

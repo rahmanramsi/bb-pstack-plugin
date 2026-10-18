@@ -38,7 +38,6 @@ test("with no eligible machine the job stays queued with each machine's reason, 
     "no machine is eligible: host_server: the bb server's machine; host_mini: no checkout of this project; host_studio: codex/gpt-6.1-sol/high unavailable; host_vps: disconnected; host_box: unknown concurrency limit",
   );
   assert.equal(h.spawned.length, 0);
-  assert.deepEqual([...h.gh().issues.get(41)!.labels], ["agent"]);
   assert.deepEqual(waiting.host, { id: null, pinned: false });
   assert.match((await h.engine().run(["issues", "list"])).stdout!, new RegExp(`#41 {2}queued {2}host auto {2}${waiting.id} {2}0m ago {2}no machine is eligible: host_server`));
   assert.match((await h.engine().run(["issues", "show", waiting.id])).stdout!, /machine {7}picked when the job starts\n/);
@@ -92,36 +91,20 @@ test("sub-issues that start in the same sweep spread across machines instead of 
   assert.deepEqual(spawnedOn(h).sort(), ["host_mini", "host_studio"]);
 });
 
-test("a gone worker's replacement gets a newly picked machine, and its feedback waits while no machine is eligible", async () => {
+test("an automatic job's replacement reuses its worker's workspace on the same machine instead of picking again", async () => {
   const h = automatic({ host_server: {}, host_mini: { limit: 4 }, host_studio: { limit: 2 } });
   const { job, pr } = await h.toReview();
   assert.deepEqual(spawnedOn(h), ["host_mini"]);
   h.threads.get(job.threadId!)!.archivedAt = h.clock.now;
-  h.fleet.set("host_mini", { connected: false });
-  h.fleet.set("host_studio", { limit: 2, checkout: false });
-  const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
+  h.fleet.set("host_studio", { limit: 64 });
+  h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
   h.clock.now += FEEDBACK_QUIET_MS;
   await h.settle();
-  const waiting = await h.only();
-  assert.equal(waiting.state, "review");
-  assert.equal(waiting.error, "no machine is eligible: host_server: the bb server's machine; host_mini: disconnected; host_studio: no checkout of this project");
-  assert.equal(h.spawned.length, 1);
-  assert.match((await h.engine().run(["issues", "list"])).stdout!, new RegExp(`#41 {2}review {2}on host_mini \\(auto\\) {2}PR #${pr} .* {2}no machine is eligible: host_server`));
-
-  h.fleet.set("host_studio", { limit: 2 });
-  h.clock.now += MIN;
-  await h.settle();
+  await h.advance(MIN);
   const addressing = await h.only();
   assert.equal(addressing.state, "addressing", addressing.error ?? "");
-  assert.deepEqual(spawnedOn(h), ["host_mini", "host_studio"]);
-  assert.equal(h.spawned[1]!.environment.workspace.baseBranch.name, `origin/${job.branch}`);
-  assert.deepEqual(h.store.get(job.id)!.host, { pinned: false, id: "host_studio" });
-
-  const round = { outcome: "changes", round: 1, replies: [{ kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." }], verification: ["npm test: 14 passed"], summary: "Renamed x." };
-  assert.equal((await h.report(addressing.threadId!, round, { headSha: SHA3 })).exitCode, 0);
-  await h.settle();
-  assert.equal((await h.only()).state, "review");
-  assert.equal(h.pushes.length, 2, "the replacement's commit is pushed from its own machine");
+  assert.deepEqual(h.spawned[1]!.environment, { type: "reuse", environmentId: h.threads.get(job.threadId!)!.environmentId });
+  assert.deepEqual(h.store.get(job.id)!.host, { pinned: false, id: "host_mini" });
 });
 
 test("a pinned repository's job runs on its machine even when another has more room", async () => {

@@ -231,6 +231,8 @@ export default async function plugin(bb: BbPluginApi) {
     bb,
     store: issueStore,
     github,
+    inspectOrigin: async (hostId, worktreePath) => (await hosts.call("inspect", { worktreePath }, { hostId })).originUrl,
+    inspectCommit: (hostId, input, signal) => hosts.call("inspectCommit", input, { hostId, ...(signal ? { signal } : {}) }),
     hostPush: (hostId, input, signal) => hosts.call("push", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS, ...(signal ? { signal } : {}) }),
     repos: issueRepos,
     catalog: async () => {
@@ -342,6 +344,7 @@ export default async function plugin(bb: BbPluginApi) {
             return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
           },
           host: {
+            inspectCommit: (hostId, input) => hosts.call("inspectCommit", input, { hostId }),
             pushBranch: (hostId, input) => hosts.call("pushBranch", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS }),
             inspect: async (hostId, worktreePath) => (await hosts.call("inspect", { worktreePath }, { hostId })).originUrl,
             fetch: (hostId, input) => hosts.call("fetch", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS }),

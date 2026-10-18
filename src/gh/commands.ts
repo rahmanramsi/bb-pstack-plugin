@@ -152,6 +152,7 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
         if (!branch) throw new PluginCliError("the worktree is not on a branch", { code: "detached_head", hint: "Check out a branch, or pass --branch." });
         if (!BRANCH.test(branch)) throw new PluginCliError(`"${branch}" is not a branch name pstack pushes`, { code: "invalid_branch" });
         if (!ws.headSha) throw new PluginCliError("the worktree has no commit", { code: "no_commit" });
+        const sha = ws.headSha;
         return withRepo(ws.repo, async (repo) => {
           const defaultBranch = await repo.defaultBranch();
           if (branch === defaultBranch) {
@@ -159,17 +160,23 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
           }
           const expectedRemoteSha = await repo.branchSha(branch);
           if (expectedRemoteSha === null && !(await hasOwnCommits(bb, ws, defaultBranch, await repo.branchSha(defaultBranch)))) {
-            throw new PluginCliError(`HEAD ${ws.headSha} has no commits that ${defaultBranch} lacks, so ${branch} would only copy ${defaultBranch}`, {
+            throw new PluginCliError(`HEAD ${sha} has no commits that ${defaultBranch} lacks, so ${branch} would only copy ${defaultBranch}`, {
               code: "nothing_to_push",
               hint: ws.dirty ? "Commit your changes first; uncommitted changes are never pushed." : "Commit your work first.",
             });
           }
-          if (expectedRemoteSha === ws.headSha) {
-            return input.options.json ? json({ repo: ws.repo, branch, sha: ws.headSha, pushed: false }) : { exitCode: 0, stdout: `${ws.repo} ${branch} is already at ${ws.headSha}.\n` };
+          if (expectedRemoteSha === sha) {
+            return input.options.json ? json({ repo: ws.repo, branch, sha, pushed: false }) : { exitCode: 0, stdout: `${ws.repo} ${branch} is already at ${sha}.\n` };
           }
-          const { remoteUrl, token } = await repo.pushCredentials();
+          const comparisonSha = (await repo.capabilities({ fresh: true })).defaultHead;
+          if (!host.inspectCommit) throw new PluginCliError("the host cannot inspect pinned commits", { code: "unsupported_host" });
+          const classification = await host.inspectCommit(ws.hostId, { worktreePath: ws.path, sha, comparisonSha, publishedSha: expectedRemoteSha });
+          if (classification.kind === "missing-object") throw new PluginCliError(`commit ${classification.sha} is not available in this worktree`, { code: "missing_commit" });
+          if (classification.sha !== sha || classification.comparisonSha !== comparisonSha) throw new PluginCliError("the host inspected different commits", { code: "stale_inspection" });
+          const workflows = classification.workflows;
+          const { remoteUrl, token } = await repo.pushCredentials({ workflows });
           try {
-            const result = await host.pushBranch(ws.hostId, { worktreePath: ws.path, remoteUrl, branch, sha: ws.headSha!, expectedRemoteSha, token, rewrite: input.options["force-with-lease"] ?? false });
+            const result = await host.pushBranch(ws.hostId, { worktreePath: ws.path, remoteUrl, branch, sha, expectedRemoteSha, comparisonSha, workflows, token, rewrite: input.options["force-with-lease"] ?? false });
             if (result.status === "failed") throw new PluginCliError(`push failed: ${result.detail}`, { code: "push_failed", hint: "Nothing was refused; run the push again." });
             if (result.status === "rejected") {
               const hint =
@@ -182,7 +189,7 @@ export function ghCommands(deps: GhDeps): Record<string, PluginCliCommand> {
             await repo.revoke(token).catch((error) => bb.log.warn(`pstack gh: could not revoke a push token: ${error instanceof Error ? error.message : String(error)}`));
           }
           const note = ws.dirty ? "\nUncommitted changes were not pushed." : "";
-          return input.options.json ? json({ repo: ws.repo, branch, sha: ws.headSha, pushed: true }) : { exitCode: 0, stdout: `Pushed ${ws.headSha} to ${ws.repo} ${branch}.${note}\n` };
+          return input.options.json ? json({ repo: ws.repo, branch, sha, pushed: true }) : { exitCode: 0, stdout: `Pushed ${sha} to ${ws.repo} ${branch}.${note}\n` };
         });
       },
     }),

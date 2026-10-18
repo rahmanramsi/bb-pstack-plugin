@@ -70,7 +70,7 @@ Tests alone are not sufficient verification. A PR is verified only when its unit
 
 Each live lane runs in its own environment at the PR head, on a remote machine when one is enrolled. Drive through bb's `browser-automation` skill or bb terminals.
 
-- [ ] `git fetch origin <head-branch> && git checkout <head SHA>`.
+- [ ] `git fetch origin <head-branch> && git checkout <head SHA>` (under the pstack forge, `bb pstack gh fetch && git checkout <head SHA>`).
 - [ ] <Start the backend and the surface. Wait for ready.>
 - [ ] <Deliver input only through the control skill's commands. Name the read-only diagnostics.>
 - [ ] Save every screenshot to `/tmp/swarm-<pr-id>/worker-<n>/<slug>.png` and return the paths with the report.

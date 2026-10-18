@@ -8,7 +8,7 @@ import type { IssueStore } from "./store.ts";
 /** A repository's last poll. `error` is why it failed, including setup problems such as an App that is not installed. */
 export type RepoView = { repo: RepoName; polledAt: number | null; error: string | null };
 /** A job with its last poll of its issue and pull request, which fails on its own when GitHub cannot read them. */
-export type ListedJob = JobView & { poll: { polledAt: number | null; error: string | null } };
+export type ListedJob = JobView & { delivery: { pending: boolean; error: string | null }; poll: { polledAt: number | null; error: string | null } };
 export type IssueBoard = { repos: RepoView[]; jobs: ListedJob[] };
 
 const JOB_STATES = [...RESTING_STATES, ...Object.keys(TRANSIT)] as [JobState, ...JobState[]];
@@ -37,6 +37,9 @@ export const IssueBoardSchema = z.object({
       pushedSha: z.string().nullable(),
       round: z.number().int(),
       summary: z.string().nullable(),
+      outcome: z.enum(["ready", "no-change", "failure", "cancelled", "merged", "closed-unmerged"]).nullable(),
+      limitation: z.string().nullable(),
+      delivery: z.object({ pending: z.boolean(), error: z.string().nullable() }),
       error: z.string().nullable(),
       createdAt: z.number(),
       updatedAt: z.number(),
@@ -54,7 +57,7 @@ export function repoView(store: IssueStore, repo: RepoName): RepoView {
 
 export function listed(store: IssueStore, job: Job): ListedJob {
   const { polledAt, error } = store.jobPoll(job.id);
-  return { ...toView(job), poll: { polledAt, error } };
+  return { ...toView(job), delivery: store.delivery(job.repo, job.issue), poll: { polledAt, error } };
 }
 
 export function issueBoard(store: IssueStore, configured: readonly RepoName[], filter: BoardFilter): IssueBoard {
