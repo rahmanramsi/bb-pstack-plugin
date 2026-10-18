@@ -125,6 +125,27 @@ async function inspectObjects(input: InspectCommitInput, env: NodeJS.ProcessEnv,
   const history = await git(["log", "--no-ext-diff", "--no-textconv", "--format=", "--name-only", "--no-renames", "--diff-merges=remerge", "-z", input.sha, "--not", input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : []], env, signal);
   if (diff.code !== 0 || history.code !== 0) throw new Error("cannot inspect pinned Git objects");
   let workflows = history.stdout.split("\0").some((path) => path.trim().startsWith(".github/workflows/"));
+  if (!workflows) {
+    // Remerge omits octopus commits. Reconstruct each unpublished merge, including ones later reverted.
+    const octopus = await git(["rev-list", "--min-parents=3", "--parents", input.sha, "--not", input.comparisonSha, ...input.publishedSha ? [input.publishedSha] : []], env, signal);
+    if (octopus.code !== 0) throw new Error("cannot inspect multi-parent contribution history");
+    for (const line of octopus.stdout.trim().split("\n").filter(Boolean)) {
+      const [commit, first, ...parents] = line.split(" ");
+      let merged = first!;
+      let tree = "";
+      for (const parent of parents) {
+        const merge = await git(["merge-tree", "--write-tree", "--no-messages", "--allow-unrelated-histories", merged, parent], env, signal);
+        if (merge.code !== 0 && merge.code !== 1) throw new Error("cannot reconstruct multi-parent merge");
+        tree = merge.stdout.split("\n")[0]!;
+        const synthetic = await git(["-c", "user.name=pstack", "-c", "user.email=pstack@localhost", "commit-tree", tree, "-p", merged, "-p", parent, "-m", "Reconstruct merge tree"], env, signal);
+        if (synthetic.code !== 0) throw new Error("cannot record reconstructed merge parents");
+        merged = synthetic.stdout.trim();
+      }
+      const authored = await git(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", tree, commit!, "--", ".github/workflows/"], env, signal);
+      if (authored.code !== 0) throw new Error("cannot inspect multi-parent workflow contribution");
+      if (authored.stdout.length > 0) { workflows = true; break; }
+    }
+  }
   if (input.publishedSha) {
     const ancestor = await git(["merge-base", "--is-ancestor", input.publishedSha, input.sha], env, signal);
     if (ancestor.code !== 0 && ancestor.code !== 1) throw new Error("cannot inspect pinned publication ancestry");

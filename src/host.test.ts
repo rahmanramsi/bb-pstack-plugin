@@ -332,3 +332,89 @@ test("workflow conflict resolutions are inspected while clean upstream merges ar
   assert.deepEqual(readdirSync(f.temp), []);
   await f.harness.experimental_dispose();
 });
+
+for (const parentCount of [3, 4]) {
+  for (const change of ["addition", "edit", "deletion", "intermediate-reversion", "upstream-only"] as const) {
+    test(`${parentCount}-parent history classifies ${change} workflows independently of the final tree`, async () => {
+      const f = fixture();
+      const workflow = ".github/workflows/check.yml";
+      mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+      const base = change === "addition" || change === "deletion" || change === "upstream-only" ? f.baseSha : commit(f.main, workflow, "name: original\n");
+      const sides: string[] = [];
+      for (let n = 0; n < 2 * (parentCount - 1); n++) {
+        sh(f.main, "checkout", "-q", "--detach", base);
+        if (change === "upstream-only" && n === 0) {
+          mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+          commit(f.main, workflow, "name: upstream\n");
+        }
+        sides.push(commit(f.main, `side-${n}.txt`, `side ${n}\n`));
+      }
+      sh(f.worktree, "reset", "--hard", base);
+      if (change === "deletion") {
+        mkdirSync(join(f.worktree, ".github/workflows"), { recursive: true });
+        commit(f.worktree, workflow, "name: published worker workflow\n");
+      }
+      const published = commit(f.worktree, "feature.txt", "feature\n");
+      const comparisonSha = change === "upstream-only" ? sides[0]! : base;
+      const inspect = (sha: string, comparison = comparisonSha, publication = published) => f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha, comparisonSha: comparison, publishedSha: publication });
+      sh(f.worktree, "merge", "--no-edit", ...sides.slice(0, parentCount - 1));
+      if (change !== "upstream-only") {
+        if (change === "deletion") sh(f.worktree, "rm", workflow);
+        else {
+          mkdirSync(join(f.worktree, ".github/workflows"), { recursive: true });
+          writeFileSync(join(f.worktree, workflow), "name: authored\n");
+          sh(f.worktree, "add", workflow);
+        }
+        sh(f.worktree, "commit", "--amend", "--no-edit", "-q");
+      }
+      const intermediate = sh(f.worktree, "rev-parse", "HEAD");
+      assert.equal(sh(f.worktree, "show", "-s", "--format=%P", intermediate).split(" ").length, parentCount);
+      assert.equal(sh(f.worktree, "log", "--format=", "--name-only", "--diff-merges=remerge", intermediate, "--not", comparisonSha, published).includes(workflow), false, "remerge alone omits the authored multi-parent tree");
+      if (change === "intermediate-reversion") {
+        sh(f.worktree, "merge", "--no-edit", ...sides.slice(parentCount - 1));
+        writeFileSync(join(f.worktree, workflow), "name: original\n");
+        sh(f.worktree, "add", workflow); sh(f.worktree, "commit", "--amend", "--no-edit", "-q");
+        assert.equal(sh(f.worktree, "diff", "--name-only", published, "HEAD", "--", workflow), "");
+      }
+      const head = sh(f.worktree, "rev-parse", "HEAD");
+      const result = await inspect(head);
+      assert.equal(result.kind, "inspected");
+      if (result.kind === "inspected") assert.equal(result.workflows, change !== "upstream-only");
+      for (const excluded of [await inspect(head, head), await inspect(head, comparisonSha, head)]) {
+        assert.equal(excluded.kind, "inspected");
+        if (excluded.kind === "inspected") assert.equal(excluded.workflows, false, "already reachable base or publication history is excluded");
+      }
+      const refused = await f.harness.experimental_call("push", { worktreePath: f.worktree, remoteUrl: `file://${f.remote}`, branch: BRANCH, sha: head, expectedRemoteSha: null, comparisonSha, workflows: false, token: TOKEN });
+      assert.equal(refused.status, change === "upstream-only" ? "pushed" : "rejected");
+      assert.deepEqual(readdirSync(f.loot), []);
+      assert.deepEqual(readdirSync(f.temp), []);
+      await f.harness.experimental_dispose();
+    });
+  }
+}
+
+test("an octopus that combines upstream workflow edits remains contents-only even when combined diff lists the workflow", async () => {
+  const f = fixture();
+  const workflow = ".github/workflows/check.yml";
+  const lines = Array.from({ length: 20 }, (_, n) => `line ${n}\n`);
+  mkdirSync(join(f.main, ".github/workflows"), { recursive: true });
+  const common = commit(f.main, workflow, lines.join(""));
+  const first = [...lines]; first[0] = "first upstream edit\n";
+  const one = commit(f.main, workflow, first.join(""));
+  sh(f.main, "checkout", "--detach", common);
+  const second = [...lines]; second[19] = "second upstream edit\n";
+  const two = commit(f.main, workflow, second.join(""));
+  sh(f.main, "merge", "--no-edit", one);
+  const base = sh(f.main, "rev-parse", "HEAD");
+  sh(f.worktree, "reset", "--hard", common);
+  const published = commit(f.worktree, "feature.txt", "feature\n");
+  sh(f.worktree, "merge", "--no-edit", one, two);
+  const head = sh(f.worktree, "rev-parse", "HEAD");
+  assert.equal(sh(f.worktree, "show", "--format=", "--cc", "--name-only", head).includes(workflow), true);
+  const result = await f.harness.experimental_call("inspectCommit", { worktreePath: f.worktree, sha: head, comparisonSha: base, publishedSha: published });
+  assert.equal(result.kind, "inspected");
+  if (result.kind === "inspected") assert.equal(result.workflows, false);
+  assert.deepEqual(readdirSync(f.loot), []);
+  assert.deepEqual(readdirSync(f.temp), []);
+  await f.harness.experimental_dispose();
+});
