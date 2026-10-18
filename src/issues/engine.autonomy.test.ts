@@ -17,7 +17,7 @@ test("same-target pending CI clears readiness without reversing a ready conversi
   h.gh().checkRuns[0]!.status = "completed";
   h.gh().checkRuns[0]!.conclusion = "success";
   h.gh().suiteState = { status: "completed", conclusion: "success" };
-  await h.settle();
+  await h.settle(); await h.advance(MIN);
   assert.equal((await h.only()).outcome, "ready");
   assert.deepEqual(h.gh().draftConversions, [false]);
 });
@@ -49,12 +49,12 @@ test("healthy verified base advances do not exhaust a lifetime local-evidence bu
     const base = (100 + step).toString(16).padStart(40, "0");
     const head = (200 + step).toString(16).padStart(40, "0");
     h.gh().refs.set("main", base);
-    await h.settle();
+    await h.advance(2 * MIN);
     const repair = await h.only();
     assert.equal(repair.state, "addressing", repair.error ?? "");
     const report = await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [], summary: "Verified current base integration.", verification: ["integration tests passed"] }, { headSha: head, ancestors: [previousHead, base], ahead: 2 });
     assert.equal(report.exitCode, 0, report.stderr);
-    await h.settle();
+    await h.advance(2 * MIN);
     assert.equal((await h.only()).outcome, "ready");
     previousHead = head;
   }
@@ -118,7 +118,7 @@ test("publication divergence preserves accepted work and requires a fresh merged
   assert.match(missingRemote.stderr!, /does not contain/);
   const accepted = await h.report(job.threadId!, fresh, { headSha: "6".repeat(40), ancestors: [SHA2, SHA3], commits: ["6".repeat(40)], ahead: 3 });
   assert.equal(accepted.exitCode, 0, accepted.stderr);
-  await h.settle();
+  await h.settle(); await h.advance(MIN);
   const ready = await h.only();
   assert.equal(ready.outcome, "ready");
   assert.equal(h.pushes[1]!.sha, "6".repeat(40));
@@ -144,7 +144,7 @@ test("an already-contained publication needs fresh no-change verification withou
   h.failures.gate = null;
   const response = await h.report(job.threadId!, report, { headSha: SHA3, ancestors: [SHA2], commits: [SHA3], ahead: 2 });
   assert.equal(response.exitCode, 0, response.stderr);
-  await h.settle();
+  await h.settle(); await h.advance(MIN);
   assert.equal((await h.only()).outcome, "ready");
   assert.equal((await h.only()).pushedSha, SHA3);
   assert.equal(h.pushes.length, 1);
@@ -154,7 +154,7 @@ test("feedback publication repair retains body intent, assigned replies, and ori
   const h = harness();
   const { job, pr } = await h.toReview();
   const feedback = h.review(pr, { body: "Fix the layout." });
-  h.clock.now += 2 * MIN; await h.settle();
+  await h.advance(2 * MIN);
   const held = h.holdAt("push:before", "sdk");
   await h.report(job.threadId!, { outcome: "changes", round: 1, replies: [{ kind: "review", commentId: feedback.id, body: "The layout is fixed." }], pr: { body: "## Why\nLayout fixes preserve footer space." }, summary: "Fixed review request.", verification: ["layout tests passed"] }, { headSha: SHA3 });
   await held.hit;
@@ -167,7 +167,7 @@ test("feedback publication repair retains body intent, assigned replies, and ori
   const missing = await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [], summary: "Merged changes.", verification: ["tests passed"] }, { headSha: "5".repeat(40), ancestors: [SHA3, "4".repeat(40)], ahead: 3 });
   assert.match(missing.stderr!, /reply to every listed/);
   await h.report(job.threadId!, { outcome: "changes", round: repair.round - 1, replies: [{ kind: "review", commentId: feedback.id, body: "The merged layout is verified." }], summary: "Merged changes.", verification: ["tests passed"] }, { headSha: "5".repeat(40), ancestors: [SHA3, "4".repeat(40)], ahead: 3 });
-  await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).outcome, "ready");
   assert.match(h.gh().issues.get(pr)!.pr!.body, /Layout fixes preserve footer space/);
   assert.ok(h.gh().comments.get(pr)!.some((comment) => comment.body.includes("The merged layout is verified")));
@@ -312,7 +312,7 @@ test("a durable report is evaluated after an outage and restart without resubmis
   assert.equal(response.exitCode, 0);
   assert.match(response.stdout!, /saved/);
   h.restart();
-  await h.settle();
+  await h.settle(); await h.advance(MIN);
   assert.equal((await h.only()).outcome, "ready");
   assert.equal(h.pushes.length, 1);
 });
@@ -366,7 +366,7 @@ test("a changed remote head clears readiness and requests current local evidence
   const h = harness();
   const { job, pr } = await h.toReview();
   h.gh().refs.set(job.branch, SHA3);
-  await h.settle();
+  await h.advance(2 * MIN);
   const changed = await h.only();
   assert.notEqual(changed.outcome, "ready");
   assert.equal(h.gh().issues.get(pr)!.pr!.draft, true);
@@ -425,6 +425,7 @@ test("accepted publication survives more than eight transient failures and then 
   assert.equal((await h.only()).outcome, null);
   assert.equal(h.store.get((await h.only()).id)!.report!.headSha, SHA2);
   for (let i = 0; i < 4; i++) { h.clock.now += 16 * MIN; await h.settle(); }
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).outcome, "ready");
   assert.equal(h.pushes.length, 1);
 });
@@ -446,8 +447,11 @@ test("terminal status retries independently from labels and unrelated execution,
   assert.equal(h.gh().comments.get(41)!.length, 1);
   assert.match(h.gh().comments.get(41)![0]!.body, /Essential capability unavailable/);
   h.gh().comments.delete(41);
-  h.clock.now += 2 * MIN; await h.settle();
+  await h.advance(30 * MIN);
+  assert.equal(h.gh().comments.get(41), undefined, "a deleted terminal comment waits for the hourly audit");
+  await h.advance(30 * MIN);
   assert.equal(h.gh().comments.get(41)!.length, 1);
+  assert.match(h.gh().comments.get(41)![0]!.body, /Essential capability unavailable/);
 });
 
 test("pending CI waits while active and missing producers exhaust bounded repair rounds", async () => {
@@ -460,7 +464,7 @@ test("pending CI waits while active and missing producers exhaust bounded repair
   h.gh().checkRuns = [];
   h.gh().requiredChecks = [{ context: "tests", app_id: 9 }];
   for (let i = 0; i < 6; i++) {
-    await h.settle();
+    await h.advance(MIN);
     const job = h.store.get((await h.only()).id)!;
     if (job.phase.state === "stuck") break;
     assert.equal(job.phase.state, "addressing");
@@ -479,7 +483,7 @@ test("a base change during ready conversion cannot settle stale evidence ready",
   await held.hit;
   h.gh().refs.set("main", SHA3);
   held.free();
-  await h.settle();
+  await h.settle(); await h.advance(MIN);
   const job = await h.only();
   assert.notEqual(job.outcome, "ready");
   assert.equal(h.gh().issues.get(job.pr!.number)!.pr!.draft, true);
@@ -499,7 +503,7 @@ test("retired workers cannot poison an identical pending report from the replace
   h.threads.set(replacement.id, replacement);
   const pending = await h.report(replacement.id, GOOD);
   assert.equal(pending.exitCode, 0);
-  h.clock.now += MIN; await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).threadId, replacement.id);
   assert.equal((await h.only()).outcome, "ready");
 });
@@ -524,7 +528,7 @@ test("CI repair recovers a gone published worker in the preserved environment", 
   const { job } = await h.toReview();
   h.threads.get(job.threadId!)!.archivedAt = h.clock.now;
   h.gh().mergeable = false;
-  await h.settle();
+  await h.advance(2 * MIN);
   const repairing = await h.only();
   assert.equal(repairing.state, "addressing");
   assert.notEqual(repairing.threadId, job.threadId);
@@ -552,7 +556,7 @@ test("a missing fresh base object asks the worker to fetch and requires integrat
   assert.match(h.sent.at(-1)!.input[0].text, /verified base/);
   const response = await h.report(worker, GOOD, { headSha: "4".repeat(40), ancestors: [SHA3], ahead: 2 });
   assert.equal(response.exitCode, 0, response.stderr);
-  await h.settle();
+  await h.settle(); await h.advance(MIN);
   assert.equal((await h.only()).outcome, "ready");
 });
 
@@ -568,7 +572,7 @@ test("aggregate pending suites cannot make an otherwise successful head ready", 
   assert.equal((await h.only()).outcome, null);
   assert.deepEqual(h.gh().draftConversions, []);
   h.gh().suiteState = { status: "completed", conclusion: "success" };
-  await h.settle();
+  await h.advance(2 * MIN);
   assert.equal((await h.only()).outcome, "ready");
 });
 
@@ -576,13 +580,18 @@ test("persistently unknown mergeability stays unready and exhausts its actual re
   const h = harness();
   const { job } = await h.toReview();
   h.gh().mergeable = null;
-  await h.settle();
+  await h.advance(2 * MIN);
+  const waiting = await h.only();
+  assert.equal(waiting.state, "checking", "a first unknown read waits for a later fresh observation before repair");
+  assert.notEqual(waiting.outcome, "ready");
+  assert.equal(h.spawned.length, 1);
+  await h.advance(MIN);
   for (let round = 0; round < 5; round++) {
     const current = await h.only();
     assert.equal(current.state, "addressing");
     assert.notEqual(current.outcome, "ready");
     await h.report(job.threadId!, { outcome: "no-change", round: current.round - 1, replies: [], summary: "Verified the current implementation.", verification: ["local tests passed; mergeability is still unknown"] }, { headSha: SHA2, ahead: 1 });
-    await h.settle();
+    await h.advance(MIN);
   }
   assert.equal((await h.only()).outcome, "failure");
   assert.match((await h.only()).error!, /repair exhausted.*mergeability is unknown/);
@@ -630,7 +639,7 @@ test("permanent essential PR observation denial ends checking but a transport ou
     const h = harness();
     const { job, pr } = await h.toReview();
     h.gh().outages.push({ key: `GET /repos/acme/web/pulls/${pr}`, status, times: Infinity });
-    await h.settle();
+    await h.advance(MIN);
     if (status === 403) {
       assert.equal((await h.only()).outcome, "failure");
       assert.equal((await h.only()).pushedSha, job.pushedSha);
@@ -638,7 +647,7 @@ test("permanent essential PR observation denial ends checking but a transport ou
     } else {
       assert.equal((await h.only()).state, "review");
       h.gh().outages.length = 0;
-      await h.settle();
+      await h.settle(); await h.advance(MIN);
       assert.equal((await h.only()).outcome, "ready");
     }
   }
@@ -654,8 +663,8 @@ test("uncertain PR creation adopts only the App-owned publication marker for thi
     await held.hit;
     const pull = [...h.gh().issues.values()].find((issue) => issue.pr)!;
     if (!marked) pull.pr!.body = "An unrelated pull request on the same branch.";
-    h.restart(); h.clock.now += MIN + 1;
-    await h.settle();
+    h.restart();
+    await h.advance(2 * MIN);
     const job = await h.only();
     assert.equal(job.outcome, marked ? "ready" : "failure");
     if (!marked) assert.match(job.error!, /publication marker/);
@@ -727,21 +736,22 @@ test("migrated no-change and merged children satisfy parent prerequisites withou
   assert.equal(h.spawned.length, 1);
 });
 
-test("recovery stops archived same-environment writers and refuses queued or background survivors", async () => {
+test("recovery leaves unowned archived same-environment threads untouched and refuses their active work", async () => {
   for (const activity of ["none", "queued", "background", "command", "goal", "workflow"]) {
     const h = harness();
     h.label(41); await h.settle();
     const original = (await h.only()).threadId!;
     const thread = h.threads.get(original)!;
-    const archived = { ...thread, id: "thr_archived_writer", archivedAt: h.clock.now, metadata: {}, queuedMessageCount: activity === "queued" ? 1 : 0, activeBackgroundAgentCount: activity === "background" ? 1 : 0, activeBackgroundCommandCount: activity === "command" ? 1 : 0, activeGoalCount: activity === "goal" ? 1 : 0, activeWorkflowCount: activity === "workflow" ? 1 : 0 };
+    const archived = { ...thread, id: "thr_unowned_archived", status: "idle" as const, archivedAt: h.clock.now, metadata: {}, queuedMessageCount: activity === "queued" ? 1 : 0, activeBackgroundAgentCount: activity === "background" ? 1 : 0, activeBackgroundCommandCount: activity === "command" ? 1 : 0, activeGoalCount: activity === "goal" ? 1 : 0, activeWorkflowCount: activity === "workflow" ? 1 : 0 };
     h.threads.set(archived.id, archived);
     for (let i = 0; i < 3; i++) await h.report(original, { outcome: `invalid-${i}` });
     await h.settle();
-    assert.ok(h.stopped.includes(archived.id));
+    assert.ok(h.stopped.includes(original));
+    assert.ok(!h.stopped.includes(archived.id), "an unowned thread is never stopped");
     if (activity !== "none") {
       assert.equal(h.spawned.length, 1);
       assert.equal((await h.only()).outcome, "failure");
-      assert.match((await h.only()).error!, /exclusive.*(?:queued or background work remains|background commands, goals or workflows remain)/);
+      assert.match((await h.only()).error!, activity === "queued" || activity === "background" ? /exclusive stop is not confirmed for env_\S+; work retained/ : /exclusive stop is not confirmed .*background commands, goals or workflows remain/);
     } else {
       assert.equal(h.spawned.length, 2);
       assert.equal(h.spawned[1]!.environment.environmentId, thread.environmentId);
