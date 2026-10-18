@@ -335,7 +335,7 @@ test("submission evaluations and status revisions survive lost writers and newer
   const oldStatus = store.statuses(5)[0]!;
   assert.equal(store.claimStatus(oldStatus, 5), true);
   const second = store.insert(newJob({ issue: first.issue }), 6)!;
-  store.settleStatus(oldStatus, { error: null, nextAt: 50000 });
+  store.settleStatus(oldStatus, { error: null, nextAt: 50000, now: 7 });
   const newest = store.statuses(7)[0]!;
   assert.equal(newest.jobId, second.id);
   assert.ok(newest.revision > oldStatus.revision);

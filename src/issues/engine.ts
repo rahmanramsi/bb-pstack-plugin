@@ -14,6 +14,7 @@ import { z } from "zod";
 import type { HostPush, HostInspectCommit } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { repoFromRemote } from "../gh/commands.ts";
+import { createStatusDelivery } from "./delivery.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
 import { issueBoard, type BoardFilter, type IssueBoardSchema, type IssueSummarySchema } from "./board.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
@@ -202,38 +203,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     return { kind: "observed", target: { pr: snapshot.pr, head: snapshot.head, base: snapshot.base }, state: snapshot.state, draft: snapshot.draft, complete: snapshot.complete, ready: snapshot.complete && reasons.length === 0 && !pending, limitation: snapshot.required.kind === "unavailable" ? `Branch policy could not be inspected: ${snapshot.required.reason}. Observed CI and local evidence passed; merge prerequisites are not established.` : null, pending, reasons, fingerprint: reasons.map((reason) => reason.replace(/[0-9a-f]{40}/g, "<sha>")).sort().join("|") || "healthy" };
   }
 
-  let delivering: Promise<void> | null = null;
-  function deliverStatuses(): Promise<void> {
-    if (delivering) return delivering;
-    const task = performStatusDelivery().finally(() => { if (delivering === task) delivering = null; });
-    delivering = task;
-    return task;
-  }
-
-  async function performStatusDelivery(): Promise<void> {
-    await Promise.all(store.statuses(clock()).map(async (status) => {
-      if (!store.claimStatus(status, clock())) return;
-      let error: string | null = null;
-      let nextAt = clock() + POLL_MS;
-      const repo = github.repo(status.repo, AbortSignal.timeout(50_000));
-      try { await repo.upsertIssueStatus({ issue: status.issue, marker: `<!-- pstack:issue-status:${status.repo}:${status.issue} -->`, revision: status.revision, body: status.body }); }
-      catch (failure) { error = message(failure); nextAt = Math.max(clock() + POLL_MS, failure instanceof GitHubTransientError ? failure.notBefore ?? 0 : 0); }
-      store.settleStatus(status, { error, nextAt, release: false });
-      const job = store.get(status.jobId);
-      if (!job || job.generation !== status.generation) { store.settleStatus(status, { error, nextAt }); return; }
-      const labels: Effect = { op: "labels", key: `status-labels:${status.revision}`, on: "issue", add: job.phase.state === "review" ? [LABEL.review] : TERMINAL.has(job.phase.state) ? [] : [LABEL.working], remove: job.phase.state === "review" ? [LABEL.working, LABEL.needsInfo] : TERMINAL.has(job.phase.state) ? [LABEL.working, LABEL.needsInfo, LABEL.review] : [LABEL.review, LABEL.needsInfo] };
-      store.decorate(job, labels);
-      for (const item of [...status.decorations, { effect: labels, nextAt: 0, attempts: 0, error: null }]) {
-        if (item.nextAt > clock()) continue;
-        if (clock() >= (status.leaseUntil ?? clock()) - SETTLE_MARGIN_MS) break;
-        const attempts = store.claimDecoration(status, item.effect.key);
-        if (attempts === null) continue;
-        const outcome = await runEffect(job, item.effect, attempts > 0 && EFFECT_POLICY[item.effect.op].recovery.kind === "probe" ? "probe-then-perform" : "perform", (status.leaseUntil ?? clock()) - SETTLE_MARGIN_MS);
-        store.settleDecoration(status, item.effect.key, outcome.kind === "done" ? null : "error" in outcome ? outcome.error : "delivery unconfirmed", clock() + POLL_MS);
-      }
-      store.settleStatus(status, { error, nextAt });
-    }));
-  }
+  const deliverStatuses = createStatusDelivery({ store, github, clock, runEffect });
 
   async function worktree(job: Job, signal?: AbortSignal): Promise<Worktree> {
     if (!job.threadId) return { ok: false, transient: false, error: "the job has no worker thread" };
@@ -640,11 +610,14 @@ export function createIssues(deps: IssuesDeps): Issues {
         .then((head) => ({ head }))
         .catch((error) => (bb.log.warn(`pstack issues: ${job.id}: could not read ${job.branch}: ${message(error)}`), null));
     }
-    if (wanted.includes("review") && job.pr) {
+    if (wanted.includes("review") && job.pr && store.claimReview(job, clock())) {
       try {
         const snapshot = await github.repo(job.repo).reviewSnapshot(job.pr.number);
         facts.review = snapshot ? reviewObservation(job, snapshot) : { kind: "observed", target: { pr: job.pr.number, head: job.pushedSha!, base: job.pushedSha! }, state: "closed", draft: true, complete: true, ready: false, pending: false, reasons: ["pull request missing"], fingerprint: "missing" };
-      } catch (error) { facts.review = { kind: "unavailable", reason: message(error), permanent: error instanceof GitHubPermanentError || error instanceof GitHubSetupError }; }
+      } catch (error) {
+        store.deferReview(job, Math.max(clock() + POLL_MS, error instanceof GitHubTransientError ? error.notBefore ?? 0 : 0));
+        facts.review = { kind: "unavailable", reason: message(error), permanent: error instanceof GitHubPermanentError || error instanceof GitHubSetupError };
+      }
     }
     if (wanted.includes("worker")) facts.worker = await resolveWorker(job);
     if (wanted.includes("thread")) facts.thread = await threadFact(job.threadId);

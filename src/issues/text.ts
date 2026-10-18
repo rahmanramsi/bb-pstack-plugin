@@ -309,16 +309,31 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
 
 export function statusBody(job: Job): string {
   const result = job.control.disposition;
-  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.phase.state === "review" ? "Ready for review" : job.phase.state === "checking" ? "Checking CI" : job.phase.state === "addressing" ? "Addressing feedback" : job.phase.state === "recovering" ? "Recovering work" : job.phase.state;
-  return [
+  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : job.phase.state === "done" ? "Outcome unknown" : job.phase.state === "review" || job.phase.state === "checking" ? "Checking CI" : job.phase.state === "addressing" ? "Addressing feedback" : job.phase.state === "recovering" ? "Recovering work" : job.phase.state;
+  const failure = job.control.publicFailure;
+  let reason: string | null = null;
+  if (result === "failure") {
+    switch (failure?.kind) {
+      case "workflow-permission": reason = "Workflow changes require a workflow write permission that is unavailable. The work is preserved."; break;
+      case "publication-denied": reason = "Repository permissions denied publication. The work is preserved."; break;
+      case "prerequisite": reason = `Prerequisite work did not complete${failure.issues.length ? ` for ${failure.issues.map((issue) => `#${issue}`).join(", ")}` : ""}.`; break;
+      case "verification": reason = "The current contribution could not be verified for review. The work is preserved."; break;
+      case "recovery-exhausted": reason = "Automatic worker recovery was exhausted. The work is preserved."; break;
+      case "report": reason = failure.reason; break;
+      case "execution":
+      case undefined: reason = "Execution failed. The work is preserved."; break;
+      default: { const exhaustive: never = failure; return exhaustive; }
+    }
+  }
+  return issueText([
     `Issue #${job.issue}: ${status}`,
     job.control.policyLimitation,
-    job.progress,
+    job.phase.state === "tracking" || job.phase.state === "updating" ? job.progress : null,
     job.report?.summary,
-    job.error ? `Reason: ${job.error}` : null,
+    reason ? `Reason: ${reason}` : null,
     job.pr ? `Pull request: ${job.pr.url}` : null,
-    job.report ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : job.control.preservedSha ? `Preserved commit: ${job.control.preservedSha}` : null,
+    job.report?.headSha ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : job.control.preservedSha ? `Preserved commit: ${job.control.preservedSha}` : null,
     `Branch: \`${job.branch}\``,
     ...(job.report?.verification ?? []).map((line) => `- ${line}`),
-  ].filter(Boolean).join("\n\n");
+  ].filter(Boolean).join("\n\n"));
 }

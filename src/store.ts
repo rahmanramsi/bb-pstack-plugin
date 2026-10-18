@@ -438,6 +438,13 @@ CREATE TABLE issue_jobs_unattended (
      AND ((SELECT pr_state FROM issue_job_polls WHERE job_id = issue_jobs.id) IN ('merged','closed')
        OR json_extract(report_json, '$.outcome') = 'no-change')`,
   `ALTER TABLE issue_rounds ADD COLUMN feedback_round INTEGER`,
+  `ALTER TABLE issue_status ADD COLUMN lease_owner TEXT;
+   ALTER TABLE issue_status ADD COLUMN retry_not_before INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE issue_status ADD COLUMN desired_labels_key TEXT;
+   CREATE TABLE issue_review_schedule (
+     job_id TEXT PRIMARY KEY REFERENCES issue_jobs(id) ON DELETE CASCADE,
+     next_at INTEGER NOT NULL
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;
