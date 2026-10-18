@@ -71,6 +71,7 @@ test("label to draft pull request: spawn a worker, accept its report, push the r
   assert.equal(accepted.exitCode, 0, accepted.stdout);
   assert.match(accepted.stdout!, /pushes 2222222 to agent\/issue-41/);
   await h.settle();
+  await h.advance(MIN);
 
   const done = await h.only();
   assert.equal(done.state, "review");
@@ -143,6 +144,7 @@ for (const point of CRASH_POINTS) {
       await h.report(working.threadId!, GOOD);
       await h.settle();
     }
+    await h.advance(MIN);
 
     const end = await h.only();
     assert.equal(end.state, point.end.state, end.error ?? "");
@@ -233,6 +235,7 @@ test("a rejected report lists every reason and leaves the job working; a fixed r
   const accepted = await h.report(working.threadId!, GOOD, { dirty: false });
   assert.equal(accepted.exitCode, 0);
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "review");
 });
 
@@ -252,6 +255,7 @@ test("a corrected commit can reuse report text after a validation rejection", as
   const accepted = await h.report(working.threadId!, GOOD);
   assert.equal(accepted.exitCode, 0);
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "review");
 });
 
@@ -438,7 +442,7 @@ test("a push that outlives its lease while a second engine pushes the same commi
   while (h.gh().refs.get(working.branch) !== SHA2) await new Promise((resolve) => setImmediate(resolve));
   second.free();
   await sweeping;
-  await h.settle();
+  await h.advance(MIN);
 
   const done = await h.only();
   assert.equal(done.state, "review", done.error ?? "");
@@ -526,7 +530,7 @@ test("a report saved before spawn confirmation is accepted automatically once th
   h.clock.now += 15_000;
   await h.engine().issues.sweep();
   assert.equal((await h.only()).threadId, threadId);
-  await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "review");
 });
 
