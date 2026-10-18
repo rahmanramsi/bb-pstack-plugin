@@ -357,7 +357,7 @@ export function statusBody(job: Job): string {
   return issueText([
     `Issue #${job.issue}: ${status}`,
     job.control.policyLimitation,
-    job.phase.state === "tracking" || job.phase.state === "updating" ? job.progress : null,
+    job.control.childrenProgress,
     job.report?.summary,
     reason ? `Reason: ${reason}` : null,
     job.pr ? `Pull request: ${job.pr.url}` : null,

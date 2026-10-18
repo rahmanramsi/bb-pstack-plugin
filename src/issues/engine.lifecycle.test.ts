@@ -67,8 +67,7 @@ test("exhausted feedback-worker recovery preserves its failure and leaves feedba
   h.store.write(row.id, row.version, { control: { ...row.control, recoveries: 2 } }, h.clock.now);
   h.threads.get(job.threadId!)!.status = "error";
   h.review(pr, { body: "Correct the footer spacing." });
-  h.clock.now += 3 * MIN;
-  await h.settle();
+  await h.advance(3 * MIN);
   const failed = await h.only();
   assert.equal(failed.state, "stuck");
   assert.match(failed.error!, /automatic recovery exhausted.*feedback worker/);
@@ -110,8 +109,8 @@ for (const observation of ["creating", "provisioning", "unavailable"] as const) 
     const worker = h.threads.get(job.threadId!)!;
     await h.report(worker.id, GOOD); await h.settle();
     h.review((await h.only()).pr!.number, { body: "Keep footer spacing consistent." });
-    worker.status = "error"; pending = true; h.clock.now += 3 * MIN;
-    await h.settle();
+    worker.status = "error"; pending = true;
+    await h.advance(3 * MIN);
     assert.equal((await h.only()).state, "recovering");
     assert.equal(h.spawned.length, 1);
     h.restart(); pending = false; h.clock.now += MIN;
@@ -142,8 +141,8 @@ for (const mismatch of ["host", "path", "branch", "missing"] as const) {
     const { job, pr } = await h.toReview();
     h.review(pr, { body: "Fix the footer." });
     h.threads.get(job.threadId!)!.status = "error";
-    corrupt = true; h.clock.now += 3 * MIN;
-    await h.settle();
+    corrupt = true;
+    await h.advance(3 * MIN);
     assert.equal((await h.only()).state, "stuck");
     assert.equal(h.spawned.length, 1);
   });
@@ -170,8 +169,8 @@ for (const archived of [false, true]) {
     const original = h.threads.get(job.threadId!)!;
     h.threads.set("user_thread", { ...original, id: "user_thread", metadata: {}, originPluginId: "user", status: archived ? "idle" : "active", archivedAt: archived ? h.clock.now : null, activeBackgroundCommandCount: archived ? 1 : 0 });
     original.status = "error";
-    h.review(pr, { body: "Fix the footer." }); h.clock.now += 3 * MIN;
-    await h.settle();
+    h.review(pr, { body: "Fix the footer." });
+    await h.advance(3 * MIN);
     assert.equal((await h.only()).state, "stuck");
     assert.equal(h.spawned.length, 1);
     assert.ok(!h.stopped.includes("user_thread"));
@@ -203,8 +202,8 @@ test("recovery stops an archived job-owned worker before inspecting exclusive re
   const original = h.threads.get(job.threadId!)!;
   h.threads.set("retired_worker", { ...original, id: "retired_worker", archivedAt: h.clock.now });
   original.status = "error";
-  h.review(pr, { body: "Fix the footer." }); h.clock.now += 3 * MIN;
-  await h.settle();
+  h.review(pr, { body: "Fix the footer." });
+  await h.advance(3 * MIN);
   assert.ok(h.stopped.includes("retired_worker"));
   assert.equal(h.threads.get("retired_worker")!.status, "idle");
   assert.equal(h.spawned.length, 2);
@@ -263,8 +262,8 @@ test("clean mergeability within its grace reaches review without a diagnostic wo
   h.label(41); await h.settle();
   await h.report((await h.only()).threadId!, GOOD); await h.settle();
   assert.equal((await h.only()).state, "checking");
-  h.gh().mergeable = true; h.clock.now += 30_000;
-  await h.settle();
+  h.gh().mergeable = true;
+  await h.advance(3 * MIN);
   assert.equal((await h.only()).outcome, "ready");
   assert.equal(h.sent.length, 0);
 });
@@ -292,8 +291,7 @@ test("feedback after repair work uses its feedback count while retaining the rep
   assert.ok(current.pushedSha);
   h.store.write(job.id, current.version, { startRound: { ordinal: 9, kind: "feedback", cause: "ci", baseSha: current.pushedSha, feedback: [] }, control: { ...current.control, feedbackRounds: 1 } }, h.clock.now);
   h.review(pr, { body: "Correct the footer spacing." });
-  h.clock.now += 3 * MIN;
-  await h.settle();
+  await h.advance(3 * MIN);
   const prompt = h.sent.at(-1)!.input[0].text;
   assert.match(prompt, /^Feedback round 2 of 5 on pull request/);
   assert.match(prompt, /"round": 9/);
@@ -312,8 +310,7 @@ test("unknown mergeability grace resets when the exact PR target changes", async
   h.restart(); await h.settle();
   assert.equal((await h.only()).state, "checking");
   assert.equal(h.sent.length, 0);
-  h.clock.now += 45_000;
-  await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.only()).state, "addressing");
 });
 
@@ -330,6 +327,7 @@ test("persistent unknown mergeability exhausts its bounded diagnostic repairs", 
     const result = await h.report(job.threadId!, { outcome: "no-change", round: job.round - 1, replies: [], summary: "The footer implementation is verified. GitHub still has no mergeability result.", verification: ["npm test passed"] });
     assert.equal(result.exitCode, 0, result.stderr);
     await h.settle();
+    await h.advance(MIN);
   }
   assert.equal((await h.only()).state, "stuck");
   assert.match((await h.only()).error!, /repair exhausted.*mergeability is unknown/);

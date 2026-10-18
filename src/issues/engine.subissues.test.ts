@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { GOOD, harness } from "./engine-harness.ts";
+import { GOOD, MIN, harness } from "./engine-harness.ts";
 
 function withParent(subIssues = [51, 52]) {
   const h = harness();
@@ -18,6 +18,7 @@ test("integration reports must contain the exact ready child commits", async () 
   await h.settle();
   for (const issue of [51, 52]) await h.report((await h.byIssue(issue)).threadId!, GOOD);
   await h.settle();
+  await h.advance(MIN);
   const parent = await h.byIssue(50);
   const response = await h.report(parent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40)], ahead: 1 });
   assert.equal(response.exitCode, 1);
@@ -42,6 +43,7 @@ test("host ancestry proves merged default-base prerequisites beyond the SDK comm
   const response = await h.report(dependent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40)], ancestors: ["1".repeat(40), "2".repeat(40)], ahead: 1 });
   assert.equal(response.exitCode, 0, response.stderr);
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.byIssue(52)).outcome, "ready");
   const parent = await h.byIssue(50);
   assert.equal(h.store.get(parent.id)!.control.prerequisites.length, 2);
@@ -52,18 +54,24 @@ test("a newly ready child head cannot restore its parent's old integration evide
   await h.settle();
   let child = await h.byIssue(51);
   await h.report(child.threadId!, GOOD); await h.settle();
+  await h.advance(MIN);
   const parent = await h.byIssue(50);
   await h.report(parent.threadId!, GOOD, { headSha: "3".repeat(40), commits: ["3".repeat(40), "2".repeat(40)], ahead: 2 });
   await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.byIssue(50)).outcome, "ready");
   h.gh().refs.set(child.branch, "4".repeat(40));
-  await h.settle();
+  await h.advance(MIN);
+  await h.advance(MIN);
   child = await h.byIssue(51);
   assert.equal(child.state, "addressing");
   await h.report(child.threadId!, { outcome: "changes", round: child.round - 1, replies: [], verification: ["integration tests passed"], summary: "Updated child." }, { headSha: "5".repeat(40), commits: ["5".repeat(40), "4".repeat(40), "2".repeat(40)], ahead: 3 });
   await h.settle();
+  await h.advance(MIN);
+  await h.advance(MIN);
   assert.equal((await h.byIssue(51)).outcome, "ready");
   assert.notEqual((await h.byIssue(50)).outcome, "ready");
+  await h.advance(MIN);
   const current = h.store.get(parent.id)!;
   assert.equal(current.control.localEvidence, null);
   assert.equal(current.control.prerequisites[0]!.sha, "5".repeat(40));
@@ -117,6 +125,7 @@ test("the parent starts its own integration verification once every sub-issue is
   const comments = statusComments(h);
   assert.equal(comments.length, 1);
   assert.match(comments[0]!.body, /2 of 2 closed/);
+  assert.doesNotMatch(comments[0]!.body, /Verify the combined result|Merge origin\//);
 });
 
 test("the parent sticks when a sub-issue's job ended and no open sub-issue can still progress", async () => {
@@ -157,6 +166,7 @@ test("a ready unmerged prerequisite supplies its pinned branch and commit to the
   const prerequisite = await h.byIssue(51);
   await h.report(prerequisite.threadId!, GOOD);
   await h.settle();
+  await h.advance(MIN);
   const dependent = await h.byIssue(52);
   assert.equal(dependent.state, "working");
   const prompt = h.spawned.find((spawn) => spawn.pluginMetadata.jobId === dependent.id)!.prompt;
@@ -185,14 +195,16 @@ test("the parent aggregates ready children before merge and verifies integration
   await h.settle();
   for (const issue of [51, 52]) await h.report((await h.byIssue(issue)).threadId!, GOOD);
   await h.settle();
+  await h.advance(MIN);
   const parent = await h.byIssue(50);
   assert.equal(parent.state, "working");
   const prompt = h.spawned.find((spawn) => spawn.pluginMetadata.jobId === parent.id)!.prompt;
   for (const issue of [51, 52]) assert.match(prompt, new RegExp(`Merge origin/${(await h.byIssue(issue)).branch}`));
   await h.report(parent.threadId!, GOOD); await h.settle();
+  await h.advance(MIN);
   assert.equal((await h.byIssue(50)).outcome, "ready");
   const child = await h.byIssue(51);
   h.gh().refs.set(child.branch, "3".repeat(40));
-  await h.settle();
+  await h.advance(MIN);
   assert.notEqual((await h.byIssue(50)).outcome, "ready");
 });

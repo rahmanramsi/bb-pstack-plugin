@@ -263,6 +263,7 @@ export type PublicFailure =
 
 export type Control = {
   publicFailure: PublicFailure | null;
+  childrenProgress: string | null;
   epoch: number;
   feedbackRounds: number;
   workspace: Workspace | null;
@@ -285,7 +286,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -482,7 +483,14 @@ function rounded(job: Job, change: Change): Change {
 }
 
 export function plan(job: Job, facts: Facts): Action | null {
-  const action = next(job, facts);
+  let action = next(job, facts);
+  if (facts.children) {
+    const childrenProgress = progressBody(facts.children);
+    if (childrenProgress !== job.control.childrenProgress) {
+      if (action?.type === "change" || action?.type === "nudge") action = { ...action, change: { ...action.change, control: { ...(action.change.control ?? job.control), childrenProgress } } };
+      else if (!action || action.type === "sleep") action = { type: "change", change: { control: { ...job.control, childrenProgress } } };
+    }
+  }
   return action?.type === "change" ? { type: "change", change: rounded(job, action.change) } : action;
 }
 
