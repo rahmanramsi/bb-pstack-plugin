@@ -34,7 +34,7 @@ import {
   type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
-import { issueText, prBody, replyText, roundPrompt, workerPrompt } from "./text.ts";
+import { issueText, nudgeText, prBody, replyText, roundPrompt, workerInstructions, workerPrompt } from "./text.ts";
 
 const NOW = 10_000_000;
 const MIN = 60_000;
@@ -352,6 +352,31 @@ test("the worker prompt fences the issue as data, even when the issue contains a
   assert.match(prompt, /built-in PR tool/);
   assert.match(prompt, /Never run `git push`, never use `gh`/);
   assert.match(prompt, /pull_request_template\.md/);
+});
+
+test("unattended workers keep decision guidance at start, after compaction, and when reminded", () => {
+  const working = job({ phase: { state: "working" }, threadId: "thr_w" });
+  for (const text of [workerPrompt(working), workerInstructions(working), nudgeText(working, null)]) {
+    assert.match(text, /do not ask for decisions or confirmation in the worker thread/);
+    assert.match(text, /including when a playbook would normally ask the human/);
+    assert.match(text, /Pass these instructions to any delegates/);
+    assert.match(text, /smallest useful baseline as a draft pull request/);
+    assert.match(text, /material assumptions, remaining limitations, and unresolved product choices in the pull request description/);
+    assert.match(text, /Use `needs-info` only when a missing prerequisite prevents any useful baseline/);
+    assert.match(text, /Uncertain preferences, several valid approaches, or incomplete acceptance criteria are not blockers/);
+    assert.match(text, /Do not claim unperformed checks passed or bypass report validation/);
+    assert.match(text, /not merging, deployment, or destructive external actions/);
+  }
+});
+
+test("feedback workers leave unresolved decisions on the pull request and report without waiting", () => {
+  const addressing = job({ round: 2, phase: { state: "addressing" }, threadId: "thr_w" });
+  const prompt = roundPrompt(addressing, 2, [], [], HEAD);
+  assert.match(prompt, /do not ask for confirmation in the worker thread/);
+  assert.match(prompt, /explain your assumption or limitation in `replies`/);
+  assert.match(prompt, /must not stop work on the other items/);
+  assert.match(workerInstructions(addressing), /`needs-info` is not available/);
+  assert.match(nudgeText(addressing, null), /report `changes` or `no-change` with `replies`/);
 });
 
 test("the view names the pending effect of a transit state", () => {
