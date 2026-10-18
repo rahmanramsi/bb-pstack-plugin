@@ -560,7 +560,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function gather(job: Job): Promise<Facts> {
+  async function gather(job: Job, observations?: { review: boolean }): Promise<Facts> {
     const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
@@ -610,7 +610,8 @@ export function createIssues(deps: IssuesDeps): Issues {
         .then((head) => ({ head }))
         .catch((error) => (bb.log.warn(`pstack issues: ${job.id}: could not read ${job.branch}: ${message(error)}`), null));
     }
-    if (wanted.includes("review") && job.pr && store.claimReview(job, clock())) {
+    if (wanted.includes("review") && job.pr && observations?.review !== false && store.claimReview(job, clock())) {
+      if (observations) observations.review = false;
       try {
         const snapshot = await github.repo(job.repo).reviewSnapshot(job.pr.number);
         facts.review = snapshot ? reviewObservation(job, snapshot) : { kind: "observed", target: { pr: job.pr.number, head: job.pushedSha!, base: job.pushedSha! }, state: "closed", draft: true, complete: true, observedAt: clock(), mergeability: "unknown", ready: false, pending: false, reasons: ["pull request missing"], fingerprint: "missing" };
@@ -668,6 +669,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function reconcile(id: JobId): Promise<void> {
+    const observations = { review: true };
     for (let step = 0; step < MAX_STEPS; step++) {
       const job = store.get(id);
       if (!job) return;
@@ -678,13 +680,13 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (result.code === "worker-action") {
           const current = store.get(id);
           if (!current) return;
-          const action = plan(current, await gather(current));
+          const action = plan(current, await gather(current, observations));
           if (!action || action.type === "sleep") return;
           await apply(current, action);
         }
         continue;
       }
-      const action = plan(job, await gather(job));
+      const action = plan(job, await gather(job, observations));
       if (!action || action.type === "sleep") return;
       await apply(job, action);
     }

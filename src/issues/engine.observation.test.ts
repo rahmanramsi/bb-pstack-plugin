@@ -63,3 +63,28 @@ test("accepted reports and new target context cannot reuse a prior ready observa
   assert.equal(h.store.get(cleared.id)!.control.readiness, null);
   assert.equal(h.store.open(REPO, 41)!.id, cleared.id);
 });
+
+
+test("a long reconcile consumes only one scheduled observation while draft guards remain fresh", async () => {
+  const h = harness();
+  h.label(41);
+  await h.settle();
+  const working = await h.only();
+  const snapshot = h.holdAt(`GET /repos/acme/web/commits/${SHA2}/check-suites`, "github");
+  await h.report(working.threadId!, GOOD);
+  await snapshot.hit;
+  const delivered = h.holdAt("GET /repos/acme/web/issues/41/comments", "github");
+  try {
+    h.clock.now += 2 * MIN;
+    snapshot.free();
+    await delivered.hit;
+    const job = await h.only();
+    assert.equal(job.state, "checking");
+    assert.notEqual(job.outcome, "ready");
+    assert.deepEqual(h.gh().draftConversions, [false]);
+    assert.equal(h.gh().issues.get(job.pr!.number)!.pr!.draft, false);
+  } finally {
+    snapshot.free();
+    delivered.free();
+  }
+});
