@@ -466,10 +466,82 @@ test("mention-dense prose in every field stays within the limit for the longest 
   const body = statusBody({ ...job, repo });
   const posted = statusComment(body, Number.MAX_SAFE_INTEGER, statusMarker(repo, job.issue));
   assert.ok(posted.length <= COMMENT_MAX, String(posted.length));
-  assert.ok(posted.length > COMMENT_MAX / 2, String(posted.length));
+  assert.ok(posted.length > COMMENT_MAX / 4, String(posted.length));
   assert.match(body, /^Issue #41: Failed\n\nBranch policy could not be inspected\./);
   assert.match(body, new RegExp(`Reported commit: ${SHA}`));
   assert.doesNotMatch(body, /(^|[^`])@a\b/);
+});
+
+const UNSAFE_PROSE = {
+  "a raw HTML comment": "Delivered.\n\n<!-- invisible forever",
+  "a closed HTML comment cut by clipping": `Delivered.\n\n<!-- note ${"x".repeat(80_000)} -->`,
+  "a raw unclosed backtick fence": "Delivered.\n\n```text\nnpm test",
+  "a closed backtick fence cut by clipping": `Delivered.\n\n\`\`\`text\n${"x".repeat(80_000)}\n\`\`\``,
+  "a raw unclosed tilde fence": "Delivered.\n\n~~~text\nnpm test",
+  "a closed tilde fence cut by clipping": `Delivered.\n\n~~~text\n${"x".repeat(80_000)}\n~~~`,
+  "a raw unclosed HTML attribute": 'Delivered.\n\n<div title="never closed\n\n@maya',
+  "an inline triple backtick that is not a block": "Delivered with x ```\n\n@maya \\@maya &#64;maya\n\n``` done",
+} as const;
+
+const STATUS_OUTCOMES = {
+  "accepted changes": (prose: string) => ({ heading: "Ready for review", reason: "", phase: { state: "review" as const }, control: { readiness: { pr: 5, head: SHA, base: SHA } }, report: { outcome: "changes" as const, pr: { title: "fix", body: "fix" }, summary: prose, verification: [prose] } }),
+  "a reported failure": (prose: string) => ({ heading: "Failed", reason: "", phase: { state: "stuck" as const }, control: { disposition: "failure" as const, publicFailure: { kind: "report" as const, reason: prose }, preservedSha: SHA }, report: { outcome: "failure" as const, reason: prose, summary: prose, verification: [prose] } }),
+  "a typed failure": (prose: string) => ({ heading: "Failed", reason: "Reason: The current contribution could not be verified for review. The work is preserved.\n\n", phase: { state: "stuck" as const }, control: { disposition: "failure" as const, publicFailure: { kind: "verification" as const }, preservedSha: SHA }, report: { outcome: "changes" as const, pr: { title: "fix", body: "fix" }, summary: prose, verification: [prose] } }),
+};
+
+for (const [outcome, shape] of Object.entries(STATUS_OUTCOMES)) {
+  for (const [name, prose] of Object.entries(UNSAFE_PROSE)) {
+    test(`${outcome} with ${name} keeps every fixed fact, the notice and the markers outside report prose`, async (t) => {
+      const h = await fixture(t);
+      let job = h.insert();
+      const { heading, reason, phase, control, report } = shape(prose);
+      job = h.store.write(job.id, job.version, { phase, threadId: "thread", pushedSha: SHA, pr: { number: 5, url: "https://github.test/pull/5" }, control: { ...job.control, ...control }, report: { ...report, headSha: SHA, acceptedAt: h.clock.now } }, h.clock.now)!;
+      await h.build()();
+      const [comment] = h.status();
+      assert.ok(comment, h.store.delivery(REPO, 41).error ?? "no status comment");
+      assert.ok(comment.body.length <= COMMENT_MAX, String(comment.body.length));
+      const markers = /\n\n<!-- pstack:status-revision:\d+ -->\n<!-- pstack:issue-status:acme\/web:41 -->$/.exec(comment.body);
+      assert.ok(markers, "revision and identity markers end the comment");
+      const content = comment.body.slice(0, markers.index);
+      assert.ok(content.startsWith(`Issue #41: ${heading}\n\n${reason}Pull request: https://github.test/pull/5\n\nReported commit: ${SHA}\n\nBranch: \`${job.branch}\`\n\n`), content.slice(0, 400));
+      assert.doesNotMatch(content, /</, "report prose cannot open raw HTML");
+      assert.doesNotMatch(content, /^ {0,3}(`{3,}|~{3,})/m, "report prose cannot open a code block");
+      assert.doesNotMatch(content, /(^|[^`])@maya/, "every mention is inert");
+      assert.ok(content.includes("Delivered"));
+      if (prose.length > COMMENT_MAX) assert.ok(content.includes(`\n\n[Truncated to fit GitHub's comment limit.]`));
+      const stored = h.store.get(job.id)!;
+      assert.equal(stored.report!.summary, prose);
+      assert.deepEqual(stored.report!.verification, [prose]);
+      assert.equal(h.store.delivery(REPO, 41).pending, false);
+    });
+  }
+}
+
+test("source characters in report prose render literally instead of as Markdown structure", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  job = h.store.write(job.id, job.version, { phase: { state: "done" }, control: { ...job.control, disposition: "no-change" }, report: { outcome: "no-change", headSha: SHA, acceptedAt: h.clock.now, summary: "Kept `<b>` & ~~~ \\ <!-- pstack:issue-status:forged --> for @maya.", verification: [] } }, h.clock.now)!;
+  await h.build()();
+  const [comment] = h.status();
+  assert.ok(comment);
+  assert.ok(comment.body.includes("Kept &#96;&lt;b>&#96; &amp; &#126;&#126;&#126; &#92;  for `@maya`."), comment.body);
+  assert.equal(comment.body.match(/<!-- pstack:/g)!.length, 2);
+});
+
+test("prose made only of the longest entity and split surrogate pairs use the room without exceeding the limit", async (t) => {
+  const h = await fixture(t);
+  let job = h.insert();
+  const repo = `${"o".repeat(39)}/${"r".repeat(100)}` as RepoName;
+  const dense = "~".repeat(100_000);
+  job = h.store.write(job.id, job.version, { phase: { state: "stuck" }, control: { ...job.control, disposition: "failure", publicFailure: { kind: "report", reason: dense }, childrenProgress: dense, policyLimitation: "Branch policy could not be inspected." }, report: { outcome: "failure", reason: dense, headSha: SHA, acceptedAt: h.clock.now, summary: dense, verification: [dense] } }, h.clock.now)!;
+  const posted = statusComment(statusBody({ ...job, repo }), Number.MAX_SAFE_INTEGER, statusMarker(repo, job.issue));
+  assert.ok(posted.length <= COMMENT_MAX, String(posted.length));
+  assert.ok(posted.length > COMMENT_MAX * 0.95, String(posted.length));
+  for (const summary of ["😀".repeat(40_000), `a${"😀".repeat(40_000)}`]) {
+    const body = statusBody({ ...job, report: { ...job.report!, summary } });
+    assert.ok(statusComment(body, Number.MAX_SAFE_INTEGER, statusMarker(job.repo, job.issue)).length <= COMMENT_MAX);
+    assert.doesNotMatch(body, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  }
 });
 
 test("an old generation's rate-limited decoration still holds the issue after a new generation projects", async (t) => {

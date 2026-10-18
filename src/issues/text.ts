@@ -337,8 +337,9 @@ const ISSUE_STAGE: Record<Job["phase"]["state"], string> = {
 };
 
 const TRUNCATED = "[Truncated to fit GitHub's comment limit.]";
-const MAX_ISSUE_TEXT_GROWTH = 2;
 const CLIP_GAP = "\n\n";
+const STATUS_PROSE_ENTITIES: Record<string, string> = { "&": "&amp;", "<": "&lt;", "`": "&#96;", "~": "&#126;", "\\": "&#92;" };
+const MAX_PROSE_GROWTH = Math.max(2, ...Object.values(STATUS_PROSE_ENTITIES).map((entity) => entity.length));
 
 export function statusMarker(repo: Job["repo"], issue: number): string {
   return `<!-- pstack:issue-status:${repo}:${issue} -->`;
@@ -360,18 +361,18 @@ function allocate(lengths: readonly number[], room: number): number[] {
 }
 
 function clipped(text: string, limit: number): string {
-  if (text.length <= limit) return text;
   const end = /[\uD800-\uDBFF]/.test(text[limit - 1] ?? "") ? limit - 1 : limit;
-  return `${text.slice(0, end)}${CLIP_GAP}${TRUNCATED}`;
+  return text.slice(0, end);
 }
 
-function rawProseRoom(normalizedRoom: number, blockCount: number): number {
-  return Math.max(0, Math.floor((normalizedRoom - blockCount * CLIP_GAP.length) / MAX_ISSUE_TEXT_GROWTH));
+function statusProse(text: string): string {
+  return issueText(unmarked(text).replace(/[&<`~\\]/g, (char) => STATUS_PROSE_ENTITIES[char]!));
 }
 
 /**
- * The status comment's body, within GitHub's limit once `statusComment` wraps it. Only the report's prose and the
- * sub-issue progress are cut; the store keeps the full report.
+ * The status comment's body, within GitHub's limit once `statusComment` wraps it. The outcome and the fixed facts come
+ * first. The report's prose and the sub-issue progress follow with Markdown's structural characters as entities, so
+ * they cannot hide what comes after them, and only they are cut. The store keeps the full report.
  */
 export function statusBody(job: Job): string {
   const result = job.control.disposition;
@@ -392,25 +393,28 @@ export function statusBody(job: Job): string {
       default: { const exhaustive: never = failure; return exhaustive; }
     }
   }
-  const verification = (job.report?.verification ?? []).map((line) => `- ${line}`).join("\n\n");
-  const prose = [job.control.childrenProgress, job.report?.summary ?? null, reported, verification || null];
-  const render = ([children, summary, because, checks]: (string | null)[]) => [
+  const fixed = [
     `Issue #${job.issue}: ${status}`,
     job.control.policyLimitation,
-    children,
-    summary,
-    because ? `Reason: ${because}` : null,
     reason ? `Reason: ${reason}` : null,
     job.pr ? `Pull request: ${job.pr.url}` : null,
     job.report?.headSha ? `Reported commit: ${job.report.headSha}` : job.pushedSha ? `Preserved commit: ${job.pushedSha}` : job.control.preservedSha ? `Preserved commit: ${job.control.preservedSha}` : null,
     `Branch: \`${job.branch}\``,
-    checks,
-  ].flatMap((part) => (part ? [issueText(part)] : [])).filter(Boolean).join("\n\n");
-  const full = render(prose);
+  ].flatMap((part) => (part ? [issueText(part)] : []));
+  const verification = (job.report?.verification ?? []).map((line) => `- ${line}`).join("\n\n");
+  const prose = [
+    { label: "", text: job.control.childrenProgress },
+    { label: "", text: job.report?.summary ?? null },
+    { label: "Reason: ", text: reported },
+    { label: "", text: verification || null },
+  ];
+  const render = (limits: readonly number[]) => [
+    ...fixed,
+    ...prose.map(({ label, text }, index) => text && (text.length <= limits[index]! ? `${label}${statusProse(text)}` : `${label}${statusProse(clipped(text, limits[index]!))}${CLIP_GAP}${TRUNCATED}`)),
+  ].filter(Boolean).join("\n\n");
+  const full = render(prose.map(() => Infinity));
   const budget = COMMENT_MAX - statusComment("", Number.MAX_SAFE_INTEGER, statusMarker(job.repo, job.issue)).length;
   if (full.length <= budget) return full;
-  const fixed = render(prose.map((text) => text && TRUNCATED)).length;
-  const room = rawProseRoom(budget - fixed, prose.length);
-  const limits = allocate(prose.map((text) => text?.length ?? 0), room);
-  return render(prose.map((text, index) => text && clipped(text, limits[index]!)));
+  const room = Math.max(0, Math.floor((budget - render(prose.map(() => 0)).length) / MAX_PROSE_GROWTH));
+  return render(allocate(prose.map(({ text }) => text?.length ?? 0), room));
 }
