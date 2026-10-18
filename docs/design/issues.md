@@ -164,7 +164,7 @@ The relabel comes first in `sending` and `respawning`, so the worker never gets 
 - The round starts in one store transaction: the job moves to `sending`, or to `respawning` when its thread is archived, deleted or failed, with the round ordinal plus one. The round's row is inserted in `issue_rounds`, and every item the message lists is marked with the round. An item is never sent in two rounds. The store refuses a round start that does not list every pending item. An item polled while the round was being planned then restarts the quiet period instead of starting a round of its own.
 - The round's base is the branch's head on GitHub when the round starts, kept on the job (`round_base`) and the round's row. A reviewer who commits a suggestion or presses Update branch moves it past the last push. The round's commit must contain the base, and its push expects it. When the branch moves again during the round, the report is refused with `remote_moved`, which does not count, and the base moves to the new head. A branch that no longer exists sticks the job.
 - The message is built from those items and stored in the effect, so a replay sends the same text. It stands alone. It holds the pull request URL and branch, the round number of 5, and the issue. Each item comes with its kind and id, author, file, line, diff hunk and body. An inline follow-up also shows the thread comment it answers. A one-line summary of each earlier round follows, then the rules. When the branch moved since the last push, the message says so and tells the worker to run `git fetch origin` and merge `origin/<branch>` before it commits. Comment text is fenced and marked as data from a GitHub user. The message also says that a repeated copy needs no work.
-- `addressing` behaves like `working`: 60 minutes per round, reminders to an idle worker, two rejected reports, and `stop`.
+- `addressing` behaves like `working`: 4 hours per round, reminders to an idle worker, two rejected reports, and `stop`.
 - A merged or closed pull request ends a job in `review` or `addressing`: it stops the worker and removes the status labels.
 - A replacement worker is a spawn of its own, keyed by the round, and starts from the pushed branch with the settings the first worker used.
 
@@ -209,7 +209,7 @@ Before the start, the service resolves the worker and checks its `provider/model
 **Limits.** These are constants:
 
 - No cap on concurrent jobs in pstack. A queued job starts as soon as its worker resolves, and bb's per-machine and global concurrency limits decide when worker threads run.
-- 60 minutes per round.
+- 4 hours per round (`ROUND_MS`).
 - Two reminders to an idle worker that has not reported.
 - Two rejected reports per round.
 - 5 feedback rounds per pull request (`MAX_FEEDBACK_ROUNDS`). New feedback after the fifth sticks the job with the reason.
@@ -275,7 +275,7 @@ The host entry is `src/host.ts`, and its contract is in `src/host-contract.ts`. 
 
 - An issue edited after work starts is sent to the worker as a note. Is that enough, or should a large edit restart the job?
 - Two jobs that touch the same files are not coordinated. Conflicts surface as conflict rounds.
-- Workers use the project's default permission mode. A project whose default is `accept-edits` may stall an unattended worker on approval prompts until the round's 60 minutes run out.
+- Workers use the project's default permission mode. A project whose default is `accept-edits` may stall an unattended worker on approval prompts until the round's 4 hours run out.
 - Whether bb logs host RPC payloads, which carry the push token, is unverified.
 - The reminder to an idle worker compares the thread's `updatedAt` with the job's last write. If bb does not bump `updatedAt` when a turn ends, no reminder is sent and the job sticks at the round's deadline instead. When pstack cannot count the worker's active runs and children, it treats the worker as waiting, with the same fallback.
 - The spawn probe's early stop relies on bb listing pinned threads first and then newest first. That order is observed, not documented. If it changes, the probe can miss a late thread, and the job sticks after the spawn's grace period.

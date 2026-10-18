@@ -417,7 +417,7 @@ export type Action =
 
 export const MAX_NUDGES = 2;
 export const MAX_REJECTIONS = 2;
-export const ROUND_MS = 60 * 60_000;
+export const ROUND_MS = 4 * 60 * 60_000;
 
 /** States a round runs through, from its start until the job rests in review or needs-info, or heads to an end. */
 const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "asking", "sending", "respawning", "addressing", "republishing", "replying"]);
@@ -484,7 +484,7 @@ function next(job: Job, facts: Facts): Action | null {
     case "working": {
       if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job) };
       if (job.deadline !== null && job.deadline <= now) {
-        return { type: "change", change: stick(job, "the worker did not report within 60 minutes") };
+        return { type: "change", change: stick(job, `the worker did not report within ${ROUND_MS / 3_600_000} hours`) };
       }
       const thread = facts.thread;
       if (!thread) return null;
