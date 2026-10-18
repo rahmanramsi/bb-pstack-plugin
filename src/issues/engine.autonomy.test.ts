@@ -726,12 +726,18 @@ test("migrated no-change and merged children satisfy parent prerequisites withou
     insert.run(merged, 52, now - MIN, snapshot, "agent/issue-52-merged", "done", parent, noChange, SHA2, now - MIN, now - MIN);
     insert.run(unknown, 99, now - MIN, snapshot, "agent/issue-99-unknown", "done", null, null, null, now - MIN, now - MIN);
     db.prepare("INSERT INTO issue_job_polls (job_id,pr_state) VALUES (?, 'merged')").run(merged);
+    db.prepare("UPDATE issue_jobs SET pr_number = 70, pr_url = 'https://github.com/acme/web/pull/70' WHERE id = ?").run(merged);
   } });
   for (const issue of [50, 51, 52]) h.gh().issues.set(issue, { number: issue, title: `Historical part ${issue}`, body: "Verify integration", user: "maya", updatedAt: h.clock.now, labels: new Set(), ...(issue === 50 ? { subIssues: [51, 52] } : {}) });
+  h.gh().issues.set(70, { number: 70, title: "Historical implementation", body: "Verified result", user: "pstack-test[bot]", updatedAt: h.clock.now, labels: new Set(), pr: { head: "agent/issue-52-merged", base: "main", title: "Historical implementation", body: "Verified result", draft: false } });
+  h.gh().refs.set("agent/issue-52-merged", SHA3);
+  h.gh().pulls.set(70, { state: "closed", merged: true, requested: new Set() });
   h.label(50); await h.settle();
   assert.equal((await h.byIssue(51)).outcome, "no-change");
   assert.equal((await h.byIssue(52)).outcome, "merged");
   assert.equal((await h.byIssue(99)).outcome, null);
+  assert.equal(h.store.get((await h.byIssue(52)).id)!.control.mergedHead, SHA3);
+  assert.equal(h.store.get((await h.byIssue(50)).id)!.control.prerequisites[0]!.sha, SHA3);
   assert.equal((await h.byIssue(50)).state, "working");
   assert.equal(h.spawned.length, 1);
 });

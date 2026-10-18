@@ -640,3 +640,29 @@ test("unknown mergeability needs a fresh observation and can diagnose on that ob
   assert.equal(fresh.change.phase?.state, "repairing");
   assert.equal(fresh.change.control?.mergeabilityGrace?.observations, 2);
 });
+
+test("terminal plans absorb prerequisite failures and child projection", () => {
+  for (const state of ["done", "stopped", "stuck", "ignored"] as const) {
+    const current = job({ phase: { state } });
+    assert.equal(plan(current, facts({ prerequisiteProblem: "prerequisite failed", prerequisites: [], children: [{ number: 52, title: "Part", url: "https://example.test/52", state: "open", blockedBy: [], job: null }] })), null, state);
+  }
+});
+
+test("changed prerequisite pins draft the recorded review target between snapshot polls", () => {
+  const target = { pr: 7, head: HEAD, base: "b".repeat(40) as Sha };
+  const current = job({ phase: { state: "review" }, pr: { number: 7, url: "https://example.test/7" }, control: { ...initialControl(), readiness: target, localEvidence: target } });
+  const action = plan(current, facts({ prerequisites: [{ issue: 52, branch: current.branch, sha: "c".repeat(40) as Sha }] }));
+  assert.equal(action?.type, "change");
+  if (action?.type !== "change") return;
+  assert.equal(action.change.phase?.state, "drafting");
+  assert.equal(action.change.control?.localEvidence, null);
+  assert.equal(action.change.control?.readiness, null);
+  assert.deepEqual(action.change.phase && "effects" in action.change.phase && action.change.phase.effects[0].op === "set-draft" && action.change.phase.effects[0].target, target);
+});
+
+test("review without matching local evidence converges through drafting", () => {
+  const target = { pr: 7, head: HEAD, base: "b".repeat(40) as Sha };
+  const current = job({ phase: { state: "review" }, control: { ...initialControl(), reviewIntent: target } });
+  const action = plan(current, facts({ review: { kind: "observed", target, state: "open", draft: false, complete: true, ready: true, pending: false, observedAt: NOW, mergeability: "clean", reasons: [], fingerprint: "healthy" } }));
+  assert.equal(action?.type === "change" && action.change.phase?.state, "drafting");
+});

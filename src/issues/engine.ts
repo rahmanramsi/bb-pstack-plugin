@@ -34,6 +34,7 @@ import { acceptSync,
   awaitingThread,
   containsSha,
   integrationPrerequisites,
+  verifiedDeliveredHead,
   publicationRepairPrompt,
   isTransit,
   TRANSIT,
@@ -569,13 +570,15 @@ export function createIssues(deps: IssuesDeps): Issues {
       const { prState } = store.jobPoll(job.id);
       facts.pr = prState ? { state: prState } : null;
     }
-    if (first.includes("children")) facts.children = childFacts(job);
+    if (first.includes("children")) facts.children = await childFacts(job);
     if (facts.children?.length) {
       facts.prerequisites = integrationPrerequisites(facts.children);
+      const failed = facts.children.find((child) => child.state === "open" && child.job && TERMINAL.has(child.job.state) && !child.job.merged && child.job.disposition !== "no-change");
+      if (failed && job.phase.state !== "tracking") facts.prerequisiteProblem = `prerequisites failed: #${failed.number}`;
       const unpinned = facts.children.find((child) => (child.job?.ready || child.job?.merged || child.job?.disposition === "merged") && (!child.job.branch || !child.job.sha));
       if (unpinned) facts.prerequisiteProblem = `prerequisite #${unpinned.number} has no established commit`;
     }
-    if (job.parentId && !isTransit(job.phase.state)) {
+    if (job.parentId && ["queued", "working", "addressing", "checking", "review"].includes(job.phase.state)) {
       const children = store.polledChildren(job.parentId) ?? [];
       const blockers = children.find((child) => child.number === job.issue)?.blockedBy ?? [];
       const localNumber = (ref: string) => Number(new RegExp(`^(?:${job.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})?#(\\d+)$`).exec(ref)?.[1] ?? NaN);
@@ -590,15 +593,22 @@ export function createIssues(deps: IssuesDeps): Issues {
       };
       if (cycle(job.issue)) facts.prerequisiteProblem = "prerequisite dependency cycle";
       facts.prerequisites ??= [];
+      const siblings = new Map<number, Job>();
+      for (const ref of blockers) {
+        const number = localNumber(ref);
+        const candidate = store.open(job.repo, number) ?? store.children(job.parentId).find((row) => row.issue === number);
+        if (candidate) siblings.set(number, await observeMergedHead(candidate));
+      }
       facts.blockers = blockers.filter((ref) => {
         const number = localNumber(ref);
         const child = children.find((candidate) => candidate.number === number);
         if (!child) { facts.prerequisiteProblem = `prerequisite ${ref} is outside this parent job's owned scope`; return false; }
-        const prerequisite = store.open(job.repo, number) ?? store.children(job.parentId!).find((candidate) => candidate.issue === number);
+        const prerequisite = siblings.get(number);
+        const head = prerequisite ? verifiedDeliveredHead(prerequisite) : null;
         if (prerequisite && TERMINAL.has(prerequisite.phase.state) && prerequisite.control.disposition !== "no-change" && prerequisite.control.disposition !== "merged") { facts.prerequisiteProblem = `prerequisite ${ref} failed`; return false; }
-        if (prerequisite && (prerequisite.control.readiness || prerequisite.control.disposition === "merged") && !prerequisite.pushedSha) facts.prerequisiteProblem = `prerequisite ${ref} has no established commit`;
-        if (prerequisite?.pushedSha && prerequisite.control.disposition !== "no-change") facts.prerequisites = [...(facts.prerequisites ?? []), { issue: prerequisite.issue, branch: prerequisite.branch, sha: prerequisite.pushedSha }];
-        return child.state !== "closed" && !prerequisite?.control.readiness && prerequisite?.control.disposition !== "no-change" && prerequisite?.control.disposition !== "merged";
+        if (prerequisite && (prerequisite.control.readiness || prerequisite.control.disposition === "merged") && !head) facts.prerequisiteProblem = `prerequisite ${ref} has no established commit`;
+        if (prerequisite && head && prerequisite.control.disposition !== "no-change") facts.prerequisites = [...(facts.prerequisites ?? []), { issue: prerequisite.issue, branch: prerequisite.branch, sha: head }];
+        return child.state !== "closed" && !prerequisite?.control.readiness && !prerequisite?.control.mergedHead && prerequisite?.control.disposition !== "no-change" && prerequisite?.control.disposition !== "merged";
       });
       facts.prerequisites = [...facts.prerequisites].sort((a, b) => a.issue - b.issue);
     }
@@ -635,14 +645,23 @@ export function createIssues(deps: IssuesDeps): Issues {
     return facts;
   }
 
-  function childFacts(parent: Job): ChildFact[] | null {
+  async function observeMergedHead(job: Job): Promise<Job> {
+    if (!job.pr || job.control.mergedHead || (job.control.disposition !== "merged" && store.jobPoll(job.id).prState !== "merged")) return job;
+    const snapshot = await github.repo(job.repo).reviewSnapshot(job.pr.number);
+    if (snapshot && (!snapshot.complete || snapshot.state === "open")) throw new GitHubTransientError("the merged prerequisite head is not coherently observed yet", null);
+    if (!snapshot || snapshot.state !== "merged" || snapshot.headRepository !== job.repo || snapshot.headBranch !== job.branch || snapshot.baseBranch !== job.baseBranch) return job;
+    return store.write(job.id, job.version, { control: { ...job.control, mergedHead: snapshot.head } }, clock()) ?? store.get(job.id) ?? job;
+  }
+
+  async function childFacts(parent: Job): Promise<ChildFact[] | null> {
     const polled = store.polledChildren(parent.id);
     if (!polled) return null;
     const created = store.children(parent.id);
-    return polled.map((child) => {
-      const job = store.open(parent.repo, child.number) ?? created.find((row) => row.issue === child.number);
-      return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged", ready: job.control.readiness !== null, disposition: job.control.disposition, branch: job.branch, sha: job.pushedSha } : null };
-    });
+    return Promise.all(polled.map(async (child) => {
+      const candidate = store.open(parent.repo, child.number) ?? created.find((row) => row.issue === child.number);
+      const job = candidate ? await observeMergedHead(candidate) : null;
+      return { ...child, job: job ? { state: job.phase.state, merged: store.jobPoll(job.id).prState === "merged", ready: job.control.readiness !== null, disposition: job.control.disposition, branch: job.branch, sha: verifiedDeliveredHead(job) } : null };
+    }));
   }
 
   async function apply(job: Job, action: Exclude<Action, { type: "sleep" }>): Promise<void> {
@@ -811,11 +830,6 @@ export function createIssues(deps: IssuesDeps): Issues {
       store.finishSubmission(submission.id, "job no longer reporting", clock());
       return reject("not_working", `job ${job.id} is ${job.phase.state}`);
     }
-    const currentFacts = await gather(job);
-    if (currentFacts.prerequisites && JSON.stringify(currentFacts.prerequisites) !== JSON.stringify(job.control.prerequisites)) {
-      store.write(job.id, job.version, { control: { ...job.control, prerequisites: currentFacts.prerequisites, readiness: null, localEvidence: null } }, clock());
-      return reject("pending", "Report saved while current prerequisites are reconciled.");
-    }
     let parsed: ReturnType<typeof parseReport>;
     try { parsed = parseReport(job, JSON.parse(submission.raw)); }
     catch (error) { parsed = { ok: false, code: "invalid_report", message: `the report is not JSON: ${message(error)}` }; }
@@ -852,6 +866,17 @@ export function createIssues(deps: IssuesDeps): Issues {
         submission.intendedSha = tree.headSha;
       }
     } catch {}
+    const currentFacts = await gather(job);
+    if (currentFacts.prerequisiteProblem) {
+      const result = reject("prerequisite_failed", currentFacts.prerequisiteProblem);
+      store.write(job.id, job.version, { ...stick(job, currentFacts.prerequisiteProblem, { kind: "prerequisite", issues: job.control.prerequisites.map(({ issue }) => issue) }), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());
+      return result;
+    }
+    if (currentFacts.blockers?.length || currentFacts.children?.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change")) return reject("pending", "Report saved while prerequisites regain readiness.");
+    if (currentFacts.prerequisites && JSON.stringify(currentFacts.prerequisites) !== JSON.stringify(job.control.prerequisites)) {
+      store.write(job.id, job.version, { control: { ...job.control, prerequisites: currentFacts.prerequisites, readiness: null, localEvidence: null } }, clock());
+      return reject("pending", "Report saved while current prerequisites are reconciled.");
+    }
     const facts = await reportFacts(job);
     if ("unavailable" in facts) {
       if (facts.disposition === "fail") {
@@ -869,11 +894,6 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       return reject("pending", `Report saved. Evaluation resumes automatically when dependencies recover. ${facts.unavailable}`);
     }
-    facts.prerequisiteProblems = [
-      ...(currentFacts.prerequisiteProblem ? [currentFacts.prerequisiteProblem] : []),
-      ...(currentFacts.blockers?.length ? [`prerequisites are not ready: ${currentFacts.blockers.join(", ")}`] : []),
-      ...(currentFacts.children?.filter((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change").map((child) => `prerequisite #${child.number} is not ready`) ?? []),
-    ];
     if (submission.intendedSha !== facts.worktree.headSha) {
       const result = reject("stale_snapshot", "The worker changed HEAD during report evaluation; current verification is required.");
       store.write(job.id, job.version, { ...rejectedChange(rejectReport(job, [result.result.message]), result.result.message), evaluation: { submissionId: submission.id, result: JSON.stringify(result.result) } }, clock());

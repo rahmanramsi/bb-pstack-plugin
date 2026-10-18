@@ -272,6 +272,7 @@ export type Control = {
   bestReasons: readonly string[] | null;
   milestones: readonly string[];
   readiness: ReviewTarget | null;
+  mergedHead?: Sha | null;
   reviewIntent: ReviewTarget | null;
   localEvidence: { head: Sha; base: Sha } | null;
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
@@ -286,7 +287,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;
@@ -483,6 +484,7 @@ function rounded(job: Job, change: Change): Change {
 }
 
 export function plan(job: Job, facts: Facts): Action | null {
+  if (TERMINAL.has(job.phase.state)) return null;
   let action = next(job, facts);
   if (facts.children) {
     const childrenProgress = progressBody(facts.children);
@@ -510,7 +512,8 @@ function next(job: Job, facts: Facts): Action | null {
 
   if (facts.prerequisites && JSON.stringify(facts.prerequisites) !== JSON.stringify(job.control.prerequisites)) {
     const control = { ...job.control, prerequisites: facts.prerequisites, localEvidence: null, readiness: null };
-    if (phase.state === "review" && facts.review?.kind === "observed") return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `prerequisites-draft:${job.id}:${job.version}`, target: facts.review.target, draft: true }]) } };
+    const target = facts.review?.kind === "observed" ? facts.review.target : job.control.readiness ?? job.control.reviewIntent;
+    if (phase.state === "review" && target) return { type: "change", change: { control, phase: enter("drafting", [{ op: "set-draft", key: `prerequisites-draft:${job.id}:${job.version}`, target, draft: true }]) } };
     return { type: "change", change: { control } };
   }
   if (facts.prerequisiteProblem) return { type: "change", change: stick(job, facts.prerequisiteProblem, { kind: "prerequisite", issues: job.control.prerequisites.map(({ issue }) => issue) }) };
@@ -541,6 +544,7 @@ function next(job: Job, facts: Facts): Action | null {
     case "addressing":
     case "working": {
       if (facts.pr && facts.pr.state !== "open") return { type: "change", change: close(job, facts.pr.state) };
+      if (facts.blockers?.length || facts.children?.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change")) return null;
       const thread = facts.thread;
       if (!thread) return null;
       switch (thread.kind) {
@@ -607,15 +611,15 @@ export type ReviewFact =
 
 function checkReview(job: Job, facts: Facts): Action | null {
   const review = facts.review;
-  const knownTarget = job.control.readiness;
+  const knownTarget = job.control.readiness ?? job.control.reviewIntent;
   const pendingChildren = facts.children?.some((child) => child.state === "open" && !child.job?.ready && !child.job?.merged && child.job?.disposition !== "no-change");
   const blocked = Boolean(facts.blockers?.length || pendingChildren);
-  if (job.phase.state === "review" && knownTarget && (facts.feedback?.pending.length || blocked) && review?.kind !== "observed") {
+  if (job.phase.state === "review" && knownTarget && (facts.feedback?.pending.length || blocked || !job.control.localEvidence || !job.control.readiness) && review?.kind !== "observed") {
     return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `known-regression:${job.id}:${job.version}`, target: knownTarget, draft: true }]), control: { ...job.control, readiness: null, ...(blocked ? { localEvidence: null } : {}) } } };
   }
   if (!review) return null;
   if (review.kind === "unavailable") return review.permanent ? { type: "change", change: stick(job, review.reason) } : null;
-  if (review.state !== "open") return { type: "change", change: close(job, review.state) };
+  if (review.state !== "open") return { type: "change", change: close(job, review.state, review.target.head) };
   const target = review.target;
   const previous = job.control.readiness;
   const changed = previous && (previous.head !== target.head || previous.base !== target.base);
@@ -624,7 +628,7 @@ function checkReview(job: Job, facts: Facts): Action | null {
   const converted = intent?.head === target.head && intent.base === target.base && intent.pr === target.pr;
   const awaitingCI = converted && local && review.complete && !review.draft && review.pending && review.reasons.length === 0;
   if (job.phase.state === "review" && awaitingCI && !facts.feedback?.pending.length) return { type: "change", change: { phase: { state: "checking" }, control: { ...job.control, readiness: null, reviewIntent: target } } };
-  if (job.phase.state === "review" && (changed || !review.ready || review.draft || Boolean(facts.feedback?.pending.length))) {
+  if (job.phase.state === "review" && (changed || !local || !previous || !review.ready || review.draft || Boolean(facts.feedback?.pending.length))) {
     return { type: "change", change: { phase: enter("drafting", [{ op: "set-draft", key: `draft:${job.id}:${job.version}`, target, draft: true }]), control: { ...job.control, readiness: null } } };
   }
   if (facts.blockers?.length) {
@@ -692,6 +696,10 @@ function track(job: Job, children: readonly ChildFact[]): Action | null {
   }
   if (body === job.progress) return null;
   return { type: "change", change: { phase: enter("updating", [status]), progress: body } };
+}
+
+export function verifiedDeliveredHead(job: Job): Sha | null {
+  return job.control.mergedHead ?? (job.control.disposition === "merged" ? null : job.control.readiness?.head ?? null);
 }
 
 export function integrationPrerequisites(children: readonly ChildFact[]): Control["prerequisites"] {
@@ -798,9 +806,9 @@ function startRound(job: Job, pending: readonly Feedback[], rounds: readonly Rou
 }
 
 /** review or addressing → closing once the pull request is merged or closed: the worker and the status labels go. */
-function close(job: Job, disposition: PullState = "merged"): Change {
+function close(job: Job, disposition: PullState = "merged", observedHead?: Sha): Change {
   if (disposition === "closed") return { ...stick(job, "the pull request closed without merging"), control: { ...job.control, readiness: null, disposition: "closed" } };
-  return { phase: enter("closing", endingEffects(job, "close")), deadline: null, error: null, control: { ...job.control, disposition: "merged", readiness: null } };
+  return { phase: enter("closing", endingEffects(job, "close")), deadline: null, error: null, control: { ...job.control, disposition: "merged", mergedHead: observedHead ?? job.control.mergedHead ?? null, readiness: null } };
 }
 
 /** Waiting for its spawn to create the worker, which may report before the spawn is confirmed. */
