@@ -407,3 +407,25 @@ test("migrated no-change and merged children satisfy parent prerequisites withou
   assert.equal((await h.byIssue(50)).state, "working");
   assert.equal(h.spawned.length, 1);
 });
+
+test("recovery stops archived same-environment writers and refuses queued or background survivors", async () => {
+  for (const activity of ["none", "queued", "background", "command", "goal", "workflow"]) {
+    const h = harness();
+    h.label(41); await h.settle();
+    const original = (await h.only()).threadId!;
+    const thread = h.threads.get(original)!;
+    const archived = { ...thread, id: "thr_archived_writer", archivedAt: h.clock.now, metadata: {}, queuedMessageCount: activity === "queued" ? 1 : 0, activeBackgroundAgentCount: activity === "background" ? 1 : 0, activeBackgroundCommandCount: activity === "command" ? 1 : 0, activeGoalCount: activity === "goal" ? 1 : 0, activeWorkflowCount: activity === "workflow" ? 1 : 0 };
+    h.threads.set(archived.id, archived);
+    for (let i = 0; i < 3; i++) await h.report(original, { outcome: `invalid-${i}` });
+    await h.settle();
+    assert.ok(h.stopped.includes(archived.id));
+    if (activity !== "none") {
+      assert.equal(h.spawned.length, 1);
+      assert.equal((await h.only()).outcome, "failure");
+      assert.match((await h.only()).error!, /exclusive.*(?:queued or background work remains|background commands, goals or workflows remain)/);
+    } else {
+      assert.equal(h.spawned.length, 2);
+      assert.equal(h.spawned[1]!.environment.environmentId, thread.environmentId);
+    }
+  }
+});

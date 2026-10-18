@@ -274,6 +274,11 @@ export type FakeThread = {
   environmentId: string;
   metadata: Record<string, unknown>;
   pinnedAt?: number | null;
+  queuedMessageCount?: number;
+  activeBackgroundAgentCount?: number;
+  activeBackgroundCommandCount?: number;
+  activeGoalCount?: number;
+  activeWorkflowCount?: number;
 };
 
 export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typeof Database>, now: number) => void } = {}) {
@@ -352,11 +357,11 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         return { id: thread.id };
       },
       /** bb's order: pinned threads first, then newest first. */
-      async list({ offset = 0, limit = 50, projectId, environmentId }: { offset?: number; limit?: number; projectId?: string; environmentId?: string }) {
+      async list({ offset = 0, limit = 50, projectId, environmentId, archived = false }: { offset?: number; limit?: number; projectId?: string; environmentId?: string; archived?: boolean }) {
         calls.list++;
         return [...threads.values()]
-          .filter((thread) => thread.archivedAt === null && (!projectId || thread.projectId === projectId) && (!environmentId || thread.environmentId === environmentId))
-          .map((thread) => ({ ...thread, pinnedAt: thread.pinnedAt ?? null }))
+          .filter((thread) => (archived ? thread.archivedAt !== null : thread.archivedAt === null) && (!projectId || thread.projectId === projectId) && (!environmentId || thread.environmentId === environmentId))
+          .map((thread) => ({ ...thread, pinnedAt: thread.pinnedAt ?? null, activity: { activeBackgroundAgentCount: thread.activeBackgroundAgentCount ?? 0, activeBackgroundCommandCount: thread.activeBackgroundCommandCount ?? 0, activeGoalCount: thread.activeGoalCount ?? 0, activeWorkflowCount: thread.activeWorkflowCount ?? 0, activePlanModeCount: 0 } }))
           .sort((a, b) => (b.pinnedAt === null ? 0 : 1) - (a.pinnedAt === null ? 0 : 1) || b.createdAt - a.createdAt)
           .slice(offset, offset + limit);
       },

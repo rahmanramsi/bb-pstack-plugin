@@ -157,12 +157,15 @@ export function createIssues(deps: IssuesDeps): Issues {
   }
 
   async function workspaceThreads(environmentId: string, signal?: AbortSignal) {
-    const found: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
-    for (let offset = 0; ; offset += 100) {
-      const page = await bb.sdk.threads.list({ environmentId, includeHidden: true, limit: 100, offset, ...(signal ? { signal } : {}) });
-      found.push(...page);
-      if (page.length < 100) return found;
+    const found = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>[number]>();
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += 100) {
+        const page = await bb.sdk.threads.list({ environmentId, archived, includeHidden: true, limit: 100, offset, ...(signal ? { signal } : {}) });
+        for (const thread of page) found.set(thread.id, thread);
+        if (page.length < 100) break;
+      }
     }
+    return [...found.values()];
   }
 
   async function matchingEpoch(job: Job, signal?: AbortSignal): Promise<string[]> {
@@ -451,7 +454,11 @@ export function createIssues(deps: IssuesDeps): Issues {
         const status = await bb.sdk.environments.status({ environmentId: workspace.environmentId, mergeBaseBranch: `origin/${job.baseBranch}` });
         if (status.outcome !== "available" || status.workspace.checkout.kind !== "branch" || status.workspace.checkout.branchName !== workspace.branch) return { kind: "fail", error: `the preserved branch identity cannot be confirmed in ${workspace.environmentId}; workspace retained` };
         const writers = await workspaceThreads(workspace.environmentId);
-        if (writers.some((writer) => !["idle", "error"].includes(writer.status))) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}; work retained` };
+        for (const writer of writers) {
+          if (writer.activity.activeBackgroundCommandCount > 0 || writer.activity.activeGoalCount > 0 || writer.activity.activeWorkflowCount > 0) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}: background commands, goals or workflows remain; work retained` };
+          const current = await bb.sdk.threads.get({ threadId: writer.id }).catch((error) => { if (isMissing(error)) return null; throw error; });
+          if (current && (!["idle", "error"].includes(current.status) || (current.runtime !== undefined && !["idle", "error"].includes(current.runtime.displayStatus)) || current.queuedMessageCount > 0 || current.activeBackgroundAgentCount > 0)) return { kind: "fail", error: `exclusive stop is not confirmed for ${workspace.environmentId}; work retained` };
+        }
         try {
           const thread = await bb.sdk.threads.spawn({ projectId: job.projectId, visibility: "visible", environment: { type: "reuse", environmentId: workspace.environmentId }, pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch }, prompt: recoveryPrompt(job), title: `Recover issue #${job.issue}`, providerId: settings.providerId, model: settings.model, reasoningLevel: settings.reasoningLevel, ...(settings.permissionMode ? { permissionMode: settings.permissionMode } : {}) });
           return done({ threadId: thread.id, worker: settings });
@@ -498,6 +505,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           await bb.sdk.threads.stop({ threadId, signal }).catch((error) => { if (!isMissing(error)) throw error; });
           const stopped = await bb.sdk.threads.get({ threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });
           if (stopped && (stopped.status !== "idle" && stopped.status !== "error" || (stopped.runtime !== undefined && !["idle", "error"].includes(stopped.runtime.displayStatus)))) return { kind: "retry", error: `stop is not confirmed for ${threadId}`, notBefore: clock() + SWEEP_MS };
+          if (job.phase.state === "recovering" && stopped && (stopped.queuedMessageCount > 0 || stopped.activeBackgroundAgentCount > 0)) return { kind: "fail", error: `exclusive reuse is unavailable for ${threadId}: queued or background work remains after stop; the original workspace is preserved` };
         }
         return done({ control: { ...job.control, workspace } });
       },
