@@ -65,7 +65,7 @@ export type IssueReads = {
   due(now: number): JobId[];
   /** Newest first; terminal jobs only with `all`. */
   list(filter: { repo?: RepoName; all: boolean }): Job[];
-  /** Newest first: stuck jobs that no later job for their issue has replaced, ignored ones included. */
+  /** Newest first: stuck jobs that no later job for their issue has replaced; a later ignored row is no replacement. */
   latestStuck(filter: { repo?: RepoName }): Job[];
   /** Whether the item is stored already, sent or not. */
   hasFeedback(repo: RepoName, ref: FeedbackRef): boolean;
@@ -411,11 +411,12 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       return rows.map(parse);
     },
     latestStuck({ repo }) {
-      // An ignored row can tie its predecessor's generation, so rowid breaks the tie.
+      // An ignored row can tie its predecessor's generation, so rowid orders the rest; ignored rows never replace a job.
       const rows = db
         .prepare(
           `SELECT * FROM issue_jobs j WHERE state = 'stuck' ${repo ? "AND repo = ?" : ""}
              AND NOT EXISTS (SELECT 1 FROM issue_jobs n WHERE n.repo = j.repo AND n.issue = j.issue
+               AND n.state != 'ignored'
                AND (n.generation > j.generation OR (n.generation = j.generation AND n.rowid > j.rowid)))
            ORDER BY created_at DESC, id DESC`,
         )

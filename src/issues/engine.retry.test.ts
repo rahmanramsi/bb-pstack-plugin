@@ -65,3 +65,53 @@ test("a stopped job can be retried, and a done or ignored one cannot", async () 
   assert.equal(done.exitCode, 1);
   assert.match(done.stderr!, /is done; only a stuck or stopped job can be retried/);
 });
+
+test("a drive-by relabel of a stuck job's issue leaves the stuck job on the list", async () => {
+  const h = harness();
+  const stuck = h.queue(41);
+  h.setWorkerRole("codex/gpt-missing/high");
+  await h.engine().issues.sweep();
+  h.setWorkerRole("codex/gpt-6.1-sol/high");
+  h.label(41, "drive-by");
+  await h.engine().issues.sweep();
+  const all = await h.views();
+  assert.deepEqual(all.map((view) => view.state).sort(), ["ignored", "stuck"]);
+  assert.deepEqual(ids((await h.engine().run(["issues", "list"])).stdout!), [stuck.id]);
+});
+
+test("a sub-issue job cannot be retried on its own", async () => {
+  const h = harness();
+  const gh = h.gh();
+  for (const number of [51, 52]) gh.issues.set(number, { number, title: `Part ${number}`, body: `Do part ${number}.`, user: "maya", updatedAt: h.clock.now, labels: new Set() });
+  gh.issues.set(50, { number: 50, title: "Checkout redesign", body: "The whole checkout flow.", user: "maya", updatedAt: h.clock.now, labels: new Set(), subIssues: [51, 52] });
+  h.label(50);
+  await h.settle();
+  const parent = await h.byIssue(50);
+  for (const [issue, state] of [[51, "stuck"], [52, "stopped"]] as const) {
+    const child = h.store.get((await h.byIssue(issue)).id)!;
+    assert.equal(child.parentId, parent.id);
+    h.store.write(child.id, child.version, { phase: { state } }, h.clock.now);
+    const count = (await h.views()).length;
+    assert.deepEqual(await h.engine().issues.retry(child.id, "the bb app"), {
+      ok: false, code: "child_job_not_retryable", message: `${child.id} is a sub-issue job of ${parent.id}; stop and retry the parent job instead`,
+    });
+    assert.equal((await h.views()).length, count);
+  }
+});
+
+test("a retry that loses the race to a polled job refuses, while a start returns the polled job", async () => {
+  const h = harness();
+  const stuck = h.queue(41);
+  h.setWorkerRole("codex/gpt-missing/high");
+  await h.engine().issues.sweep();
+  h.setWorkerRole("codex/gpt-6.1-sol/high");
+
+  const retrying = h.engine().issues.retry(stuck.id, "the bb app");
+  const polled = h.queue(41);
+  assert.deepEqual(await retrying, { ok: false, code: "issue_has_open_job", message: `acme/web#41 already has the open job ${polled.id}` });
+
+  const starting = h.engine().issues.start("acme/web" as typeof stuck.repo, 42);
+  const winner = h.queue(42);
+  assert.equal(await starting, winner.id);
+  assert.equal((await h.views()).length, 3);
+});
