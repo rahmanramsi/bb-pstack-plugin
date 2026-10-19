@@ -138,6 +138,7 @@ export function issueCommands(deps: {
   report(threadId: string, text: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
   sync(threadId: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
   stop(id: JobId, by: string): Promise<boolean>;
+  retry(id: JobId, by: string): Promise<{ ok: true; id: JobId } | { ok: false; code: string; message: string }>;
 }): Record<string, PluginCliCommand> {
   const { bb, store } = deps;
   const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
@@ -178,6 +179,19 @@ export function issueCommands(deps: {
         if (!store.get(id)) throw new PluginCliError(`no issue job ${id}`, { code: "job_not_found" });
         const stopped = await deps.stop(id, ctx.threadId ? `thread ${ctx.threadId}` : "the bb CLI");
         return { exitCode: 0, stdout: stopped ? `Stopping ${id}.\n` : `${id} already ended.\n` };
+      },
+    }),
+    "issues retry": cliCommand({
+      summary: "Start a new job for the issue of a stuck or stopped job, once the cause is fixed",
+      positionals: [{ name: "job", description: "Job id (psi_…)", required: true }],
+      async run(input, ctx) {
+        const id = jobId(input.positionals.job);
+        if (ctx.threadId && store.byThread(ctx.threadId)) {
+          throw new PluginCliError("an issue worker cannot retry issue jobs", { code: "worker_cannot_retry" });
+        }
+        const result = await deps.retry(id, ctx.threadId ? `thread ${ctx.threadId}` : "the bb CLI");
+        if (!result.ok) throw new PluginCliError(result.message, { code: result.code });
+        return { exitCode: 0, stdout: `Retrying ${id} as ${result.id}.\n` };
       },
     }),
     "issues report": cliCommand({

@@ -118,11 +118,14 @@ export type Issues = {
   instructions(threadId: string): string | null;
   /** One pass of the service: poll every repository, reconcile every job that may act, and wait for any reconcile in flight. */
   sweep(): Promise<void>;
+  /** Starts a new job for the issue of a stuck or stopped job, when the issue has no open job. */
+  retry(id: JobId, by: string): Promise<StartResult>;
   /** Moves the job to stopping and starts its ending effects. False when it already ended or is ending, or does not exist. */
   stop(id: JobId, by: string): Promise<boolean>;
 };
 
 export type ReportResult = { ok: true; message: string } | { ok: false; code: string; message: string };
+export type StartResult = { ok: true; id: JobId } | { ok: false; code: string; message: string };
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const isMissing = (error: unknown) => {
@@ -1232,6 +1235,40 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  /** Inserts a job for an open issue, as a person starting it, and runs it. A job already open for it wins the race. */
+  async function admit(mapping: RepoMapping, number: number, actor: string): Promise<StartResult> {
+    const { primaryHostId } = await bb.sdk.system.config();
+    if (mapping.hostId !== null && mapping.hostId === primaryHostId) return { ok: false, code: "bb_server_host", message: "Map this repository to a worker host before starting an issue." };
+    const ready = await readiness(mapping);
+    if (ready.kind === "blocked") return { ok: false, code: "worker_not_ready", message: notReady(mapping, ready) };
+    const repo = github.repo(mapping.repo);
+    const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
+    if (!issue || issue.state !== "open") return { ok: false, code: "issue_not_open", message: "Only an open GitHub issue can be started." };
+    const baseBranch = await repo.defaultBranch();
+    const now = clock();
+    const job = store.insert({
+      id: `psi_${randomUUID()}` as JobId, repo: mapping.repo, issue: number,
+      trigger: { eventId: null, actor, at: now },
+      snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
+      projectId: mapping.projectId, hostId: mapping.hostId, baseBranch,
+      state: issue.subIssues > 0 ? "tracking" : "queued", error: null,
+    }, now) ?? store.open(mapping.repo, number);
+    if (!job) return { ok: false, code: "start_failed", message: "The issue could not be started. Refresh and try again." };
+    background(tick(job.id));
+    return { ok: true, id: job.id };
+  }
+
+  async function retry(id: JobId, by: string): Promise<StartResult> {
+    const job = store.get(id);
+    if (!job) return { ok: false, code: "job_not_found", message: `no issue job ${id}` };
+    if (job.phase.state !== "stuck" && job.phase.state !== "stopped") return { ok: false, code: "job_not_retryable", message: `${id} is ${job.phase.state}; only a stuck or stopped job can be retried` };
+    const mapping = deps.repos().find(({ repo }) => repo === job.repo);
+    if (!mapping) return { ok: false, code: "repo_not_configured", message: `${job.repo} is not configured for issue workers` };
+    const open = store.open(job.repo, job.issue);
+    if (open) return { ok: false, code: "issue_has_open_job", message: `${job.repo}#${job.issue} already has the open job ${open.id}` };
+    return admit(mapping, job.issue, by);
+  }
+
   const openJob = (threadId: string) => {
     const job = store.byThread(threadId);
     return job && !TERMINAL.has(job.phase.state) ? job : null;
@@ -1270,27 +1307,12 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!mapping) throw new Error("This repository is not configured for issue workers.");
       const existing = store.open(mapping.repo, number);
       if (existing) return existing.id;
-      const { primaryHostId } = await bb.sdk.system.config();
-      if (mapping.hostId !== null && mapping.hostId === primaryHostId) throw new Error("Map this repository to a worker host before starting an issue.");
-      const ready = await readiness(mapping);
-      if (ready.kind === "blocked") throw new Error(notReady(mapping, ready));
-      const repo = github.repo(mapping.repo);
-      const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
-      if (!issue || issue.state !== "open") throw new Error("Only an open GitHub issue can be started.");
-      const baseBranch = await repo.defaultBranch();
-      const now = clock();
-      const job = store.insert({
-        id: `psi_${randomUUID()}` as JobId, repo: mapping.repo, issue: number,
-        trigger: { eventId: null, actor: "the bb app", at: now },
-        snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
-        projectId: mapping.projectId, hostId: mapping.hostId, baseBranch,
-        state: issue.subIssues > 0 ? "tracking" : "queued", error: null,
-      }, now) ?? store.open(mapping.repo, number);
-      if (!job) throw new Error("The issue could not be started. Refresh and try again.");
-      background(tick(job.id));
-      return job.id;
+      const started = await admit(mapping, number, "the bb app");
+      if (!started.ok) throw new Error(started.message);
+      return started.id;
     },
-    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop }),
+    retry,
+    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop, retry }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
         bb.events.on(event, ({ thread }) => {
