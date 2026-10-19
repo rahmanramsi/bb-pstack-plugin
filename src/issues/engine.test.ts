@@ -351,11 +351,11 @@ test("a worker cannot stop jobs, and a thread naming a job that is not waiting f
   assert.deepEqual(h.stopped, ["thr_dup"]);
 });
 
-test("an unsupported worker role fails concretely before spawning", async () => {
+test("a queued job whose worker role became unsupported sticks concretely before spawning", async () => {
   for (const [role, reason] of [["codex/gpt-6.1-sol/extreme", /reasoning level "extreme"/], ["codex/gpt-missing/high", /codex\/gpt-missing\/high: not in the host's catalog/]] as const) {
     const h = harness();
+    h.queue(41);
     h.setWorkerRole(role);
-    h.label(41);
     await h.engine().issues.sweep();
     const job = await h.only();
     assert.equal(job.state, "stuck");
@@ -365,22 +365,58 @@ test("an unsupported worker role fails concretely before spawning", async () => 
   }
 });
 
+test("a pinned machine without the worker's model takes no label events, keeps polling its jobs, and starts each one once fixed", async () => {
+  const h = harness();
+  h.label(40);
+  await h.engine().issues.sweep();
+  const working = await h.only();
+  assert.equal(working.state, "working");
+
+  h.setWorkerRole("codex/gpt-missing/high");
+  h.clock.now += MIN;
+  h.label(41);
+  await h.settle();
+  assert.deepEqual((await h.views()).map((job) => job.issue), [40], "no job, not even a stuck one");
+  assert.equal(h.store.repoPoll(REPO).error, "issue worker cannot take new jobs on host_worker: codex/gpt-missing/high: not in the host's catalog");
+  assert.equal(h.store.jobPoll(working.id).polledAt, h.clock.now, "open jobs are still polled");
+  assert.match((await h.engine().run(["issues", "list"])).stdout!, /poll error: issue worker cannot take new jobs on host_worker: codex\/gpt-missing\/high/);
+  await assert.rejects(h.engine().issues.start(REPO, 41), /issue worker cannot take new jobs on host_worker/);
+
+  h.setWorkerRole("codex/gpt-6.1-sol/high");
+  h.clock.now += MIN;
+  await h.settle();
+  h.clock.now += MIN;
+  await h.settle();
+  const started = (await h.views()).filter((job) => job.issue === 41);
+  assert.deepEqual(started.map((job) => [job.state, job.triggeredBy]), [["working", "maya"]]);
+  const event = h.gh().events.get(41)!.filter((item) => item.label.name === "agent").at(-1)!;
+  assert.equal(h.store.byTrigger(event.id)!.id, started[0]!.id);
+  assert.equal(h.store.repoPoll(REPO).error, null);
+});
+
+test("a catalog that fails to load on the pinned machine takes no label events until it loads", async () => {
+  const h = harness();
+  h.failures.catalog = "codex/gpt-6.1-sol/high: could not load codex models: auth_required";
+  h.label(41);
+  await h.engine().issues.sweep();
+  assert.deepEqual(await h.views(), []);
+  assert.match(h.store.repoPoll(REPO).error!, /^issue worker cannot take new jobs on host_worker: .*could not load codex models/);
+
+  h.failures.catalog = null;
+  h.clock.now += MIN;
+  await h.engine().issues.sweep();
+  assert.equal((await h.only()).state, "working");
+  assert.equal(h.store.repoPoll(REPO).error, null);
+});
+
 test("queued jobs that cannot resolve their worker yet do not hold back a job that can", async () => {
   const h = harness();
-  h.setRepo({ repo: REPO, projectId: "prj_offline", hostId: "host_worker" });
-  for (const issue of [41, 42, 43]) h.label(issue);
-  await h.engine().issues.sweep();
-  const waiting = await h.views();
-  assert.deepEqual(waiting.map((job) => job.state), ["queued", "queued", "queued"]);
-  for (const job of waiting) assert.match(job.error!, /project settings are unavailable/);
-
-  h.setRepo({ repo: REPO, projectId: "prj_web", hostId: "host_worker" });
-  h.clock.now += MIN;
+  for (const issue of [41, 42, 43]) h.queue(issue, { projectId: "prj_offline" });
   h.label(44);
   await h.engine().issues.sweep();
-  const [newest] = await h.views();
-  assert.equal(newest!.issue, 44);
-  assert.equal(newest!.state, "working");
+  const views = (await h.views()).sort((a, b) => a.issue - b.issue);
+  assert.deepEqual(views.map((job) => [job.issue, job.state]), [[41, "queued"], [42, "queued"], [43, "queued"], [44, "working"]]);
+  for (const job of views.slice(0, 3)) assert.match(job.error!, /project settings are unavailable/);
 });
 
 test("an effect's handler has a probe exactly when its policy looks for a trace before running it again", () => {

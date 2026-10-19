@@ -66,6 +66,7 @@ import { acceptSync,
   type Sha,
   type SubIssue,
   type WorkerProblem,
+  type WorkerReadiness,
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore, Submission } from "./store.ts";
@@ -549,28 +550,46 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function resolveWorker(job: Job): Promise<WorkerSettings | WorkerProblem> {
-    const permanent = (error: string): WorkerProblem => ({ error, permanent: true });
+  /**
+   * Which worker a repository's new job would run, and whether it can: the first `issue worker` choice, with the
+   * project's defaults, and on a pinned machine that machine's catalog. Never throws and makes no GitHub call. The
+   * poll, a job, a start and doctor all ask it, so they agree on the tuple.
+   */
+  async function readiness(target: { projectId: string; hostId: string | null }): Promise<WorkerReadiness> {
+    const blocked = (error: string, tuple: string | null = null, permanent = true): WorkerReadiness => ({ kind: "blocked", permanent, error, tuple });
     const choice = deps.resolveRole("issue worker")[0];
-    if (!choice) return permanent("no model is configured for the issue worker role");
+    if (!choice) return blocked("no model is configured for the issue worker role");
+    let tuple = choice.kind === "tuple" ? `${choice.provider}/${choice.model}/${choice.reasoningLevel}` : null;
     try {
-      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: job.projectId });
+      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: target.projectId });
       const permissionMode = defaults?.permissionMode ?? null;
       let worker: WorkerSettings;
       if (choice.kind === "tuple") {
-        if (!isReasoningLevel(choice.reasoningLevel)) return permanent(`the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows`);
+        if (!isReasoningLevel(choice.reasoningLevel)) return blocked(`the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows`, tuple);
         worker = { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
       } else {
-        if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
+        if (!defaults) return blocked(`the issue worker role inherits the project's model, and project ${target.projectId} has no default`);
         worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
       }
+      tuple = `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`;
+      if (target.hostId === null) return { kind: "ready", worker, tuple };
+      const problem = await deps.checkWorker(target.hostId, tuple);
+      return problem ? blocked(problem, tuple) : { kind: "ready", worker, tuple };
+    } catch (error) {
+      return blocked(message(error), tuple, false);
+    }
+  }
+
+  async function resolveWorker(job: Job): Promise<WorkerSettings | WorkerProblem> {
+    const ready = await readiness({ projectId: job.projectId, hostId: job.host.pinned ? job.host.id : null });
+    if (ready.kind === "blocked") return { error: ready.error, permanent: ready.permanent };
+    const permanent = (error: string): WorkerProblem => ({ error, permanent: true });
+    try {
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       if (capabilities.archived) return permanent("the repository is archived");
       if (capabilities.defaultBranch !== job.baseBranch) return permanent("the configured base no longer matches the repository default branch");
       if (capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return permanent("the existing installation lacks publication grants");
-      if (!job.host.pinned) return worker;
-      const problem = await deps.checkWorker(job.host.id, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
-      return problem ? permanent(problem) : worker;
+      return ready.worker;
     } catch (error) {
       return { error: message(error), permanent: error instanceof GitHubSetupError || error instanceof GitHubPermanentError };
     }
@@ -1121,6 +1140,9 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  const notReady = (mapping: RepoMapping, ready: Extract<WorkerReadiness, { kind: "blocked" }>) =>
+    `issue worker${ready.tuple && !ready.error.includes(ready.tuple) ? ` ${ready.tuple}` : ""} cannot take new jobs${mapping.hostId ? ` on ${mapping.hostId}` : ""}: ${ready.error}`;
+
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
     const now = clock();
     let cursor = store.repoPoll(mapping.repo).poll as PollCursor | null;
@@ -1130,10 +1152,15 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     const repo = github.repo(mapping.repo);
     const errors: string[] = [];
-    try {
-      cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
-    } catch (error) {
-      errors.push(message(error));
+    // The cursor stays put while the worker cannot run, so the label events it skips are read again once it can.
+    const ready = await readiness(mapping);
+    if (ready.kind === "blocked") errors.push(notReady(mapping, ready));
+    else {
+      try {
+        cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
+      } catch (error) {
+        errors.push(message(error));
+      }
     }
     try {
       await pollJobs(repo);
@@ -1245,6 +1272,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (existing) return existing.id;
       const { primaryHostId } = await bb.sdk.system.config();
       if (mapping.hostId !== null && mapping.hostId === primaryHostId) throw new Error("Map this repository to a worker host before starting an issue.");
+      const ready = await readiness(mapping);
+      if (ready.kind === "blocked") throw new Error(notReady(mapping, ready));
       const repo = github.repo(mapping.repo);
       const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
       if (!issue || issue.state !== "open") throw new Error("Only an open GitHub issue can be started.");

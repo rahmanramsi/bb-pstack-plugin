@@ -380,6 +380,14 @@ export type ThreadFact =
  */
 export type WorkerProblem = { error: string; permanent: boolean };
 
+/**
+ * Whether a repository's next job can get a worker. `permanent: false` when the answer could not be observed, such as
+ * a catalog that failed to load; true when an operator must change the configuration. `tuple` is null until known.
+ */
+export type WorkerReadiness =
+  | { kind: "ready"; worker: WorkerSettings; tuple: string }
+  | { kind: "blocked"; permanent: boolean; error: string; tuple: string | null };
+
 export type GateFact = { pass: true } | { pass: false; reason: string };
 
 /** The machine an automatic job's next worker spawns on, or why no machine can run it yet. */

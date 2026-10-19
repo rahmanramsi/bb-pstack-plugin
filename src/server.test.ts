@@ -94,7 +94,14 @@ test("an unusable GitHub App private key shows as the repository's poll error", 
   const { bb, harness } = createFakePluginHost({
     pluginId: "pstack",
     settings: { githubAppId: "123", githubPrivateKey: Buffer.from("not a key").toString("base64"), issueRepos: "acme/web project=prj_web host=host_worker" },
-    sdk: { system: { config: async () => ({ primaryHostId: "host_server" }) as never } },
+    sdk: {
+      system: { config: async () => ({ primaryHostId: "host_server" }) as never },
+      projects: { defaultExecutionOptions: async () => null },
+      providers: {
+        list: async () => [{ id: "codex", available: true }] as never,
+        models: async () => ({ models: [{ model: "gpt-6.1-sol", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] }] }) as never,
+      },
+    },
   });
   await plugin(bb);
   const service = harness.runService("pstack-issues");
