@@ -6,6 +6,7 @@ import {
   failedChecks,
   providerIds,
   renderChecks,
+  workerProblem,
   type Catalog,
 } from "./doctor.ts";
 
@@ -55,4 +56,11 @@ test("a multi-line detail stays on its check's line", () => {
     { ok: false, subject: "bug-fix: x/y/z", detail: "boom\n  at stack\n" },
   ]);
   assert.equal(rendered, "FAIL  bug-fix: x/y/z  (boom at stack)");
+});
+
+test("a worker tuple is a problem when the host lacks it, and unknown when its provider's models failed to load", () => {
+  assert.equal(workerProblem("codex/gpt-6.1-sol/xhigh", catalog), null);
+  assert.equal(workerProblem("pi/m/low", catalog), 'pi/m/low: provider "pi" is not installed');
+  assert.match(workerProblem("codex/gpt-9/low", catalog)!, /has no model "gpt-9"/);
+  assert.throws(() => workerProblem("claude-code/m/low", catalog), /could not load claude-code models: auth_required/);
 });

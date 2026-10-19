@@ -56,6 +56,17 @@ export function checkTuple(value: string, catalog: Catalog): Verdict {
   }
 }
 
+/**
+ * Why a host with `catalog` cannot run `tuple`, or null when it can. Throws when the provider's models failed to load,
+ * which says nothing about the tuple.
+ */
+export function workerProblem(tuple: string, catalog: Catalog): string | null {
+  const check = checkTuple(tuple, catalog);
+  if (check.ok) return null;
+  if (catalog.get(tuple.split("/")[0]!)?.state === "error") throw new Error(`${tuple}: ${check.detail}`);
+  return `${tuple}: ${check.detail}`;
+}
+
 export function checkRoles(roles: readonly EffectiveRole[], catalog: Catalog): Check[] {
   return roles.flatMap((role) =>
     role.models.map((value) => ({

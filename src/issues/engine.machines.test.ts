@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MIN, REPO, SHA3, harness, type Machine } from "./engine-harness.ts";
 import { FEEDBACK_QUIET_MS } from "./job.ts";
+import { workerProblem, type Catalog } from "../doctor.ts";
 
 function automatic(machines: Record<string, Machine>) {
   const h = harness();
@@ -119,4 +120,25 @@ test("a pinned repository's job runs on its machine even when another has more r
   assert.deepEqual(job.host, { id: "host_worker", pinned: true });
   assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}working {2}on host_worker {2}thr_/);
   assert.match((await h.engine().run(["issues", "show", job.id])).stdout!, /machine {7}host_worker \(pinned by issueRepos\)\n/);
+});
+
+test("doctor checks the issue worker once per pinned machine and tuple, and fails a machine without the provider", async () => {
+  const web = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
+  const repos = [web, { ...web, repo: "acme/api" as typeof REPO }, { ...web, repo: "acme/docs" as typeof REPO, hostId: null }];
+  let catalog: Catalog = new Map([["codex", { state: "ok", models: [{ model: "gpt-6.1-sol", levels: ["high"] }] }]]);
+  const h = harness({
+    configureDeps: (deps) => {
+      deps.repos = () => repos;
+      deps.checkWorker = async (_hostId, tuple) => workerProblem(tuple, catalog);
+    },
+  });
+  assert.deepEqual(await h.engine().issues.workerChecks(), [{ ok: true, subject: "issue worker on host_worker (acme/web, acme/api): codex/gpt-6.1-sol/high", detail: "available" }]);
+
+  catalog = new Map();
+  assert.deepEqual(await h.engine().issues.workerChecks(), [{ ok: false, subject: "issue worker on host_worker (acme/web, acme/api): codex/gpt-6.1-sol/high", detail: 'codex/gpt-6.1-sol/high: provider "codex" is not installed' }]);
+
+  catalog = new Map([["codex", { state: "error", detail: "auth_required" }]]);
+  const [unknown] = await h.engine().issues.workerChecks();
+  assert.equal(unknown!.ok, false);
+  assert.match(unknown!.detail, /^could not check: codex\/gpt-6.1-sol\/high: could not load codex models: auth_required/);
 });

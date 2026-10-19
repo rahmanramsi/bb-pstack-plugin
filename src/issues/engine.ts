@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import type { Check } from "../doctor.ts";
 import type { HostPush, HostInspectCommit } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { hostId, pickHost, type Facts as PlacementFacts, type Hold, type HostId } from "../placement.ts";
@@ -118,6 +119,8 @@ export type Issues = {
   instructions(threadId: string): string | null;
   /** One pass of the service: poll every repository, reconcile every job that may act, and wait for any reconcile in flight. */
   sweep(): Promise<void>;
+  /** One doctor check per pinned machine and issue worker tuple, naming the repositories mapped to it. */
+  workerChecks(): Promise<Check[]>;
   /** Starts a new job for the issue of a stuck or stopped job, when the issue has no open job. */
   retry(id: JobId, by: string): Promise<StartResult>;
   /** Moves the job to stopping and starts its ending effects. False when it already ended or is ending, or does not exist. */
@@ -1312,6 +1315,20 @@ export function createIssues(deps: IssuesDeps): Issues {
       return started.id;
     },
     retry,
+    async workerChecks() {
+      const pinned = deps.repos().filter((mapping) => mapping.hostId !== null);
+      const results = await Promise.all(pinned.map(async (mapping) => ({ mapping, ready: await readiness(mapping) })));
+      const checks = new Map<string, { host: string; tuple: string | null; repos: string[]; ok: boolean; detail: string }>();
+      for (const { mapping, ready } of results) {
+        const key = `${mapping.hostId} ${ready.tuple}`;
+        const detail = ready.kind === "ready" ? "available" : ready.permanent ? ready.error : `could not check: ${ready.error}`;
+        const check = checks.get(key) ?? { host: mapping.hostId!, tuple: ready.tuple, repos: [], ok: true, detail };
+        check.repos.push(mapping.repo);
+        if (check.ok && ready.kind === "blocked") Object.assign(check, { ok: false, detail });
+        checks.set(key, check);
+      }
+      return [...checks.values()].map(({ host, tuple, repos, ok, detail }) => ({ ok, subject: `issue worker on ${host} (${repos.join(", ")})${tuple ? `: ${tuple}` : ""}`, detail }));
+    },
     commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop, retry }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
