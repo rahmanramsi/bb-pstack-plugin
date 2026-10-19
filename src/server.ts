@@ -258,6 +258,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (catalog.get(provider)?.state === "error") throw new Error(`${tuple}: ${check.detail}`);
       return `${tuple}: ${check.detail}`;
     },
+    machines: (query) => placement.facts(query),
   });
   issues.register();
 

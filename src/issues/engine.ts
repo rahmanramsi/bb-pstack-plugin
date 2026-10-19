@@ -13,6 +13,7 @@ import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import type { HostPush, HostInspectCommit } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
+import { hostId, pickHost, type Facts as PlacementFacts, type Hold, type HostId } from "../placement.ts";
 import { repoFromRemote } from "../gh/commands.ts";
 import { createStatusDelivery } from "./delivery.ts";
 import { issueCommands, type RepoMapping } from "./commands.ts";
@@ -43,6 +44,8 @@ import { acceptSync,
   counts,
   moreFacts,
   isReasoningLevel,
+  needsMachine,
+  owesSpawn,
   plan,
   settle,
   stop as stopChange,
@@ -96,6 +99,8 @@ export type IssuesDeps = {
    * while the host is offline.
    */
   checkWorker: (hostId: string, tuple: string) => Promise<string | null>;
+  /** Placement's facts for a worker on any machine with a worktree of the project and `provider/model` at `level`. */
+  machines: (query: { projectId: string; model: string; level: string }) => Promise<PlacementFacts>;
   /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
   activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
@@ -139,6 +144,13 @@ function isTransientObservation(error: unknown): boolean {
 const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; environmentId: string; branch: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
+
+type MachineInputs = { facts: PlacementFacts; model: string; exclude: ReadonlyMap<HostId, string> } | { error: string };
+
+function workerHost(job: Job): string {
+  if (job.host.id === null) throw new Error(`issue job ${job.id} has no machine yet`);
+  return job.host.id;
+}
 
 /** `deadline` is when the claim's lease ends, less a margin to settle; every call the effect makes ends by then. */
 type Run<Op extends EffectOp> = (job: Job, effect: Extract<Effect, { op: Op }>, deadline: number) => Promise<EffectOutcome>;
@@ -226,10 +238,10 @@ export function createIssues(deps: IssuesDeps): Issues {
     if (!thread.environmentId) return { ok: false, transient: true, error: "the worker's worktree is not ready" };
     const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) }).catch((error) => { if (isMissing(error)) return null; throw error; });
     if (!environment || environment.status === "error" || environment.status === "destroyed") return { ok: false, transient: false, error: `the worker environment is ${environment?.status ?? "missing"}; original work location retained` };
-    if (environment.hostId !== job.hostId) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the mapped host ${job.hostId}` };
+    if (environment.hostId !== workerHost(job)) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the job's machine ${workerHost(job)}` };
     if (environment.status === "creating" || environment.status === "provisioning") return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
     if (!environment.path) return { ok: false, transient: false, error: "the ready worker environment has no workspace path" };
-    const origin = await deps.inspectOrigin(job.hostId, environment.path);
+    const origin = await deps.inspectOrigin(workerHost(job), environment.path);
     if (!origin || repoFromRemote(origin) !== job.repo.toLowerCase()) return { ok: false, transient: false, error: "the recorded workspace origin does not match the authorized repository" };
     const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
     if (status.outcome === "unavailable") return { ok: false, transient: status.failure.code === "unknown", error: `the worktree status is unavailable: ${status.failure.message}` };
@@ -279,7 +291,7 @@ export function createIssues(deps: IssuesDeps): Issues {
             visibility: "visible",
             // Not the project's worktree base: the first worker starts from the ref report validation counts new
             // commits against, so a fresh worktree has nothing ahead of it; a replacement starts from the pushed branch.
-            environment: { type: "host", hostId: job.hostId, workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: spec.baseRef } } },
+            environment: { type: "host", hostId: workerHost(job), workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: spec.baseRef } } },
             pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch },
             prompt: spec.prompt,
             title: spec.title,
@@ -292,7 +304,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           const environment = worker.environmentId ? await bb.sdk.environments.get({ environmentId: worker.environmentId }) : null;
           const tree = await worktree({ ...job, threadId: thread.id });
           if (!tree.ok && !tree.transient) return { kind: "fail", error: tree.error };
-          const control = tree.ok && worker.environmentId ? { ...job.control, workspace: { environmentId: worker.environmentId, hostId: environment?.hostId ?? job.hostId, path: tree.path, branch: tree.branch } } : job.control;
+          const control = tree.ok && worker.environmentId ? { ...job.control, workspace: { environmentId: worker.environmentId, hostId: environment?.hostId ?? workerHost(job), path: tree.path, branch: tree.branch } } : job.control;
           return done({ threadId: thread.id, control });
         } catch (error) {
           return { kind: "unknown", error: `spawn: ${message(error)}` };
@@ -315,14 +327,14 @@ export function createIssues(deps: IssuesDeps): Issues {
         const capabilities = await repo.capabilities({ fresh: true });
         if (capabilities.archived || capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return { kind: "fail", error: "publication requires existing contents and pull requests write grants on an active repository", publicFailure: { kind: "publication-denied" } };
         const comparisonSha = job.report?.outcome === "changes" && job.report.headSha === effect.sha && job.report.comparisonSha ? job.report.comparisonSha : capabilities.defaultHead;
-        const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: effect.sha, comparisonSha, publishedSha: effect.expectedRemoteSha }, until(deadline));
+        const inspected = await deps.inspectCommit(workerHost(job), { worktreePath: tree.path, sha: effect.sha, comparisonSha, publishedSha: effect.expectedRemoteSha }, until(deadline));
         if (inspected.kind !== "inspected") return { kind: "fail", error: `publication commit ${inspected.sha} is unavailable; original workspace retained` };
         if (!inspected.nonemptyDiff) return { kind: "fail", error: "the pinned publication has no changes against its comparison commit" };
         if (inspected.workflows && capabilities.permissions.workflows !== "write") return { kind: "fail", error: "workflow changes require workflows write, which is not already granted; commits retained", publicFailure: { kind: "workflow-permission" } };
         const { remoteUrl, token } = await repo.pushCredentials({ workflows: inspected.workflows });
         try {
           const input = { worktreePath: tree.path, remoteUrl, branch: job.branch, sha: effect.sha, expectedRemoteSha: effect.expectedRemoteSha, comparisonSha, workflows: inspected.workflows, token };
-          const result = await deps.hostPush(job.hostId, input, until(deadline - REVOKE_MS));
+          const result = await deps.hostPush(workerHost(job), input, until(deadline - REVOKE_MS));
           if (result.status === "pushed") return done({ pushedSha: effect.sha });
           // A claim whose lease ran out may still be pushing the same commit, and its push can land first.
           if (result.status === "rejected" && (result.reason === "stale-remote" || result.reason === "not-descendant")) {
@@ -556,7 +568,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (capabilities.archived) return permanent("the repository is archived");
       if (capabilities.defaultBranch !== job.baseBranch) return permanent("the configured base no longer matches the repository default branch");
       if (capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return permanent("the existing installation lacks publication grants");
-      const problem = await deps.checkWorker(job.hostId, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
+      if (!job.host.pinned) return worker;
+      const problem = await deps.checkWorker(job.host.id, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
       return problem ? permanent(problem) : worker;
     } catch (error) {
       return { error: message(error), permanent: error instanceof GitHubSetupError || error instanceof GitHubPermanentError };
@@ -582,8 +595,31 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  async function machineInputs(job: Job, worker: WorkerSettings): Promise<MachineInputs> {
+    const model = `${worker.providerId}/${worker.model}`;
+    try {
+      const [facts, { primaryHostId }] = await Promise.all([deps.machines({ projectId: job.projectId, model, level: worker.reasoningLevel }), bb.sdk.system.config()]);
+      return { facts, model, exclude: new Map(primaryHostId ? [[hostId.parse(primaryHostId), "the bb server's machine"]] : []) };
+    } catch (error) {
+      return { error: `could not read the machines: ${message(error)}` };
+    }
+  }
+
+  async function machineFor(job: Job, facts: Facts): Promise<MachineInputs | null> {
+    const worker = needsMachine(job, facts);
+    return worker ? await machineInputs(job, worker) : null;
+  }
+
+  function pickNow(facts: Facts, machine: MachineInputs | null): Facts {
+    if (!machine) return facts;
+    if ("error" in machine) return { ...facts, machine: { wait: machine.error } };
+    const holds = store.list({ all: false }).flatMap((row): Hold[] => (owesSpawn(row) && row.host.id !== null ? [{ hostId: hostId.parse(row.host.id), threadId: null, settledAt: null }] : []));
+    const pick = pickHost(machine.facts, holds, { model: machine.model }, machine.exclude, facts.now);
+    return { ...facts, machine: pick.hostId === null ? { wait: pick.why } : { hostId: pick.hostId } };
+  }
+
   async function gather(job: Job, observations?: { review: boolean }): Promise<Facts> {
-    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, machine: null };
     const unobserved = new Set<number>();
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
@@ -708,11 +744,8 @@ export function createIssues(deps: IssuesDeps): Issues {
     }));
   }
 
-  async function apply(job: Job, action: Exclude<Action, { type: "sleep" }>): Promise<void> {
+  async function apply(job: Job, action: Exclude<Action, { type: "sleep" | "change" }>): Promise<void> {
     switch (action.type) {
-      case "change":
-        store.write(job.id, job.version, action.change, clock());
-        return;
       case "nudge": {
         store.write(job.id, job.version, { ...action.change, phase: enter("recovering", [{ op: "send-round", key: `nudge:${job.id}:${job.version}`, text: action.text }]) }, clock());
         return;
@@ -744,15 +777,21 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (result.code === "worker-action") {
           const current = store.get(id);
           if (!current) return;
-          const action = plan(current, await gather(current, observations));
+          const facts = await gather(current, observations);
+          const machine = await machineFor(current, facts);
+          const action = plan(current, pickNow(facts, machine));
           if (!action || action.type === "sleep") return;
-          await apply(current, action);
+          if (action.type === "change") store.write(current.id, current.version, action.change, clock());
+          else await apply(current, action);
         }
         continue;
       }
-      const action = plan(job, await gather(job, observations));
+      const facts = await gather(job, observations);
+      const machine = await machineFor(job, facts);
+      const action = plan(job, pickNow(facts, machine));
       if (!action || action.type === "sleep") return;
-      await apply(job, action);
+      if (action.type === "change") store.write(job.id, job.version, action.change, clock());
+      else await apply(job, action);
     }
   }
 
@@ -804,7 +843,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       const comparisonSha = capabilities.defaultHead;
       const ancestorShas = [...new Set([capabilities.defaultHead, ...job.control.prerequisites.map((prerequisite) => prerequisite.sha), ...(job.roundBase ? [job.roundBase] : []), ...(job.control.publicationRepair ? [job.control.publicationRepair.acceptedSha] : [])])];
-      const inspected = await deps.inspectCommit(job.hostId, { worktreePath: tree.path, sha: tree.headSha, comparisonSha, publishedSha: job.roundBase ?? remoteHead, ancestorShas });
+      const inspected = await deps.inspectCommit(workerHost(job), { worktreePath: tree.path, sha: tree.headSha, comparisonSha, publishedSha: job.roundBase ?? remoteHead, ancestorShas });
       if (inspected.kind !== "inspected") return { unavailable: `missing local commit object ${inspected.sha}`, disposition: "worker", sha: inspected.sha as Sha };
       if (ancestorShas.some((sha) => !inspected.ancestry?.some((proof) => proof.sha === sha))) return { unavailable: "the host did not establish the requested Git ancestry", disposition: "retry" };
       const gate = job.threadId ? deps.prGate(job.threadId) : { pass: false as const, reason: "the job has no worker thread" };
@@ -896,7 +935,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       let control = job.control;
       try {
         const tree = await worktree(job);
-        if (tree.ok) { headSha = tree.headSha; control = { ...control, workspace: { environmentId: tree.environmentId, hostId: job.hostId, path: tree.path, branch: tree.branch }, preservation: tree.dirty ? "dirty and untracked work retained" : "local commits retained" }; }
+        if (tree.ok) { headSha = tree.headSha; control = { ...control, workspace: { environmentId: tree.environmentId, hostId: workerHost(job), path: tree.path, branch: tree.branch }, preservation: tree.dirty ? "dirty and untracked work retained" : "local commits retained" }; }
         else control = { ...control, preservation: tree.error };
       } catch (error) { control = { ...control, preservation: message(error) }; }
       const change = stick({ ...job, control }, report.reason, { kind: "report", reason: report.reason });
@@ -1072,7 +1111,7 @@ export function createIssues(deps: IssuesDeps): Issues {
           snapshot: { title: child.title, body: child.body, url: child.url, author: child.author, parent: { number: parent.issue, title, body, url } },
           parentId: parent.id,
           projectId: parent.projectId,
-          hostId: parent.hostId,
+          hostId: parent.host.pinned ? parent.host.id : null,
           baseBranch,
           state: "queued",
           error: null,
@@ -1085,7 +1124,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
     const now = clock();
     let cursor = store.repoPoll(mapping.repo).poll as PollCursor | null;
-    if (mapping.hostId === primaryHostId) {
+    if (mapping.hostId !== null && mapping.hostId === primaryHostId) {
       store.saveRepoPoll(mapping.repo, cursor, now, `host ${mapping.hostId} is the bb server's machine; map ${mapping.repo} to another host`);
       return;
     }
@@ -1205,7 +1244,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       const existing = store.open(mapping.repo, number);
       if (existing) return existing.id;
       const { primaryHostId } = await bb.sdk.system.config();
-      if (mapping.hostId === primaryHostId) throw new Error("Map this repository to a worker host before starting an issue.");
+      if (mapping.hostId !== null && mapping.hostId === primaryHostId) throw new Error("Map this repository to a worker host before starting an issue.");
       const repo = github.repo(mapping.repo);
       const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
       if (!issue || issue.state !== "open") throw new Error("Only an open GitHub issue can be started.");

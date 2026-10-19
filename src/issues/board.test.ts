@@ -54,6 +54,7 @@ test("the list board shows every configured repository, with or without jobs, an
   assert.equal(job.title, "Submit button hides behind the footer");
   assert.equal(job.state, "working");
   assert.equal(job.threadId, "thr_worker");
+  assert.deepEqual(job.host, { id: "host_1", pinned: true });
   assert.deepEqual(job.poll, { polledAt: 12, error: "GitHub GET /repos/acme/web/issues/41: 502" });
 });
 

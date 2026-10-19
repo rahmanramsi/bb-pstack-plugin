@@ -16,6 +16,8 @@ import {
   counts,
   enter,
   isReasoningLevel,
+  needsMachine,
+  owesSpawn,
   plan,
   settle,
   stop,
@@ -52,7 +54,7 @@ function job(overrides: Partial<Job> = {}): Job {
     trigger: { eventId: 900, actor: "maya", at: NOW - MIN },
     snapshot: { title: "Submit button hides behind the footer", body: "On 375px the footer covers it.", url: "https://github.com/acme/web/issues/41", author: "maya" },
     projectId: "prj_1",
-    hostId: "host_1",
+    host: { pinned: true, id: "host_1" },
     baseBranch: "main",
     branch: branchFor(41, "Submit button hides behind the footer", 1),
     phase: { state: "queued" },
@@ -75,7 +77,7 @@ function job(overrides: Partial<Job> = {}): Job {
   };
 }
 
-const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, ...overrides });
+const facts = (overrides: Partial<Facts> = {}): Facts => ({ now: NOW, worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, machine: null, ...overrides });
 
 function transit(state: Exclude<Phase["state"], "queued">, effects: Effect[], bookkeeping: Partial<{ tries: number; firstAt: number; leaseUntil: number; nextAt: number }> = {}): Phase {
   const phase = enter(state as never, effects);
@@ -113,6 +115,46 @@ test("a queued job starts only with resolved worker settings, labelling before i
   assert.deepEqual(started.phase.effects.map((effect) => effect.op), ["spawn"]);
   const spawn = started.phase.effects[0];
   assert.equal(spawn.op === "spawn" && spawn.spec.model, "gpt-6.1-sol");
+  assert.equal("hostId" in (action as { change: Change }).change, false, "a pinned job's machine never moves");
+});
+
+const AUTO = { pinned: false, id: null } as const;
+
+test("an automatic job starts on the machine picked for it, and waits with the reason, never stuck, while none is eligible", () => {
+  const queued = job({ host: AUTO });
+  assert.deepEqual(needsMachine(queued, facts({ worker: WORKER })), WORKER);
+  assert.equal(plan(queued, facts({ worker: WORKER })), null, "no machine fact gathered, nothing to decide");
+
+  const reason = "no machine is eligible: mini: no checkout of this project";
+  assert.deepEqual(plan(queued, facts({ worker: WORKER, machine: { wait: reason } })), { type: "change", change: { error: reason } });
+  assert.equal(plan(job({ host: AUTO, error: reason }), facts({ worker: WORKER, machine: { wait: reason } })), null);
+
+  const action = plan(job({ host: AUTO, error: reason }), facts({ worker: WORKER, machine: { hostId: "host_b" } }));
+  const change = (action as { change: Change }).change;
+  assert.equal(change.hostId, "host_b");
+  assert.equal(change.error, null);
+  assert.equal(change.phase?.state, "starting");
+});
+
+test("a machine is picked only for an automatic job whose next step spawns a worker", () => {
+  const auto = job({ host: AUTO });
+  assert.equal(needsMachine(job(), facts({ worker: WORKER })), null, "pinned");
+  assert.equal(needsMachine(auto, facts({ worker: WORKER, blockers: ["#51"] })), null, "blocked");
+  assert.deepEqual(needsMachine(auto, facts({ worker: WORKER, blockers: [] })), WORKER, "unblocked");
+  assert.equal(needsMachine(auto, facts({ worker: { error: "project settings are unavailable", permanent: false } })), null, "no worker");
+  assert.equal(needsMachine(auto, facts()), null, "worker not gathered");
+  assert.equal(needsMachine(job({ host: { pinned: false, id: "host_b" }, phase: { state: "working" }, threadId: "thr_w", worker: WORKER }), facts({ thread: { kind: "gone" } })), null, "working");
+});
+
+test("an outbox owes a spawn until the spawn settles, and a stop drops the debt", () => {
+  assert.equal(owesSpawn(job()), false);
+  const starting = job({ phase: transit("starting", [labelEffect, spawnEffect], { tries: 3 }) });
+  assert.equal(owesSpawn(starting), true);
+  assert.equal(owesSpawn(job({ phase: transit("starting", [spawnEffect], { tries: 1 }) })), true);
+  const checkEffect: Effect = { op: "check-worktree", key: "check-worktree:x", base: HEAD };
+  assert.equal(owesSpawn(job({ phase: transit("respawning", [labelEffect, spawnEffect, checkEffect]) })), true);
+  assert.equal(owesSpawn(job({ phase: transit("respawning", [checkEffect]) })), false);
+  assert.equal(owesSpawn(apply(starting, stop(starting, "maya")!)), false);
 });
 
 test("the head effect is performed first, probed after a claim, and never touched under a lease or backoff", () => {
@@ -469,6 +511,7 @@ test("an unavailable feedback worker enters confirmed-stop recovery in the recor
   assert.ok(action.change.phase && "effects" in action.change.phase);
   assert.deepEqual(action.change.phase.effects.map((effect) => effect.op), ["stop-thread", "recover-worker"]);
   assert.equal(action.change.startRound?.ordinal, 2);
+  assert.equal("hostId" in action.change, false, "a replacement reuses the worker's workspace on its machine");
 });
 
 test("feedback after the fifth feedback round sticks the job instead of starting a sixth", () => {

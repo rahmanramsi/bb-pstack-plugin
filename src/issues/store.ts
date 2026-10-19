@@ -44,7 +44,8 @@ export type NewJob = {
   /** Set for a sub-issue's job, whose trigger has no event. */
   parentId?: JobId;
   projectId: string;
-  hostId: string;
+  /** The repository's pin, or null when the job's machine is picked as it starts. A sub-issue's job copies its parent's. */
+  hostId: string | null;
   baseBranch: string;
   /** `ignored` carries its reason in `error`. */
   /** `tracking` for an issue with sub-issues. */
@@ -138,6 +139,7 @@ type JobRow = {
   issue_json: string;
   project_id: string;
   host_id: string;
+  host_pinned: 0 | 1;
   base_branch: string;
   branch: string;
   state: JobState;
@@ -196,6 +198,9 @@ const parseFeedback = (row: FeedbackRow): Feedback => ({
   postedAt: row.posted_at ?? row.created_at,
 });
 
+/** SQLite cannot drop host_id's NOT NULL without rebuilding the table, so an automatic job not started yet stores this. */
+const NO_HOST = "";
+
 function parsePhase(row: JobRow): Phase {
   if (!isTransit(row.state)) return { state: row.state };
   const effects = JSON.parse(row.effects_json ?? "[]") as Effect[];
@@ -224,7 +229,7 @@ function parse(row: JobRow): Job {
     parentId: row.parent_id as JobId | null,
     progress: row.progress,
     projectId: row.project_id,
-    hostId: row.host_id,
+    host: row.host_pinned ? { pinned: true, id: row.host_id } : { pinned: false, id: row.host_id === NO_HOST ? null : row.host_id },
     baseBranch: row.base_branch,
     branch: row.branch as BranchName,
     phase: parsePhase(row),
@@ -272,6 +277,7 @@ function columns(change: Change): Record<string, unknown> {
   if (change.worker !== undefined) set.worker_json = JSON.stringify(change.worker);
   if (change.roundBase !== undefined) set.round_base = change.roundBase;
   if (change.progress !== undefined) set.progress = change.progress;
+  if (change.hostId !== undefined) set.host_id = change.hostId;
   return set;
 }
 
@@ -329,8 +335,8 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     const generation = earlier + 1;
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, base_branch, branch, state, error, created_at, updated_at, parent_id, runtime_protocol)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, runtime_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     ).run(
       job.id,
       job.repo,
@@ -341,7 +347,8 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       job.trigger.at,
       JSON.stringify(job.snapshot),
       job.projectId,
-      job.hostId,
+      job.hostId ?? NO_HOST,
+      job.hostId === null ? 0 : 1,
       job.baseBranch,
       branchFor(job.issue, job.snapshot.title, generation),
       job.state,

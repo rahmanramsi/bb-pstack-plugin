@@ -4,7 +4,7 @@ import { issueEntries, issuePath, matchesIssue, type CatalogIssue } from "./issu
 import { issueNotes, issueStatus, type IssueJob } from "./layout.ts";
 
 const issue: CatalogIssue = { repo: "acme/web", issue: 41, title: "Fix mobile navigation", issueUrl: "https://github.com/acme/web/issues/41", state: "open", labels: ["bug"], updatedAt: 100, body: "Description", author: "maya", assignees: ["maya"], startError: null };
-const job: IssueJob = { id: "psi_00000000-0000-0000-0000-000000000001", repo: issue.repo, issue: 41, title: issue.title, issueUrl: issue.issueUrl, state: "working", next: null, triggeredBy: "maya", branch: "agent/issue-41", parentId: null, threadId: "thr_worker", pr: null, pushedSha: null, round: 1, summary: null, outcome: null, limitation: null, delivery: { pending: false, error: null }, error: null, createdAt: 1, updatedAt: 100, poll: { polledAt: 100, error: null } };
+const job: IssueJob = { id: "psi_00000000-0000-0000-0000-000000000001", repo: issue.repo, issue: 41, title: issue.title, issueUrl: issue.issueUrl, state: "working", next: null, triggeredBy: "maya", branch: "agent/issue-41", host: { id: "host_worker", pinned: true }, parentId: null, threadId: "thr_worker", pr: null, pushedSha: null, round: 1, summary: null, outcome: null, limitation: null, delivery: { pending: false, error: null }, error: null, createdAt: 1, updatedAt: 100, poll: { polledAt: 100, error: null } };
 
 test("issue details use separate owner and repository route segments", () => {
   assert.equal(issuePath(issue), "issue/acme/web/41");

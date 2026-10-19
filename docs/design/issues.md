@@ -77,12 +77,23 @@ A person does this once.
 ```sh
 bb plugin config pstack set githubAppId 123456
 bb plugin config pstack set githubPrivateKey "$(base64 -w0 app.private-key.pem)"   # secret
-bb plugin config pstack set issueRepos "acme/web project=proj_abc host=host_def"
+bb plugin config pstack set issueRepos "acme/web project=proj_abc host=host_def
+acme/api project=proj_xyz"
 ```
 
-Each `issueRepos` line maps one repository to the bb project that holds its checkout and the host that runs its workers. The host must not be the server machine.
+Each `issueRepos` line maps one repository to the bb project that holds its checkout. `host=<hostId>` pins the repository's workers to one machine, which must not be the server machine. Without `host=`, or with `host=auto`, the service picks a machine for each job when the job starts.
 
 pstack never asks for more permissions and never prompts for credentials. Before a job starts, pstack reads the installation's grants. An archived repository, a default branch that no longer matches the job's base, or missing contents or pull requests write fails the job before any worker starts.
+
+## Choosing a machine
+
+A pinned job copies its machine from `host=` when its row is inserted, and a sub-issue's job copies its parent's pin. For a pinned job, pstack checks the worker's `provider/model/level` against that machine's provider catalog before the start.
+
+An automatic job has no machine until it starts. `pickHost` in `src/placement.ts` picks one from the same facts `bb pstack spawn` reads, through the shared `Placement` and its 30 s cache. A machine is eligible when it is connected and active with a known concurrency limit, has a checkout of the project with an available `git-worktree` provider, has the worker's model at its reasoning level in its catalog, and is not the server's machine. Capacity never makes a machine ineligible, because bb queues a thread that is over a limit. It ranks eligible machines by the most headroom (limit minus running threads minus pending spawns, which can go below zero), then by the larger free share of the limit, then by name. When no machine is eligible, the job stays `queued` with an error that names each machine's first problem, and the next sweep tries again.
+
+The `start()` change that queues the spawn also writes the picked machine, so the spawn, the worktree checks, the inspections and the push all read one machine from the row, and the machine is set before the spawn is claimed. The machine never changes after that: recovery reuses the worker's environment on the same machine.
+
+Jobs that start in the same sweep spread out. An open job whose outbox still holds a spawn counts against its machine until the spawn settles, and from then its thread counts as running. The engine picks and writes the change that records the pick with no `await` between them, so each pick counts the jobs picked before it in the sweep. The count lives in the rows, so it survives a restart.
 
 ## Triggers and stopping
 
@@ -296,8 +307,8 @@ A delivery error is stored on the row and shown in the app and in `issues show`.
 ## Inspecting jobs
 
 ```sh
-bb pstack issues list                 # each repository's last poll and its error, then its jobs
-bb pstack issues show <job>           # thread, pull request, outcome, limitation, delivery, last error, and last polls
+bb pstack issues list                 # each repository's last poll and its error, then its jobs and their machines
+bb pstack issues show <job>           # machine, thread, pull request, outcome, limitation, delivery, last error, and last polls
 bb pstack issues stop <job>
 ```
 
@@ -333,7 +344,7 @@ The migrations in `src/store.ts` hold these tables:
 
 - `issue_repos`: each repository's label poll cursor, last poll time, and last poll error.
 - `issue_job_polls`: each job's poll cursor, its pull request's last state, and its last poll error.
-- `issue_jobs`: one row per job. It holds the trigger, the issue snapshot, project, host, branch, state, the outbox and its claim bookkeeping, thread, reminders, rejections, the accepted report, the pushed commit, the pull request, the round and its base, the worker's settings, the last error, `control_json` (worker epoch, recorded workspace, recovery and repair counts, readiness, outcome, and limitation), and a version for compare-and-set writes.
+- `issue_jobs`: one row per job. It holds the trigger, the issue snapshot, project, host, branch, state, the outbox and its claim bookkeeping, thread, reminders, rejections, the accepted report, the pushed commit, the pull request, the round and its base, the worker's settings, the last error, `control_json` (worker epoch, recorded workspace, recovery and repair counts, readiness, outcome, and limitation), and a version for compare-and-set writes. `host_pinned` says whether `host_id` came from `host=`. `host_id` stays `NOT NULL`, and an automatic job that has not started stores `''`, which `issues/store.ts` reads as no machine. Its `CHECK` refuses an empty `host_id` on a pinned job or in any state with a worker. Rows from before the column are pinned.
 - `issue_rounds`: one row per round with its kind, cause (`initial`, `feedback`, `ci`, `conflict`, or `publication`), target head and base, report, pushed commit, and end. A publication repair can inherit the preceding round's assigned feedback without losing its report history.
 - `issue_feedback`: one row per counted review or comment, with the round that sent it.
 - `issue_submissions`: every report submission, raw, with its evaluation result.
@@ -352,7 +363,7 @@ The upgrade to unattended jobs runs in one transaction:
 
 These are constants:
 
-- No cap on concurrent jobs in pstack. bb's per-machine and global concurrency limits decide when worker threads run.
+- No cap on concurrent jobs in pstack. An automatic job starts once a machine is eligible. bb's per-machine and global concurrency limits decide when worker threads run.
 - 2 reminders to an idle worker before recovery (`MAX_NUDGES`).
 - 2 recoveries per job, reset once by the first accepted change (`MAX_RECOVERIES`).
 - 3 rejected reports in a row without progress before recovery (`MAX_INVALID_REPORTS`).
@@ -392,3 +403,5 @@ These are constants:
 - Whether bb logs host RPC payloads, which carry the push token, is unverified.
 - The spawn probe relies on bb listing pinned threads first and then newest first. That order is observed, not documented.
 - Feedback is stored when it is polled. A review dismissed before its round starts is still answered.
+- Pending issue spawns and `bb pstack spawn`'s in-memory holds do not see each other. Running threads count for both, and bb queues a thread that is over a limit, so a start that races a delegate spawn can land on a machine one over its limit.
+- `issues list` and `issues show` print machine ids, not names.

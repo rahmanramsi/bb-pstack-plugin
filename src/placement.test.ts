@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { choose, createPlacement, HOLD_GRACE_MS, hostId, NO_CHECKOUT, REFRESH_MS, type Facts, type Hold, type Need, type Target } from "./placement.ts";
+import { choose, createPlacement, HOLD_GRACE_MS, hostId, NO_CHECKOUT, pickHost, REFRESH_MS, type Facts, type Hold, type Need, type Target } from "./placement.ts";
 
 const HOME = hostId.parse("local");
 const BOX = hostId.parse("box");
@@ -158,7 +158,65 @@ test("a host without a checkout of the project is blocked and flagged as needing
   }
 });
 
-function service(options: { badLimits?: boolean; sources?: string[] } = {}) {
+const VPS = hostId.parse("vps");
+const anywhere = (value: Facts, holds: Hold[] = [], exclude = new Map<typeof HOME, string>()) => pickHost(value, holds, { model: "codex/m" }, exclude, 0);
+
+test("pickHost takes the eligible host with the most headroom and passes over the excluded one", () => {
+  assert.deepEqual(anywhere(facts({ occupancy: { requestedAt: 0, threads: threads(HOME, 1) } })), { hostId: BOX });
+  assert.deepEqual(anywhere(facts(), [], new Map([[HOME, "the bb server's machine"], [BOX, "the bb server's machine"]])), {
+    hostId: null, why: "no machine is eligible: local: the bb server's machine; box: the bb server's machine",
+  });
+  assert.deepEqual(anywhere(facts({ occupancy: { requestedAt: 0, threads: threads(BOX, 3) } }), [], new Map([[HOME, "the bb server's machine"]])), { hostId: BOX });
+});
+
+test("pickHost needs a checkout with a ready worktree and the model on the host", () => {
+  for (const change of [
+    { checkouts: new Set([HOME]) },
+    { worktrees: new Map([[HOME, null], [BOX, "no checkout with an available worktree provider"]]) },
+    { worktrees: new Map([[HOME, null]]) },
+    { models: new Map([[HOME, null], [BOX, "codex/m/high unavailable"]]) },
+    { models: new Map([[HOME, null]]) },
+  ]) {
+    assert.deepEqual(anywhere(facts({ ...change, occupancy: { requestedAt: 0, threads: threads(HOME, 4) } })), { hostId: HOME }, JSON.stringify([...Object.values(change)[0]!]));
+  }
+  assert.deepEqual(anywhere(facts({ checkouts: new Set(), models: new Map([[HOME, "codex/m/high unavailable"]]) })), {
+    hostId: null, why: `no machine is eligible: local: ${NO_CHECKOUT}; box: ${NO_CHECKOUT}`,
+  });
+});
+
+test("pickHost passes over offline, suspended and unknown-limit hosts", () => {
+  const hosts = [
+    { id: HOME, name: HOME, connected: false, phase: "active" },
+    { id: BOX, name: BOX, connected: true, phase: "suspended" },
+    { id: VPS, name: VPS, connected: true, phase: "active" },
+  ];
+  assert.deepEqual(anywhere(facts({ hosts, worktrees: new Map([[VPS, null]]), models: new Map([[VPS, null]]) })), {
+    hostId: null, why: "no machine is eligible: local: disconnected; box: phase suspended; vps: unknown concurrency limit",
+  });
+  assert.deepEqual(anywhere(facts({ limits: null })).hostId, null);
+  assert.deepEqual(anywhere(facts({ hosts: [] })), { hostId: null, why: "bb lists no machine" });
+});
+
+test("pickHost keeps a full host eligible and spreads by headroom past zero, counting holds", () => {
+  const full = facts({ limits: { perHost: new Map([[HOME, 4], [BOX, 2]]), global: 1 }, occupancy: { requestedAt: 0, threads: [...threads(HOME, 5), ...threads(BOX, 2)] } });
+  assert.deepEqual(anywhere(full), { hostId: BOX }, "box is 0 over its limit, local is 1 over");
+  assert.deepEqual(anywhere(full, [{ hostId: BOX, threadId: null, settledAt: null }, { hostId: BOX, threadId: null, settledAt: null }]), { hostId: HOME });
+  const holds: Hold[] = [];
+  const picks = Array.from({ length: 4 }, () => {
+    const pick = anywhere(facts({ occupancy: { requestedAt: 0, threads: threads(HOME, 2) } }), holds);
+    holds.push({ hostId: pick.hostId!, threadId: null, settledAt: null });
+    return pick.hostId;
+  });
+  assert.deepEqual(picks, [BOX, BOX, BOX, HOME]);
+});
+
+test("pickHost breaks a headroom tie by free ratio, then by name", () => {
+  const value = facts({ limits: { perHost: new Map([[HOME, 4], [BOX, 8]]), global: null }, occupancy: { requestedAt: 0, threads: threads(BOX, 4) } });
+  assert.deepEqual(anywhere(value), { hostId: HOME }, "4 of 4 free beats 4 of 8");
+  assert.deepEqual(anywhere(facts()), { hostId: BOX }, "box sorts before local");
+});
+
+function service(options: { badLimits?: boolean; sources?: string[]; levels?: Record<string, string[]> } = {}) {
   let now = 0;
   let rows: { id: string; hostId: string | null }[] = threads(HOME, 4);
   const execCalls: { file: string; args: readonly string[] }[] = [];
@@ -171,7 +229,7 @@ function service(options: { badLimits?: boolean; sources?: string[] } = {}) {
       environments: { listProviders: async () => [{ id: "git-worktree", availability: { status: "available" } }] },
       providers: {
         list: async (route: unknown) => { routes.push(route); return [{ id: "codex", available: true }]; },
-        models: async () => ({ models: [{ model: "m", supportedReasoningEfforts: [] }] }),
+        models: async ({ hostId }: { hostId: string }) => ({ models: [{ model: "m", supportedReasoningEfforts: (options.levels?.[hostId] ?? []).map((reasoningEffort) => ({ reasoningEffort })) }] }),
       },
     },
     log: { warn() {} },
@@ -278,4 +336,12 @@ test("project sources decide which machines have a checkout", async () => {
   const board = await service({ sources: [HOME] }).placement.board(need);
   assert.deepEqual([board.hosts[1].blocker, board.hosts[1].onlyNeedsCheckout], [NO_CHECKOUT, true]);
   assert.equal((await service({ sources: [HOME, BOX] }).placement.board(need)).hosts[1].blocker, null);
+});
+
+test("facts for a pick require the reasoning level in each host's catalog", async () => {
+  const value = await service({ sources: [HOME, BOX], levels: { [HOME]: ["high"], [BOX]: ["low"] } }).placement.facts({ projectId: "project", model: "codex/m", level: "high" });
+  assert.deepEqual([...value.models], [[HOME, null], [BOX, "codex/m/high unavailable"]]);
+  assert.deepEqual([...value.worktrees], [[HOME, null], [BOX, null]]);
+  assert.equal(value.occupancy.threads.length, 4);
+  assert.deepEqual(pickHost(value, [], { model: "codex/m" }, new Map(), 0), { hostId: HOME });
 });

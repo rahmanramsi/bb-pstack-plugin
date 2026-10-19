@@ -8,6 +8,7 @@ import { defineCli, type BbPluginApi } from "@get-bb/plugin-sdk";
 import Database from "better-sqlite3";
 import type { PushInput, PushResult } from "../host-contract.ts";
 import { parseChoice } from "../models.ts";
+import { createPlacement } from "../placement.ts";
 import { MIGRATIONS } from "../store.ts";
 import { createIssues, SWEEP_MS, type IssuesDeps } from "./engine.ts";
 import { createGitHub } from "./github.ts";
@@ -23,6 +24,8 @@ export const SHA1 = "1".repeat(40);
 export const SHA2 = "2".repeat(40);
 export const SHA3 = "3".repeat(40);
 const CATALOG = new Set(["codex/gpt-6.1-sol/high", "claude-code/claude-opus-5-5/high"]);
+
+export type Machine = { connected?: boolean; phase?: string; limit?: number | null; checkout?: boolean; catalog?: readonly string[] };
 
 /** A held call: the fake applies the side effect, then waits here, as if the process died before it returned. */
 export type Hold = { key: string; hit: Promise<void>; reached(): void; release: Promise<void>; free(): void };
@@ -282,6 +285,7 @@ export type FakeThread = {
   environmentId: string;
   metadata: Record<string, unknown>;
   pinnedAt?: number | null;
+  hostId?: string;
   queuedMessageCount?: number;
   activeBackgroundAgentCount?: number;
   activeBackgroundCommandCount?: number;
@@ -319,7 +323,10 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null, machines: null as string | null };
+  const fleet = new Map<string, Machine>([["host_server", {}], ["host_worker", {}]]);
+  const machine = (id: string) => ({ connected: true, phase: "active", limit: 4, checkout: true, catalog: [...CATALOG], ...fleet.get(id) });
+  const hostOf = (thread: FakeThread) => thread.hostId ?? "host_worker";
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
@@ -337,7 +344,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
 
   const createThread = (args: Record<string, any>): FakeThread => {
     const id = `thr_w${++next}`;
-    const thread: FakeThread = { id, status: "active", archivedAt: null, deletedAt: null, createdAt: clock.now, updatedAt: clock.now, projectId: args.projectId, originPluginId: "pstack", environmentId: args.environment.type === "reuse" ? args.environment.environmentId : `env_${id}`, metadata: args.pluginMetadata };
+    const thread: FakeThread = { id, status: "active", archivedAt: null, deletedAt: null, createdAt: clock.now, updatedAt: clock.now, projectId: args.projectId, originPluginId: "pstack", environmentId: args.environment.type === "reuse" ? args.environment.environmentId : `env_${id}`, metadata: args.pluginMetadata, hostId: args.environment.type === "host" ? args.environment.hostId : [...threads.values()].find((candidate) => candidate.environmentId === args.environment.environmentId)?.hostId };
     // A replacement starts from the branch as the host last fetched it: GitHub's head, unless the test makes it stale.
     if (args.environment.type === "reuse") return thread;
     const base: string = args.environment.workspace.baseBranch.name;
@@ -385,6 +392,9 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         assert.ok(threadIds.length <= 200);
         return { threads: threadIds.flatMap((threadId) => (threads.has(threadId) ? [{ threadId, metadata: threads.get(threadId)!.metadata }] : [])) };
       },
+      async listRunning() {
+        return [...threads.values()].filter((thread) => thread.status === "active" && thread.archivedAt === null).map((thread) => ({ id: thread.id, hostId: hostOf(thread) }));
+      },
       async stop({ threadId }: { threadId: string }) {
         stopped.push(threadId);
         const thread = threads.get(threadId);
@@ -401,7 +411,11 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     },
     environments: {
       async get({ environmentId }: { environmentId: string }) {
-        return { id: environmentId, hostId: "host_worker", path: `/worktrees/${environmentId}`, status: "ready" };
+        const thread = [...threads.values()].find((candidate) => candidate.environmentId === environmentId);
+        return { id: environmentId, hostId: thread ? hostOf(thread) : "host_worker", path: `/worktrees/${environmentId}`, status: "ready" };
+      },
+      async listProviders() {
+        return [{ id: "git-worktree", availability: { status: "available" } }];
       },
       async status({ environmentId, mergeBaseBranch }: { environmentId: string; mergeBaseBranch: string }) {
         if (failures.workspaceUnavailable) throw new Error("worker host offline");
@@ -424,7 +438,24 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         return { content, contentEncoding: "utf8" };
       },
     },
+    hosts: {
+      async list() {
+        return [...fleet.keys()].map((id) => ({ id, name: id, status: machine(id).connected ? "connected" : "disconnected", lifecycle: { phase: machine(id).phase } }));
+      },
+    },
+    providers: {
+      async list() {
+        return [{ id: "codex", available: true }, { id: "claude-code", available: true }];
+      },
+      async models({ hostId, providerId }: { hostId: string; providerId: string }) {
+        const tuples = machine(hostId).catalog.map((tuple) => tuple.split("/")).filter(([provider]) => provider === providerId);
+        return { models: [...new Set(tuples.map(([, model]) => model!))].map((model) => ({ model, supportedReasoningEfforts: tuples.filter((tuple) => tuple[1] === model).map(([, , reasoningEffort]) => ({ reasoningEffort })) })) };
+      },
+    },
     projects: {
+      async get() {
+        return { sources: [...fleet.keys()].filter((id) => machine(id).checkout).map((hostId) => ({ hostId })) };
+      },
       async defaultExecutionOptions({ projectId }: { projectId: string }) {
         if (projectId === "prj_offline") throw new Error("project settings are unavailable");
         return { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", permissionMode: "full", serviceTier: "default" };
@@ -454,7 +485,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     if (statement.includes("CREATE TABLE issue_legacy_archive")) options.beforeAutonomyUpgrade?.(db, clock.now);
     db.exec(statement);
   }
-  let repoLine = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
+  let repoLine: { repo: RepoName; projectId: string; hostId: string | null } = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
   let workerRole = "codex/gpt-6.1-sol/high";
 
   /** A store that goes dead when its engine "crashes": reads find nothing and writes change nothing. */
@@ -476,6 +507,8 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         };
       },
     });
+    const limits = () => JSON.stringify({ globalLimit: null, hosts: [...fleet.keys()].map((id) => ({ id, effectiveLimit: machine(id).limit })) });
+    const placement = createPlacement(bb, { clock: () => clock.now, exec: async () => limits() });
     const deps: IssuesDeps = {
       bb,
       store,
@@ -488,7 +521,8 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         return { kind: "inspected", sha: input.sha, comparisonSha: input.comparisonSha, nonemptyDiff: !failures.inspectedEmpty && input.sha !== input.comparisonSha, workflows: failures.workflows, ...(input.ancestorShas ? { ancestry: input.ancestorShas.map((sha) => ({ sha, included: sha === input.sha || ancestors.includes(sha) })) } : {}) };
       },
       hostPush: async (hostId: string, input: PushInput, signal?: AbortSignal): Promise<PushResult> => {
-        assert.equal(hostId, "host_worker");
+        const worker = [...threads.values()].find((thread) => input.worktreePath === `/worktrees/${thread.environmentId}`)!;
+        assert.equal(hostId, hostOf(worker), "the push runs on the machine with the worktree");
         pushes.push(input);
         if (failures.pushHangs) {
           await new Promise((_, reject) => {
@@ -510,6 +544,10 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
       checkWorker: async (hostId: string, tuple: string) => {
         assert.equal(hostId, "host_worker");
         return CATALOG.has(tuple) ? null : `${tuple}: not in the host's catalog`;
+      },
+      machines: async (query) => {
+        if (failures.machines) throw new Error(failures.machines);
+        return placement.facts(query);
       },
       clock: () => clock.now,
     };
@@ -629,6 +667,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     stopped,
     pushes,
     failures,
+    fleet,
     advance,
     work,
     events,

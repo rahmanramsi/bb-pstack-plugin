@@ -445,6 +445,12 @@ CREATE TABLE issue_jobs_unattended (
      job_id TEXT PRIMARY KEY REFERENCES issue_jobs(id) ON DELETE CASCADE,
      next_at INTEGER NOT NULL
    )`,
+  // SQLite cannot drop host_id's NOT NULL without rebuilding the table again, so '' means an automatic job has no machine yet.
+  `ALTER TABLE issue_jobs ADD COLUMN host_pinned INTEGER NOT NULL DEFAULT 1 CHECK (
+     host_pinned IN (0, 1)
+     AND (host_pinned = 0 OR host_id != '')
+     AND (host_id != '' OR state NOT IN ('starting','working','checking','publishing','recovering','repairing','readifying','drafting','review','addressing','sending','respawning','republishing','replying'))
+   )`,
 ];
 
 export type Db = ReturnType<BbPluginApi["storage"]["database"]>;

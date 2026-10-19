@@ -26,7 +26,7 @@ registerHooks({
 Object.assign(globalThis, { __bbPluginRuntime: { react: React, pluginSdkApp: { useBbNavigate: () => ({ openUrl() {}, toThread() {} }), useRpc: () => ({ call: async () => ({}) }), Markdown: () => null } } });
 const { IssueRow } = await import("./issues.tsx");
 
-const job: IssueJob = { id: "psi_00000000-0000-0000-0000-000000000001", repo: "acme/web", issue: 41, title: "Fix mobile navigation", issueUrl: "https://github.com/acme/web/issues/41", state: "review", next: null, triggeredBy: "maya", branch: "agent/issue-41", parentId: null, threadId: "thr_worker", pr: { number: 7, url: "https://github.com/acme/web/pull/7" }, pushedSha: null, round: 1, summary: null, outcome: "ready", limitation: null, delivery: { pending: false, error: null }, error: null, createdAt: 1, updatedAt: 100, poll: { polledAt: 100, error: null } };
+const job: IssueJob = { id: "psi_00000000-0000-0000-0000-000000000001", repo: "acme/web", issue: 41, title: "Fix mobile navigation", issueUrl: "https://github.com/acme/web/issues/41", state: "review", next: null, triggeredBy: "maya", branch: "agent/issue-41", host: { id: "host_worker", pinned: true }, parentId: null, threadId: "thr_worker", pr: { number: 7, url: "https://github.com/acme/web/pull/7" }, pushedSha: null, round: 1, summary: null, outcome: "ready", limitation: null, delivery: { pending: false, error: null }, error: null, createdAt: 1, updatedAt: 100, poll: { polledAt: 100, error: null } };
 
 function render(overrides: Partial<IssueJob>) {
   const html = renderToStaticMarkup(React.createElement(IssueRow, { job: { ...job, ...overrides }, now: 100, onThread: null, refresh() {} }));

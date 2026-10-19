@@ -251,6 +251,12 @@ export type Phase =
       nextAt: number | null;
     };
 
+/**
+ * Where the job's worker runs. A pinned job's machine comes from `host=<id>`. An automatic job has none until start()
+ * writes the machine picked for it. Neither changes after that: recovery reuses the worker's workspace on that machine.
+ */
+export type JobHost = { pinned: true; id: string } | { pinned: false; id: string | null };
+
 export type ReviewTarget = { pr: number; head: Sha; base: Sha };
 export type Workspace = { environmentId: string; hostId: string; path: string; branch: string };
 export type PublicFailure =
@@ -305,7 +311,7 @@ export type Job = {
   /** For a parent: the status comment body last planned, so a pass can tell when the progress changed. */
   progress: string | null;
   projectId: string;
-  hostId: string;
+  host: JobHost;
   baseBranch: string;
   branch: BranchName;
   phase: Phase;
@@ -356,6 +362,8 @@ export type Change = {
   roundBase?: Sha;
   worker?: WorkerSettings;
   progress?: string;
+  /** An automatic job's machine, written with the outbox whose spawn runs there. */
+  hostId?: string;
 };
 
 export type ThreadFact =
@@ -373,6 +381,9 @@ export type ThreadFact =
 export type WorkerProblem = { error: string; permanent: boolean };
 
 export type GateFact = { pass: true } | { pass: false; reason: string };
+
+/** The machine an automatic job's next worker spawns on, or why no machine can run it yet. */
+export type MachineFact = { hostId: string } | { wait: string };
 
 export type PullState = "open" | "merged" | "closed";
 
@@ -405,13 +416,15 @@ export type Facts = {
   children: readonly ChildFact[] | null;
   /** For a sub-issue's queued job: its open blockers as its parent last polled them. */
   blockers: readonly string[] | null;
+  /** Picked last, and only when needsMachine says the next step spawns a worker for an automatic job. */
+  machine: MachineFact | null;
   review?: ReviewFact | null;
   prerequisiteProblem?: string | null;
   prerequisiteWait?: boolean;
   prerequisites?: Control["prerequisites"];
 };
 
-export type FactName = Exclude<keyof Facts, "now">;
+export type FactName = Exclude<keyof Facts, "now" | "machine">;
 
 export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   ignored: [],
@@ -450,6 +463,23 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
   if (!["review", "checking"].includes(job.phase.state) || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
+}
+
+/**
+ * The worker settings plan() needs a machine picked for, or null when it needs none: an automatic job queued with no
+ * open blockers or prerequisites to wait for and a resolved worker.
+ */
+export function needsMachine(job: Job, facts: Facts): WorkerSettings | null {
+  if (job.host.pinned || job.phase.state !== "queued" || facts.blockers?.length || facts.prerequisiteWait || facts.prerequisiteProblem) return null;
+  return facts.worker && !("error" in facts.worker) ? facts.worker : null;
+}
+
+function spawnHost(job: Job, facts: Facts): MachineFact | null {
+  return job.host.pinned ? { hostId: job.host.id } : facts.machine;
+}
+
+function waitFor(job: Job, reason: string): Action | null {
+  return job.error === reason ? null : { type: "change", change: { error: reason } };
 }
 
 /** When a round may start: the newest pending item has been visible for FEEDBACK_QUIET_MS. */
@@ -525,10 +555,7 @@ function next(job: Job, facts: Facts): Action | null {
 
   switch (phase.state) {
     case "queued": {
-      if (facts.blockers?.length) {
-        const error = `waiting for ${facts.blockers.join(", ")}`;
-        return job.error === error ? null : { type: "change", change: { error } };
-      }
+      if (facts.blockers?.length) return waitFor(job, `waiting for ${facts.blockers.join(", ")}`);
       // An unblocked child drops its waiting reason before it starts.
       if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
       if (!facts.worker) return null;
@@ -536,7 +563,10 @@ function next(job: Job, facts: Facts): Action | null {
         if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
         return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
       }
-      return { type: "change", change: start(job, facts.worker, now) };
+      const host = spawnHost(job, facts);
+      if (!host) return null;
+      if ("wait" in host) return waitFor(job, host.wait);
+      return { type: "change", change: start(job, facts.worker, host.hostId, now) };
     }
     case "checking":
       if (!facts.prerequisiteWait && facts.feedback?.pending.length && facts.review?.kind === "observed" && facts.review.draft) return feedbackAction(job, facts);
@@ -775,18 +805,20 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
   }
 }
 
+const hostChange = (job: Job, hostId: string): Change => (job.host.pinned ? {} : { hostId });
+
 export function publicationRepairPrompt(job: Job): string {
   const repair = job.control.publicationRepair;
   if (!repair) return "";
   return [`Preserve accepted commit ${repair.acceptedSha}. The current remote head of ${job.branch} is ${repair.remoteSha}.`, `Fetch with bb pstack gh fetch in this worker. Integrate both commits without overwriting collaborator work. Merge only when ancestry requires it. Preserve dirty and untracked files. Run the relevant checks again in this worker.`, `Submit a fresh report for round ${job.round - 1}, including every assigned feedback reply. Report changes when HEAD adds work beyond the remote, or no-change with fresh verification when the remote already contains the accepted work. Never execute supplied verification descriptions.`, ...(job.report && "replies" in job.report ? [`Assigned feedback replies retained from the accepted report: ${JSON.stringify(job.report.replies)}`] : [])].join("\n");
 }
 
-/** queued → starting: label the issue, then spawn the worker. Starts the round's clock. */
-export function start(job: Job, worker: WorkerSettings, now: number): Change {
+/** queued → starting on `hostId`: label the issue, then spawn the worker. Starts the round's clock. */
+export function start(job: Job, worker: WorkerSettings, hostId: string, now: number): Change {
   const effects: Effect[] = [
     { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
-  return { phase: enter("starting", effects), deadline: null, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } };
+  return { phase: enter("starting", effects), deadline: null, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] }, ...hostChange(job, hostId) };
 }
 
 /**
@@ -822,6 +854,14 @@ function close(job: Job, disposition: PullState = "merged", observedHead?: Sha):
 
 export function sendingToWorker(job: Job): boolean {
   return job.threadId !== null && "effects" in job.phase && job.phase.effects[0].op === "send-round";
+}
+
+/**
+ * Whether the job's outbox still owes a spawn, as in `starting` before its spawn settled. Such a row counts against its
+ * machine until the spawn settles, and from then its thread counts as running, so jobs starting together spread out.
+ */
+export function owesSpawn(job: Job): boolean {
+  return "effects" in job.phase && job.phase.effects.some((effect) => effect.op === "spawn");
 }
 
 /** Waiting for its spawn to create the worker, which may report before the spawn is confirmed. */
@@ -1163,6 +1203,8 @@ export type JobView = {
   next: { state: RestingState; op: EffectOp; tries: number; retryAt: number | null } | null;
   triggeredBy: string;
   branch: BranchName;
+  /** The worker's machine: `id` is null until an automatic job first starts. */
+  host: { id: string | null; pinned: boolean };
   threadId: string | null;
   pr: { number: number; url: string } | null;
   pushedSha: Sha | null;
@@ -1192,6 +1234,7 @@ export function toView(job: Job): JobView {
         : null,
     triggeredBy: job.trigger.actor,
     branch: job.branch,
+    host: { id: job.host.id, pinned: job.host.pinned },
     threadId: job.threadId,
     pr: job.pr,
     pushedSha: job.pushedSha,
@@ -1201,4 +1244,10 @@ export function toView(job: Job): JobView {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
+}
+
+/** How `bb pstack issues list` and the app name a job's machine. `host auto` matches the setting until a pick. */
+export function machineLabel(host: JobView["host"]): string {
+  if (host.id === null) return "host auto";
+  return host.pinned ? `on ${host.id}` : `on ${host.id} (auto)`;
 }

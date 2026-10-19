@@ -30,6 +30,7 @@ export const IssueBoardSchema = z.object({
       next: z.object({ state: z.enum(RESTING_STATES), op: z.enum(EFFECT_OPS), tries: z.number().int(), retryAt: z.number().nullable() }).nullable(),
       triggeredBy: z.string(),
       branch: z.string(),
+      host: z.object({ id: z.string().nullable(), pinned: z.boolean() }),
       parentId: z.string().regex(JOB_ID).nullable(),
       threadId: z.string().nullable(),
       pr: z.object({ number: z.number().int(), url: z.string() }).nullable(),

@@ -279,6 +279,32 @@ test("each write that changes something signals once, and a write that changes n
   assert.equal(signals(() => [store.get(job.id), store.list({ all: true }), store.repoPoll(REPO), store.jobPoll(job.id), store.due(20)]), 0, "reads");
 });
 
+test("the host migration keeps every existing job pinned to its machine", () => {
+  const db = new Database(":memory:");
+  for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+  db.prepare(
+    `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json, project_id, host_id, base_branch, branch, state, thread_id, created_at, updated_at, runtime_protocol)
+     VALUES ('psi_old', ?, 40, 1, 7, 'maya', 1, '{"title":"t","body":"b","url":"u","author":"maya"}', 'prj_1', 'host_1', 'main', 'agent/issue-40-t', 'working', 'thr_old', 5, 5, 1)`,
+  ).run(REPO);
+  db.exec(MIGRATIONS.at(-1)!);
+  const store = openIssueStore(db, () => {});
+  assert.deepEqual(store.get("psi_old" as JobId)!.host, { pinned: true, id: "host_1" });
+  assert.throws(() => db.prepare("UPDATE issue_jobs SET host_id = '' WHERE id = 'psi_old'").run(), /CHECK/);
+});
+
+test("an automatic job has no machine until a change writes one, and no worker state goes without it", () => {
+  const { db, store } = setup();
+  const job = store.insert(newJob({ hostId: null }), 10)!;
+  assert.deepEqual(job.host, { pinned: false, id: null });
+  const phase = enter("starting", [spawn]);
+  assert.throws(() => store.write(job.id, 0, { phase }, 20), /CHECK/);
+  assert.throws(() => db.prepare("UPDATE issue_jobs SET state = 'working', thread_id = 'thr_w' WHERE id = ?").run(job.id), /CHECK/);
+  const started = store.write(job.id, 0, { phase, hostId: "host_2" }, 20)!;
+  assert.deepEqual(started.host, { pinned: false, id: "host_2" });
+  const stopped = store.write(store.insert(newJob({ issue: 42, hostId: null }), 30)!.id, 0, { phase: { state: "stopped" } }, 31)!;
+  assert.deepEqual(stopped.host, { pinned: false, id: null }, "a job that never started ends without a machine");
+});
+
 test("unattended upgrade archives legacy waits byte for byte and preserves leased publication and manual starts", () => {
   const db = new Database(":memory:");
   const autonomyIndex = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE issue_legacy_archive"));
