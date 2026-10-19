@@ -87,6 +87,27 @@ test("one open job per issue; a label event is recorded once; a re-label after a
   assert.deepEqual(store.list({ all: false }).map((job) => job.id), [second.id]);
 });
 
+test("latest stuck lists a stuck job until any later job for its issue, ignored ones included, replaces it", () => {
+  const { store } = setup();
+  const stuck = (issue: number, at: number) => {
+    const job = store.insert(newJob({ issue }), at)!;
+    store.write(job.id, 0, { phase: { state: "stuck" }, error: "no model" }, at);
+    return job;
+  };
+  const kept = stuck(41, 10);
+  const replaced = stuck(42, 11);
+  const retried = store.insert(newJob({ issue: 42 }), 12)!;
+  const shadowed = stuck(43, 13);
+  store.insert(newJob({ issue: 43, state: "ignored", error: "drive-by has read permission" }), 14);
+  const other = store.insert(newJob({ repo: "acme/api" as RepoName, issue: 41 }), 15)!;
+  store.write(other.id, 0, { phase: { state: "stuck" } }, 15);
+
+  assert.deepEqual(store.latestStuck({}).map((job) => job.id), [other.id, kept.id]);
+  assert.deepEqual(store.latestStuck({ repo: REPO }).map((job) => job.id), [kept.id]);
+  assert.deepEqual(store.list({ all: false }).map((job) => job.id), [retried.id], "list is unchanged");
+  assert.ok(store.list({ all: true }).some((job) => job.id === replaced.id) && store.list({ all: true }).some((job) => job.id === shadowed.id));
+});
+
 test("repository poll state is stored per repository", () => {
   const { store } = setup();
   assert.deepEqual(store.repoPoll(REPO), { poll: null, polledAt: null, error: null });

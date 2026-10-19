@@ -79,3 +79,16 @@ test("a worker thread's board holds its own job and repository, and any other th
   assert.deepEqual(board.jobs.map((job) => [job.id, job.title]), [[working.id, "Submit button hides behind the footer"]]);
   assert.deepEqual(issueBoard(store, [WEB, API], { threadId: "thr_person" }), { repos: [], jobs: [] });
 });
+
+test("a stuck job stays on the list board until a newer job for its issue replaces it", () => {
+  const { store, working, legacy } = setup();
+  const stuck = store.insert(newJob(WEB, 43, "Crash on save"), 50)!;
+  store.write(stuck.id, stuck.version, { phase: { state: "stuck" }, error: "no model is configured for the issue worker role" }, 51);
+  const board = issueBoard(store, [WEB], { all: false });
+  assert.deepEqual(board.jobs.map((job) => job.id), [stuck.id, legacy.id, working.id]);
+  assert.equal(board.jobs[0]!.error, "no model is configured for the issue worker role");
+
+  const retried = store.insert(newJob(WEB, 43, "Crash on save"), 60)!;
+  assert.deepEqual(issueBoard(store, [WEB], { all: false }).jobs.map((job) => job.id), [retried.id, legacy.id, working.id]);
+  assert.ok(issueBoard(store, [WEB], { all: true }).jobs.some((job) => job.id === stuck.id));
+});

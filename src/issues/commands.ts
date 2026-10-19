@@ -147,7 +147,7 @@ export function issueCommands(deps: {
       summary: "List each repository's last poll and its issue jobs with their state, pull request and worker thread",
       options: {
         repo: { type: "string", description: "Only this owner/name" },
-        all: { type: "boolean", description: "Include finished, stopped, stuck and ignored jobs" },
+        all: { type: "boolean", description: "Include finished, stopped and ignored jobs, and stuck jobs a newer job for the issue replaced" },
         json: { type: "boolean", description: "Emit { repos, jobs } as JSON" },
       },
       run(input) {
