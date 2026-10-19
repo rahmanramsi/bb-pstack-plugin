@@ -32,8 +32,8 @@ test("unfinished commits pass the guarded push and remain in a draft PR with the
   assert.ok(pull.labels.has("agent"));
   assert.match(pull.title, /^chore\(issue-41\): unfinished work/);
   assert.match(pull.pr!.body, /required interface is unavailable/);
-  assert.match(pull.pr!.body, /did not complete validation/);
-  assert.match(pull.pr!.body, /without `gate pr`/);
+  assert.match(pull.pr!.body, /did not pass the checks/);
+  assert.match(pull.pr!.body, /did not pass the checks a pull request normally needs/);
   assert.match(pull.pr!.body, /Uncommitted changes remain/);
   assert.match(pull.pr!.body, /Review this pull request to start another round/);
   assert.match(pull.pr!.body, /Related to #41/);

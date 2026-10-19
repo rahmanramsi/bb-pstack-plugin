@@ -381,7 +381,7 @@ export function stuckBody(job: Job): string {
   const body = [
     "## Unfinished work",
     issueText(parked?.reason ?? job.error ?? "The worker could not finish."),
-    "The work did not complete validation. This draft pull request was opened without `gate pr`.",
+    "The work did not pass the checks a pull request normally needs before it is opened.",
     "## What remains",
     remaining,
     job.control.preservation === "dirty and untracked work retained" ? "Uncommitted changes remain in the worker's workspace." : null,

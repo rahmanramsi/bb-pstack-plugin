@@ -869,7 +869,7 @@ test("unfinished PR text stays bounded, describes remaining work, and never clos
   const body = stuckBody(current);
   assert.match(body, /CI must pass/);
   assert.match(body, /Resolve the interface mismatch/);
-  assert.match(body, /did not complete validation/);
+  assert.match(body, /did not pass the checks/);
   assert.match(body, /Uncommitted changes remain/);
   assert.match(body, /Related to #41/);
   assert.doesNotMatch(body, /(?:fixes|closes|resolves) #\d+/i);
