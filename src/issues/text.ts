@@ -2,7 +2,7 @@
  * Text the issue feature writes: the worker's prompts and reminders, and everything posted on GitHub with the checks
  * and sanitizing it gets first. Pure.
  */
-import { MAX_FEEDBACK_ROUNDS, MAX_NUDGES, TERMINAL, type ChildFact, type Feedback, type GateFact, type Job, type RoundSummary, type Sha, type ReportFacts } from "./job.ts";
+import { MAX_FEEDBACK_ROUNDS, MAX_NUDGES, SILENCE_MS, TERMINAL, type ChildFact, type Feedback, type GateFact, type Job, type RoundSummary, type Sha, type ReportFacts } from "./job.ts";
 
 /**
  * Phrases that describe how a change was made instead of the change. Whole phrases, so "thread pool", "user agent"
@@ -306,6 +306,16 @@ export function nudgeText(job: Job, gate: GateFact | null): string {
     ...(job.round > 1 ? ["For this feedback round, report `changes` or `no-change` with `replies`; put any unresolved decision in a reply on the pull request."] : []),
     ...(gate && !gate.pass && job.pushedSha === null ? [`A \`changes\` report needs \`bb pstack gate pr\` to pass, and it fails: ${gate.reason}`] : []),
     `This is reminder ${job.nudges + 1} of ${MAX_NUDGES}.`,
+  ].join("\n");
+}
+
+/** For a worker whose whole tree went quiet; `nudges` is the reminders sent since work last resumed. */
+export function silenceText(job: Job, nudges: number): string {
+  const unfinished = job.round === 1 ? "commit what works and report `changes`, with what is left in the pull request description" : "report what is done and say in the replies what is left";
+  return [
+    `Neither you nor your subagents have shown any activity for ${SILENCE_MS / 60_000} minutes.`,
+    `If the work is done, write your report JSON to a file and run \`bb pstack issues report --file <path>\`. If you cannot finish it, ${unfinished}.`,
+    `This is reminder ${nudges + 1} of ${MAX_NUDGES}.`,
   ].join("\n");
 }
 

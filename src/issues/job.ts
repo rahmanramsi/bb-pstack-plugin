@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, silenceText, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -375,6 +375,13 @@ export type ThreadFact =
   | { kind: "gone" };
 
 /**
+ * Progress across the worker's thread tree: the worker, its child threads, and the threads of the pstack runs they
+ * started. `lastActiveAt` is the newest progress event in it, or the last time a member was seen held, so time spent
+ * held never counts as silence. `queued`: a member is held right now, before its turn or waiting for a run slot.
+ */
+export type TreeFact = { lastActiveAt: number | null; queued: boolean };
+
+/**
  * Why a queued job's worker cannot be resolved. `permanent` when only an operator can fix it, such as a model the host
  * does not have: the job sticks with the reason instead of waiting.
  */
@@ -422,6 +429,7 @@ export type Facts = {
   prerequisiteProblem?: string | null;
   prerequisiteWait?: boolean;
   prerequisites?: Control["prerequisites"];
+  tree?: TreeFact | null;
 };
 
 export type FactName = Exclude<keyof Facts, "now" | "machine">;
@@ -461,6 +469,7 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
+  if (REPORTING.has(job.phase.state)) return silencePossible(job, facts.now) ? ["tree"] : [];
   if (!["review", "checking"].includes(job.phase.state) || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
 }
@@ -508,8 +517,23 @@ export type Action =
   | { type: "sleep"; until: number };
 
 export const MAX_NUDGES = 2;
+/** How long the worker's tree may show no progress before it is reminded, and after MAX_NUDGES reminders, recovered. */
+export const SILENCE_MS = 20 * 60_000;
+/** Progress this long after the job's last write, which a reminder makes, means work resumed since that reminder. */
+const RESUMED_AFTER_WRITE_MS = 5 * 60_000;
+/** The tree costs a bb call per member to read, so it is read only once it may be silent. */
+const silencePossible = (job: Job, now: number) => now - job.updatedAt >= SILENCE_MS;
 
 const IN_ROUND: ReadonlySet<JobState> = new Set(["starting", "working", "publishing", "recovering", "repairing", "sending", "respawning", "addressing", "republishing", "replying"]);
+
+function silence(job: Job, tree: TreeFact | null | undefined, now: number): Action | null {
+  if (!tree || tree.queued) return null;
+  if (now - Math.max(tree.lastActiveAt ?? 0, job.updatedAt) < SILENCE_MS) return null;
+  const nudges = tree.lastActiveAt !== null && tree.lastActiveAt > job.updatedAt + RESUMED_AFTER_WRITE_MS ? 0 : job.nudges;
+  // The reminder's write moves updatedAt, which restarts the window, so the reminder never counts as progress.
+  if (nudges < MAX_NUDGES) return { type: "nudge", text: silenceText(job, nudges), change: { nudges: nudges + 1 } };
+  return { type: "change", change: recover(job, `no activity from the worker or its subagents for ${SILENCE_MS / 60_000} minutes after ${MAX_NUDGES} reminders`) };
+}
 
 /** Marks a change that takes the job out of its round as the round's end. */
 function rounded(job: Job, change: Change): Change {
@@ -589,7 +613,7 @@ function next(job: Job, facts: Facts): Action | null {
           return { type: "change", change: recover(job, thread.error) };
         }
         case "idle":
-          if (facts.waiting) return null;
+          if (facts.waiting) break;
           if (job.control.idleObservation && thread.since <= job.control.idleObservation.since && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
           if (job.nudges >= MAX_NUDGES) {
             if (job.control.idleObservation && now < job.control.idleObservation.remindedAt + 60_000) return { type: "sleep", until: job.control.idleObservation.remindedAt + 60_000 };
@@ -598,8 +622,9 @@ function next(job: Job, facts: Facts): Action | null {
           return { type: "nudge", text: nudgeText(job, facts.gate), change: { nudges: job.nudges + 1, control: { ...job.control, idleObservation: { since: thread.since, remindedAt: now } } } };
         case "active":
         case "waiting":
-          return null;
+          break;
       }
+      return silence(job, facts.tree, now);
     }
     case "tracking":
       return facts.children ? track(job, facts.children) : null;

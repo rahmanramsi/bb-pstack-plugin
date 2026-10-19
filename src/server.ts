@@ -8,6 +8,7 @@ import { ISSUES_CHANNEL, STATE_CHANNEL } from "./contract.ts";
 import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
 import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
 import { createIssues } from "./issues/engine.ts";
+import { PROGRESS_EVENTS, createTreeActivity } from "./issues/tree.ts";
 import { GitHubSetupError, createGitHub, decodePrivateKey } from "./issues/github.ts";
 import type { JobId } from "./issues/job.ts";
 import { openIssueStore } from "./issues/store.ts";
@@ -174,7 +175,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const activeWork = async (threadId: string) => {
     const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
-    const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
+    const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting" || child.status === "pending").length;
     return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
   };
 
@@ -249,6 +250,16 @@ export default async function plugin(bb: BbPluginApi) {
       return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
     },
     activeWork,
+    treeActivity: createTreeActivity({
+      thread: (threadId) => bb.sdk.threads.get({ threadId }),
+      children: (threadId) => bb.sdk.threads.list({ parentThreadId: threadId, includeHidden: true, limit: 100 }),
+      async lastProgress(threadId) {
+        const [latest] = await bb.sdk.threads.events.list({ threadId, order: "desc", limit: "1", types: PROGRESS_EVENTS });
+        return latest?.createdAt ?? null;
+      },
+      runJobs: (threadId) => runStore.runsForThread(threadId, true).flatMap((runId) => runStore.snapshot(runId)?.jobs ?? []),
+      clock: Date.now,
+    }),
     checkWorker: async (hostId, tuple) => {
       const provider = tuple.split("/")[0]!;
       const catalog = await loadCatalog(bb, { hostId }, [provider]);

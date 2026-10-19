@@ -332,6 +332,56 @@ test("an idle worker that has not reported is reminded twice, then the job waits
   assert.equal(h.sent.length, 2, "no third reminder");
 });
 
+async function sweepUntil(h: ReturnType<typeof harness>, start: number, minutes: number) {
+  while (h.clock.now < start + minutes * MIN) {
+    h.clock.now += 15_000;
+    await h.engine().issues.sweep();
+  }
+}
+
+test("a worker whose thread tree goes silent is reminded twice, then recovered, and the tree is read only once silence is possible", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const start = h.clock.now;
+  h.setTree(() => ({ lastActiveAt: start + 10 * MIN, queued: false }));
+  await sweepUntil(h, start, 19);
+  assert.equal(h.treeReads.count, 0, "no walk while the job's last write is recent");
+  await sweepUntil(h, start, 29);
+  assert.equal(h.treeReads.count, 1, "one walk, then none until 20 minutes after the progress it found");
+  assert.equal(h.sent.length, 0);
+
+  await sweepUntil(h, start, 31);
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0]!.input[0].text, /^Neither you nor your subagents have shown any activity for 20 minutes\./);
+  await sweepUntil(h, start, 51);
+  assert.equal(h.sent.length, 2);
+  const firstWorker = (await h.only()).threadId;
+  await sweepUntil(h, start, 71);
+  const recovered = await h.only();
+  assert.equal(recovered.state, "working");
+  assert.notEqual(recovered.threadId, firstWorker, "silence after every reminder recovers the worker");
+  assert.match(JSON.stringify(h.spawned.at(-1)), /no activity from the worker or its subagents for 20 minutes after 2 reminders/);
+  assert.ok(h.stopped.includes(firstWorker!), "the silent worker is stopped");
+});
+
+test("a tree held behind a queue is not silent, and the hold counts as activity once it ends", async () => {
+  const h = harness();
+  h.label(41);
+  await h.engine().issues.sweep();
+  const start = h.clock.now;
+  let held = true;
+  h.setTree(() => ({ lastActiveAt: start, queued: held }));
+  await sweepUntil(h, start, 60);
+  assert.equal(h.sent.length, 0);
+  held = false;
+  const released = h.clock.now;
+  await sweepUntil(h, released, 19);
+  assert.equal(h.sent.length, 0, "the time held is not counted as silence");
+  await sweepUntil(h, released, 21);
+  assert.equal(h.sent.length, 1);
+});
+
 test("a worker cannot stop jobs, and a thread naming a job that is not waiting for it is stopped", async () => {
   const h = harness();
   h.label(41);
