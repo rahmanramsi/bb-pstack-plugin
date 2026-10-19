@@ -89,6 +89,8 @@ pstack never asks for more permissions and never prompts for credentials. Before
 
 A pinned job copies its machine from `host=` when its row is inserted, and a sub-issue's job copies its parent's pin. For a pinned job, pstack checks the worker's `provider/model/level` against that machine's provider catalog before the start.
 
+Each poll first resolves the worker the repository's next job would run: the first `issue worker` choice with the project's defaults, and for a pinned repository that machine's catalog. While that fails, or the catalog does not load, the poll creates no job. It records the reason as the repository's poll error, which `issues list` prints, keeps its label cursor so the skipped label events are read again once the worker can run, and still polls the open jobs. `bb pstack doctor` runs the same check once per pinned machine and tuple. A manual start or retry refuses with the same reason.
+
 An automatic job has no machine until it starts. `pickHost` in `src/placement.ts` picks one from the same facts `bb pstack spawn` reads, through the shared `Placement` and its 30 s cache. A machine is eligible when it is connected and active with a known concurrency limit, has a checkout of the project with an available `git-worktree` provider, has the worker's model at its reasoning level in its catalog, and is not the server's machine. Capacity never makes a machine ineligible, because bb queues a thread that is over a limit. It ranks eligible machines by the most headroom (limit minus running threads minus pending spawns, which can go below zero), then by the larger free share of the limit, then by name. When no machine is eligible, the job stays `queued` with an error that names each machine's first problem, and the next sweep tries again.
 
 The `start()` change that queues the spawn also writes the picked machine, so the spawn, the worktree checks, the inspections and the push all read one machine from the row, and the machine is set before the spawn is claimed. The machine never changes after that: recovery reuses the worker's environment on the same machine.
@@ -310,7 +312,10 @@ A delivery error is stored on the row and shown in the app and in `issues show`.
 bb pstack issues list                 # each repository's last poll and its error, then its jobs and their machines
 bb pstack issues show <job>           # machine, thread, pull request, outcome, limitation, delivery, last error, and last polls
 bb pstack issues stop <job>
+bb pstack issues retry <job>          # a new job for the issue of a stuck or stopped job
 ```
+
+`issues list` shows open jobs and each issue's latest stuck job with its reason, until a newer job for the issue replaces it; `--all` adds the rest. `issues retry` starts a new job for the issue once its cause is fixed, and refuses while the issue has an open job.
 
 The **Issues** panel in the bb app lists every catalog issue with its job. A job's badge shows its outcome once it has one and its current step before that. A job that ended before an upgrade and left no record of merge, closure, or a no-change report shows a neutral **Outcome unknown** badge, never Merged or a success. Notes under the badge show the failure reason first, then a branch-policy limitation, then delivery and polling state. **Needs attention** filters to failed and closed-unmerged jobs, delivery errors, poll errors, and issues that cannot start.
 
