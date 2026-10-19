@@ -238,7 +238,9 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
       return etagged({ title: issue.title, body: issue.pr.body, user: { login: issue.user }, number: issue.number, node_id: `PR_${issue.number}`, html_url: `https://github.com/acme/web/pull/${issue.number}`, state: pull.state, merged: pull.merged, merged_at: pull.merged ? iso(gh.now()) : null, draft: issue.pr.draft, mergeable: gh.mergeable, mergeable_state: gh.mergeable ? "clean" : "dirty", head: { sha: gh.refs.get(issue.pr.head), ref: issue.pr.head, repo: { full_name: REPO } }, base: { sha: gh.refs.get("main"), ref: issue.pr.base, repo: { full_name: REPO } } });
     }
     if (method === "PATCH") {
-      gh.issues.get(Number(match[1]))!.pr!.body = body.body;
+      const issue = gh.issues.get(Number(match[1]))!;
+      if (body.body !== undefined) { issue.pr!.body = body.body; issue.body = body.body; }
+      if (body.title !== undefined) { issue.pr!.title = body.title; issue.title = body.title; }
       return [200, {}];
     }
   }

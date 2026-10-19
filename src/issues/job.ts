@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, stuckBody, stuckTitle, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -24,6 +24,7 @@ export const LABEL = {
   working: "agent:working",
   needsInfo: "agent:needs-info",
   review: "agent:review",
+  stuck: "agent:stuck",
 } as const;
 export type Label = (typeof LABEL)[keyof typeof LABEL];
 
@@ -93,6 +94,7 @@ export type SpawnSpec = WorkerSettings & {
 export type Effect =
   | { op: "labels"; key: string; on: "issue" | "pr"; add: readonly Label[]; remove: readonly Label[] }
   | { op: "spawn"; key: string; spec: SpawnSpec }
+  | { op: "inspect-work"; key: string }
   | { op: "push"; key: string; sha: Sha; expectedRemoteSha: Sha | null }
   | { op: "open-pr"; key: string; title: string; body: string }
   | { op: "comment"; key: string; body: string }
@@ -101,7 +103,7 @@ export type Effect =
   /** `body` is posted as is: a conversation reply already quotes what it answers. */
   | { op: "reply"; key: string; target: ReplyTarget; body: string }
   | { op: "request-review"; key: string; reviewers: readonly string[] }
-  | { op: "edit-pr"; key: string; body: string }
+  | { op: "edit-pr"; key: string; body: string; title?: string }
   /** A replacement worker's worktree must contain `base`, the branch's head on GitHub; when it does not, it is told to merge. */
   | { op: "check-worktree"; key: string; base: Sha }
   /** A parent's one progress comment: edited when the App's comment with the key's marker exists, else created. */
@@ -125,6 +127,7 @@ export type Recovery = { kind: "replay" } | { kind: "probe" } | { kind: "once"; 
 export const EFFECT_POLICY = {
   labels: { recovery: { kind: "replay" }, leaseMs: 60_000 },
   spawn: { recovery: { kind: "once", graceMs: 5 * 60_000 }, leaseMs: 2 * 60_000 },
+  "inspect-work": { recovery: { kind: "replay" }, leaseMs: 2 * 60_000 },
   push: { recovery: { kind: "probe" }, leaseMs: 11 * 60_000 },
   "open-pr": { recovery: { kind: "probe" }, leaseMs: 60_000 },
   comment: { recovery: { kind: "probe" }, leaseMs: 60_000 },
@@ -145,12 +148,15 @@ export const EFFECT_POLICY = {
 } as const satisfies { readonly [Op in EffectOp]: { recovery: Recovery; leaseMs: number } };
 
 export const MAX_RECOVERIES = 2;
+export const MAX_PARKS = 2;
+export const PROVIDER_WAIT = "waiting for the worker's provider to retry";
 export const MAX_INVALID_REPORTS = 3;
 export const MAX_REPAIRS = 5;
 export const MAX_RECOVERY_OBSERVATIONS = 8;
 const BACKOFF_MS = [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000] as const;
 
 export type EffectOutcome =
+  | { kind: "work"; work: { kind: "commits"; sha: Sha; dirty: boolean } | { kind: "empty"; dirty: boolean } }
   | { kind: "publication-diverged"; remoteSha: Sha; reason: "stale-remote" | "not-descendant" }
   | { kind: "changed-target"; target: ReviewTarget }
   | { kind: "closed"; state: Exclude<PullState, "open"> }
@@ -269,6 +275,9 @@ export type PublicFailure =
   | { kind: "execution" };
 
 export type Control = {
+  parked: { reason: string; remaining: readonly string[] } | null;
+  parks: number;
+  emptyRetried: boolean;
   publicFailure: PublicFailure | null;
   childrenProgress: string | null;
   epoch: number;
@@ -295,7 +304,11 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ parked: null, parks: 0, emptyRetried: false, publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export function acceptsReport(job: Job): boolean {
+  return REPORTING.has(job.phase.state) || (job.phase.state === "checking" && job.control.parked !== null);
+}
+
 export type Job = {
   control: Control;
   id: JobId;
@@ -461,7 +474,7 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
-  if (!["review", "checking"].includes(job.phase.state) || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) return [];
+  if (!["review", "checking"].includes(job.phase.state) || facts.pr?.state !== "open" || !facts.feedback?.pending.length || (!job.control.parked && job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS)) return [];
   return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
 }
 
@@ -519,6 +532,10 @@ function rounded(job: Job, change: Change): Change {
 export function plan(job: Job, facts: Facts): Action | null {
   if (TERMINAL.has(job.phase.state)) return null;
   let action = next(job, facts);
+  if (facts.thread && facts.thread.kind !== "failed" && job.error?.startsWith(PROVIDER_WAIT)) {
+    if (action?.type === "change" || action?.type === "nudge") action = { ...action, change: { ...action.change, error: action.change.error === undefined ? null : action.change.error } };
+    else if (!action || action.type === "sleep") action = { type: "change", change: { error: null } };
+  }
   if (facts.children) {
     const childrenProgress = progressBody(facts.children);
     if (childrenProgress !== job.control.childrenProgress) {
@@ -569,6 +586,7 @@ function next(job: Job, facts: Facts): Action | null {
       return { type: "change", change: start(job, facts.worker, host.hostId, now) };
     }
     case "checking":
+      if (job.control.parked) return facts.prerequisiteWait ? null : feedbackAction(job, facts);
       if (!facts.prerequisiteWait && facts.feedback?.pending.length && facts.review?.kind === "observed" && facts.review.draft) return feedbackAction(job, facts);
       return checkReview(job, facts);
     case "review": {
@@ -585,7 +603,7 @@ function next(job: Job, facts: Facts): Action | null {
         case "gone":
           return { type: "change", change: recover(job, "the worker thread is unavailable") };
         case "failed": {
-          if (thread.retryAt && thread.retryAt > now) return { type: "sleep", until: thread.retryAt };
+          if (thread.retryAt && thread.retryAt > now) return waitFor(job, PROVIDER_WAIT) ?? { type: "sleep", until: thread.retryAt };
           return { type: "change", change: recover(job, thread.error) };
         }
         case "idle":
@@ -613,14 +631,14 @@ function feedbackAction(job: Job, facts: Facts): Action | null {
   const now = facts.now;
   if (!pr || !feedback) return null;
   if (feedback.pending.length === 0) return null;
-  if (job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) {
-    return { type: "change", change: stick(job, `unresolved feedback after ${MAX_FEEDBACK_ROUNDS} feedback rounds`) };
+  if (!job.control.parked && job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) {
+    return { type: "change", change: park(job, `feedback round limit reached after ${MAX_FEEDBACK_ROUNDS} rounds`, job.control.bestReasons ?? []) };
   }
   const quiet = quietAt(feedback.pending);
   if (quiet > now) return { type: "sleep", until: quiet };
   if (!facts.thread || !facts.rounds || !facts.remote) return null;
   if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
-  if (facts.thread.kind === "failed" && facts.thread.retryAt && facts.thread.retryAt > now) return { type: "sleep", until: facts.thread.retryAt };
+  if (facts.thread.kind === "failed" && facts.thread.retryAt && facts.thread.retryAt > now) return waitFor(job, PROVIDER_WAIT) ?? { type: "sleep", until: facts.thread.retryAt };
   const respawn = facts.thread.kind === "gone" || facts.thread.kind === "failed";
   return { type: "change", change: startRound(job, feedback.pending, facts.rounds, facts.remote.head, respawn, now) };
 }
@@ -634,7 +652,7 @@ export function rejectReport(job: Job, reasons: readonly string[]): Change {
 }
 
 export function recover(job: Job, reason: string): Change {
-  if (job.control.recoveries >= MAX_RECOVERIES) return stick(job, `automatic recovery exhausted: ${reason}; work is preserved in ${job.control.workspace?.path ?? "the original worker environment"}`, { kind: "recovery-exhausted" });
+  if (job.control.recoveries >= MAX_RECOVERIES) return park(job, `automatic recovery exhausted: ${reason}`, job.control.bestReasons ?? []);
   const epoch = job.control.epoch + 1;
   return { phase: enter("recovering", [{ op: "stop-thread", key: `recover-stop:${job.id}:${epoch}` }, { op: "recover-worker", key: `recover:${job.id}:${epoch}`, epoch }]), control: { ...job.control, epoch, recoveries: job.control.recoveries + 1, invalid: 0, readiness: null, idleObservation: null, workerContext: { round: job.round, text: job.control.workerContext?.text ?? "", recoveryReason: reason } }, nudges: 0, deadline: null, error: reason };
 }
@@ -706,7 +724,7 @@ function checkReview(job: Job, facts: Facts): Action | null {
   const cause = local ? review.fingerprint : "local-evidence";
   const counts = job.control.repair?.counts ?? (job.control.repair ? { [job.control.repair.cause]: job.control.repair.attempts } : {});
   const attempts = (counts[cause] ?? 0) + 1;
-  if (attempts > MAX_REPAIRS) return { type: "change", change: stick(job, `repair exhausted for ${cause}: ${review.reasons.join("; ") || "fresh head-bound local verification is missing"}`, { kind: "verification" }) };
+  if (attempts > MAX_REPAIRS) return { type: "change", change: park(job, `repair exhausted for ${cause}: ${review.reasons.join("; ") || "fresh head-bound local verification is missing"}`, review.reasons) };
   const ordinal = job.round + 1;
   const text = [workerInstructionsForRepair(job, target, review.reasons), `Report round ${ordinal - 1} with replies [] and checks you ran in this worker.`].join("\n");
   return { type: "change", change: { phase: enter("repairing", [{ op: "set-draft", key: `repair-draft:${job.id}:${ordinal}`, target, draft: true }, { op: "send-round", key: `repair:${job.id}:${ordinal}`, text }]), startRound: { ordinal, kind: "feedback", cause: review.reasons.some((reason) => reason.includes("conflicting")) ? "conflict" : "ci", target, baseSha: target.head, feedback: [] }, roundBase: target.head, control: { ...job.control, readiness: null, workerContext: { round: ordinal, text, recoveryReason: null }, repair: { cause, attempts, counts: { ...counts, [cause]: attempts } } }, nudges: 0, rejections: 0, error: null } };
@@ -751,8 +769,30 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
   const head = phase.effects[0];
   const backoff = () => now + BACKOFF_MS[Math.min(Math.max(phase.tries - 1, 0), BACKOFF_MS.length - 1)]!;
   switch (outcome.kind) {
+    case "work": {
+      const control = { ...job.control, preservation: outcome.work.dirty ? "dirty and untracked work retained" : null };
+      const current = { ...job, control };
+      if (outcome.work.kind === "empty" && !job.pr && !job.pushedSha) {
+        if (!control.emptyRetried && control.workspace) {
+          const retry = { ...current, control: { ...control, parked: null, emptyRetried: true, recoveries: 0 } };
+          const change = recover(retry, "the worker produced no commits; retrying in the recorded workspace");
+          return { ...change, control: { ...(change.control ?? retry.control), recoveries: job.control.recoveries + 1 } };
+        }
+        return stick(current, "the worker produced no commits");
+      }
+      const target = job.control.readiness ?? job.control.reviewIntent;
+      const effects: Effect[] = [
+        ...(outcome.work.kind === "commits" ? [{ op: "push", key: `push:${job.id}:park:${outcome.work.sha}`, sha: outcome.work.sha, expectedRemoteSha: roundBase(job) } as const] : []),
+        ...(job.pr ? [
+          ...(target ? [{ op: "set-draft", key: `park-draft:${job.id}:${control.parks}`, target, draft: true } as const] : []),
+          { op: "edit-pr", key: `park-body:${job.id}:${control.parks}`, title: stuckTitle(job), body: stuckBody(current) } as const,
+        ] : [{ op: "open-pr", key: `pr:${job.id}`, title: stuckTitle(job), body: stuckBody(current) } as const]),
+        { op: "labels", key: `park-label:${job.id}:${control.parks}`, on: "pr", add: [LABEL.trigger], remove: [] },
+      ];
+      return { phase: enter("publishing", effects), control };
+    }
     case "changed-target": {
-      if (phase.state === "sending" || phase.state === "repairing") {
+      if (phase.state === "sending" || phase.state === "repairing" || (phase.state === "publishing" && job.control.parked)) {
         const remaining = phase.effects.slice(1).map((effect): Effect => effect.op === "send-round" ? { ...effect, text: `The current remote head is ${outcome.target.head} and base is ${outcome.target.base}. Fetch and merge the current branches before reporting.\n${effect.text}` } : effect);
         return { phase: enter(phase.state, [{ op: "set-draft", key: `${head.key}:refresh:${outcome.target.head}:${outcome.target.base}`, target: outcome.target, draft: true }, ...remaining]), roundBase: outcome.target.head, control: { ...job.control, readiness: null } };
       }
@@ -761,7 +801,7 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
     case "done": {
       const [, ...rest] = phase.effects;
       // On the way to stuck or stopped the error is the reason, so it outlives the effects.
-      const ending = phase.state === "sticking" || phase.state === "stopping";
+      const ending = phase.state === "sticking" || phase.state === "stopping" || job.control.parked !== null;
       if (phase.state === "readifying" && outcome.patch.control?.readiness === null) return { phase: { state: "checking" }, ...outcome.patch };
       const completedPublication = rest.length === 0 && (phase.state === "publishing" || phase.state === "republishing" || phase.state === "replying");
       return { phase: phase.state === "recovering" && rest.length === 0 && job.pr ? { state: "addressing" } : enter(phase.state, rest), ...outcome.patch, ...(completedPublication && job.control.publicationRepair ? { control: { ...(outcome.patch.control ?? job.control), publicationRepair: null } } : {}), ...(ending ? {} : { error: null }) };
@@ -786,6 +826,7 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
       return { phase: { ...phase, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, backoff()) }, error: outcome.error };
     case "publication-diverged": {
       if (head.op !== "push") throw new Error("publication divergence requires a pinned push");
+      if (job.control.parked) return stick(job, `the branch moved on GitHub; unpublished commits at ${head.sha} stay in the workspace`);
       const attempts = (job.control.publicationRepair?.attempts ?? 0) + 1;
       if (attempts > MAX_REPAIRS) return stick(job, `publication divergence exhausted after ${MAX_REPAIRS} repairs; accepted commit ${head.sha} and remote ${outcome.remoteSha} are preserved`);
       const ordinal = job.round + 1;
@@ -826,6 +867,7 @@ export function start(job: Job, worker: WorkerSettings, hostId: string, now: num
  * item in one message. The round's row and its feedback are written with this change, so no item is sent twice.
  */
 function startRound(job: Job, pending: readonly Feedback[], rounds: readonly RoundSummary[], head: Sha, respawn: boolean, now: number): Change {
+  if (job.control.parked) job = { ...job, control: resumedControl(job) };
   const ordinal = job.round + 1;
   const text = roundPrompt(job, ordinal, pending, rounds, head);
   const relabel: Effect = { op: "labels", key: `labels:${job.id}:working:${ordinal}`, on: "issue", add: [LABEL.working], remove: [LABEL.review] };
@@ -885,6 +927,21 @@ function endingEffects(job: Job, kind: "stop" | "stick" | "close"): Effect[] {
   return effects;
 }
 
+function resumedControl(job: Job): Control {
+  return { ...job.control, parked: null, recoveries: 0, invalid: 0, bestReasons: null, repair: null };
+}
+
+export function park(job: Job, reason: string, remaining: readonly string[]): Change {
+  const state = job.phase.state;
+  if (state === "stopping" || state === "sticking" || TERMINAL.has(state) || job.control.parks >= MAX_PARKS) return stick(job, reason);
+  const parks = job.control.parks + 1;
+  const effects: Effect[] = [
+    ...(workerMayExist(job) ? [{ op: "stop-thread", key: `stop-thread:${job.id}:park:${parks}` } as const] : []),
+    { op: "inspect-work", key: `inspect-work:${job.id}:${parks}` },
+  ];
+  return { phase: enter("publishing", effects), control: { ...job.control, parked: { reason, remaining }, parks, readiness: null, localEvidence: null, disposition: null }, error: reason, deadline: null };
+}
+
 /**
  * Any non-terminal state → sticking. A job already on its way to an end goes there directly and drops the rest of its
  * outbox, so an effect that keeps failing while the job ends cannot loop.
@@ -931,7 +988,7 @@ export type InitialReport = z.infer<typeof InitialReport>;
  */
 const Round = z.number().int().positive();
 export const RoundReport = z.discriminatedUnion("outcome", [
-  z.strictObject({ outcome: z.literal("changes"), round: Round, pr: z.strictObject({ body: z.string() }).optional(), replies: z.array(Reply), verification: Verification, summary: Line }),
+  z.strictObject({ outcome: z.literal("changes"), round: Round, pr: z.strictObject({ title: z.string().optional(), body: z.string() }).optional(), replies: z.array(Reply), verification: Verification, summary: Line }),
   z.strictObject({ outcome: z.literal("no-change"), round: Round, replies: z.array(Reply), verification: Verification, summary: Line }),
   z.strictObject({ outcome: z.literal("failure"), round: Round, replies: z.array(Reply), verification: Verification, summary: Line, reason: Line }),
 ]);
@@ -1030,6 +1087,15 @@ export function acceptReport(job: Job, parsed: ParsedReport, facts: ReportFacts)
     return { ok: false, reasons, change: rejectReport(job, reasons) };
   }
   const verdict = parsed.round === "initial" ? acceptInitialReport(job, parsed.report, facts) : acceptRoundReport(job, parsed.report, facts);
+  if (verdict.ok && parsed.report.outcome !== "failure") {
+    if (job.control.parked) verdict.change.control = { ...(verdict.change.control ?? resumedControl(job)), parked: null, recoveries: 0, invalid: 0, bestReasons: null, repair: null };
+    const report = parsed.report;
+    if (job.pr && report.outcome === "changes" && report.pr && verdict.change.phase && "effects" in verdict.change.phase) {
+      const edit: Effect = { op: "edit-pr", key: `edit-pr:${job.id}:${job.round}`, ...(report.pr.title ? { title: report.pr.title } : {}), body: prBody(report.pr.body, job.issue) };
+      const effects = verdict.change.phase.effects;
+      verdict.change.phase = enter(verdict.change.phase.state, effects.some((effect) => effect.op === "edit-pr") ? effects.map((effect) => effect.op === "edit-pr" ? edit : effect) : [...effects, edit]);
+    }
+  }
   if (verdict.ok && (parsed.report.outcome === "changes" || (parsed.report.outcome === "no-change" && job.round > 1 && facts.gate.pass)) && facts.baseSha) {
     const milestone = !job.control.milestones.includes("verified-change");
     verdict.change.control = { ...(verdict.change.control ?? job.control), localEvidence: { head: facts.worktree.headSha, base: facts.baseSha }, invalid: 0, bestReasons: null, ...(milestone ? { milestones: [...job.control.milestones, "verified-change"], recoveries: 0 } : {}) };
@@ -1053,7 +1119,7 @@ function acceptInitialReport(job: Job, report: InitialReport, facts: ReportFacts
       break;
   }
   const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...publication(job, accepted)), report: accepted, ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, readiness: null, disposition: "failure" as const, publicFailure: { kind: "report" as const, reason: report.reason } } } : report.outcome === "no-change" ? { control: { ...job.control, disposition: "no-change" as const } } : {}) }));
+  return verdict(job, reasons, () => ({ ...publication(job, accepted), report: accepted, ...(report.outcome === "no-change" ? { control: { ...job.control, disposition: "no-change" as const } } : {}) }));
 }
 
 function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): Verdict {
@@ -1085,7 +1151,7 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
   if (repeated.length > 0) reasons.push(`reply to each comment once; repeated: ${[...new Set(repeated)].join(", ")}`);
   if (report.outcome === "changes" && !facts.gate.pass) reasons.push(`local gate failed: ${facts.gate.reason}`);
   if (report.outcome === "changes" && facts.inspected && !facts.inspected.nonemptyDiff) reasons.push("the inspected commit has no changes against the pinned comparison commit");
-  if (report.outcome === "changes" && report.pr) reasons.push(...bodyProblems(report.pr.body));
+  if (report.outcome === "changes" && report.pr) reasons.push(...bodyProblems(report.pr.body), ...(report.pr.title ? titleProblems(report.pr.title, facts.titleConvention) : []));
   for (const reply of report.replies) {
     const where = `the reply to ${refKey({ kind: reply.kind, id: reply.commentId })}`;
     reasons.push(...phraseProblems([reply.body], where));
@@ -1095,15 +1161,15 @@ function acceptRoundReport(job: Job, report: RoundReport, facts: ReportFacts): V
     if (length > COMMENT_MAX) reasons.push(`${where} is ${length} characters as posted; GitHub's limit is ${COMMENT_MAX}`);
   }
   const accepted = { ...report, headSha: facts.worktree.headSha, comparisonSha: facts.inspected?.comparisonSha, acceptedAt: facts.now };
-  return verdict(job, reasons, () => ({ phase: enter(...republication(job, accepted, facts.listed)), report: accepted, ...(job.control.publicationRepair && report.outcome === "no-change" ? { pushedSha: facts.worktree.headSha } : {}), ...(report.outcome === "failure" ? { error: report.reason, control: { ...job.control, disposition: "failure" as const, publicFailure: { kind: "report" as const, reason: report.reason } } } : {}) }));
+  return verdict(job, reasons, () => ({ ...republication(job, accepted, facts.listed), report: accepted, ...(job.control.publicationRepair && report.outcome === "no-change" ? { pushedSha: facts.worktree.headSha } : {}) }));
 }
 
 /**
  * The end of a feedback round: push the new commit if there is one, answer every listed item, update the description
  * when the report replaced it, ask the reviewers to look again, and show the issue as in review.
  */
-function republication(job: Job, report: RoundReport & AcceptedReport, listed: readonly Feedback[]): [TransitState, Effect[]] {
-  if (report.outcome === "failure") return ["sticking", endingEffects(job, "stick")];
+function republication(job: Job, report: RoundReport & AcceptedReport, listed: readonly Feedback[]): Change {
+  if (report.outcome === "failure") return park(job, report.reason, job.control.bestReasons ?? []);
   if (job.control.publicationRepair) {
     const remaining = job.control.publicationRepair.remaining.map((effect): Effect => {
       if (effect.op === "reply") {
@@ -1115,10 +1181,10 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
       return effect;
     });
     if (job.pr && report.outcome === "changes" && report.pr && !remaining.some((effect) => effect.op === "edit-pr")) remaining.push({ op: "edit-pr", key: `edit-pr:${job.id}:${job.round}`, body: prBody(report.pr.body, job.issue) });
-    return [job.pr ? "republishing" : "publishing", [
+    return { phase: enter(job.pr ? "republishing" : "publishing", [
       ...(report.outcome === "changes" ? [{ op: "push", key: `push:${job.id}:${job.round}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: roundBase(job) } as const] : []),
       ...remaining,
-    ]];
+    ]) };
   }
   const replies: Effect[] = report.replies.map((reply) => replyEffect(job, reply, listed.find((item) => refKey(item) === refKey({ kind: reply.kind, id: reply.commentId }))!));
   const reviewers = [...new Set(listed.map((item) => item.author))];
@@ -1128,8 +1194,8 @@ function republication(job: Job, report: RoundReport & AcceptedReport, listed: r
     ...(reviewers.length > 0 ? [{ op: "request-review", key: `request-review:${job.id}:${job.round}`, reviewers } as const] : []),
     { op: "labels", key: `labels:${job.id}:review:${job.round}`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
   ];
-  if (report.outcome !== "changes") return ["replying", after];
-  return ["republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: roundBase(job) }, ...after]];
+  if (report.outcome !== "changes") return { phase: enter("replying", after) };
+  return { phase: enter("republishing", [{ op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: roundBase(job) }, ...after]) };
 }
 
 /**
@@ -1156,10 +1222,10 @@ function replyEffect(job: Job, reply: RoundReport["replies"][number], answers: F
   return { op: "reply", key: `reply:${job.id}:${job.round}:${reply.kind}:${reply.commentId}`, target, body: replyText(reply.body, answers) };
 }
 
-function publication(job: Job, report: InitialReport & AcceptedReport): [TransitState, Effect[]] {
+function publication(job: Job, report: InitialReport & AcceptedReport): Change {
   switch (report.outcome) {
     case "changes":
-      return [
+      return { phase: enter(
         "publishing",
         [
           { op: "push", key: `push:${job.id}:${report.headSha}`, sha: report.headSha, expectedRemoteSha: job.pushedSha },
@@ -1167,16 +1233,16 @@ function publication(job: Job, report: InitialReport & AcceptedReport): [Transit
           { op: "labels", key: `labels:${job.id}:pr`, on: "pr", add: [LABEL.trigger], remove: [] },
           { op: "labels", key: `labels:${job.id}:review`, on: "issue", add: [LABEL.review], remove: [LABEL.working] },
         ],
-      ];
+      ) };
     case "failure":
-      return ["sticking", endingEffects(job, "stick")];
+      return park(job, report.reason, job.control.bestReasons ?? []);
     case "no-change":
-      return [
+      return { phase: enter(
         "closing",
         [
           ...endingEffects(job, "close"),
         ],
-      ];
+      ) };
   }
 }
 

@@ -12,6 +12,12 @@ import {
   branchFor,
   FEEDBACK_QUIET_MS,
   MAX_FEEDBACK_ROUNDS,
+  MAX_PARKS,
+  MAX_RECOVERIES,
+  acceptsReport,
+  park,
+  recover,
+  moreFacts,
   command,
   counts,
   enter,
@@ -36,7 +42,7 @@ import {
   type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
-import { issueText, nudgeText, prBody, replyText, roundPrompt, workerInstructions, workerPrompt } from "./text.ts";
+import { issueText, nudgeText, prBody, stuckBody, stuckTitle, titleProblems, replyText, roundPrompt, workerInstructions, workerPrompt } from "./text.ts";
 
 const NOW = 10_000_000;
 const MIN = 60_000;
@@ -245,7 +251,9 @@ test("active workers have no deadline and confirmed idle workers recover after t
   const working = job({ phase: { state: "working" }, threadId: "thr_w", updatedAt: NOW - MIN });
   assert.equal(plan(working, facts({ now: NOW + 1000 * MIN, thread: { kind: "active" } })), null);
   const scheduled = plan(working, facts({ thread: { kind: "failed", error: "quota", retryAt: NOW + MIN } }));
-  assert.deepEqual(scheduled, { type: "sleep", until: NOW + MIN });
+  assert.deepEqual(scheduled, { type: "change", change: { error: "waiting for the worker's provider to retry" } });
+  assert.equal(scheduled?.type, "change");
+  if (scheduled?.type === "change") assert.deepEqual(plan(apply(working, scheduled.change), facts({ thread: { kind: "failed", error: "quota", retryAt: NOW + MIN } })), { type: "sleep", until: NOW + MIN });
   const failed = plan(working, facts({ thread: { kind: "failed", error: "provider crashed" } }));
   assert.equal(failed?.type, "change");
   if (failed?.type === "change") assert.equal(failed.change.phase?.state, "recovering");
@@ -514,13 +522,13 @@ test("an unavailable feedback worker enters confirmed-stop recovery in the recor
   assert.equal("hostId" in action.change, false, "a replacement reuses the worker's workspace on its machine");
 });
 
-test("feedback after the fifth feedback round sticks the job instead of starting a sixth", () => {
+test("feedback after the fifth feedback round parks the job for review", () => {
   const items = [inline(1, NOW - 5 * MIN)];
   assert.equal((plan(inReview({ round: MAX_FEEDBACK_ROUNDS }), facts(pending(items))) as { change: Change }).change.phase?.state, "sending");
   const limit = plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1, control: { ...initialControl(), feedbackRounds: MAX_FEEDBACK_ROUNDS } }), facts(pending(items)));
   const stuck = (limit as { change: Change }).change;
-  assert.equal(stuck.phase?.state, "sticking");
-  assert.match(stuck.error!, /unresolved feedback after 5 feedback rounds/);
+  assert.equal(stuck.phase?.state, "publishing");
+  assert.match(stuck.error!, /feedback round limit reached after 5 rounds/);
   assert.equal(plan(inReview({ round: MAX_FEEDBACK_ROUNDS + 1, control: { ...initialControl(), feedbackRounds: MAX_FEEDBACK_ROUNDS } }), facts(pending([]))), null, "no new feedback, nothing to end");
 });
 
@@ -599,7 +607,7 @@ test("a feedback round's report must answer exactly the listed items, add a comm
   const working = job({ phase: { state: "working" }, threadId: "thr_w" });
   assert.equal(parseReport(working, { outcome: "changes", verification: ["npm test"], summary: "s" }).ok, false, "the first round's changes need pr.title and pr.body");
   assert.equal(parseReport(addressing, { outcome: "needs-info", round: 1, questions: ["Which helper?"], replies: REPLIES, verification: ["read it"] }).ok, false, "a question goes in a reply");
-  assert.equal(parseReport(addressing, { outcome: "changes", round: 1, pr: { title: "fix: x is renamed", body: "b" }, replies: REPLIES, verification: ["npm test"], summary: "s" }).ok, false, "the title is set once");
+  assert.equal(parseReport(addressing, { outcome: "changes", round: 1, pr: { title: "fix: x is renamed", body: "b" }, replies: REPLIES, verification: ["npm test"], summary: "s" }).ok, true, "a resumed contribution can replace its unfinished title");
   assert.equal(parseReport(addressing, { outcome: "no-change", round: 1, verification: ["read it"], summary: "s" }).ok, false, "replies are required");
   const answered = { outcome: "no-change", replies: REPLIES, verification: ["read it"], summary: "s" };
   assert.deepEqual(parseReport({ ...addressing, round: 3 }, { ...answered, round: 1 }), { ok: false, code: "other_round", message: "this report is for feedback round 1, and the job is on feedback round 2; report only for the latest round message" });
@@ -780,4 +788,90 @@ test("a prerequisite wait preserves evidence and gates ready promotion, repair, 
   for (const state of ["working", "addressing", "queued"] as const) {
     assert.equal(plan(inReview({ phase: { state }, control }), facts({ prerequisiteWait: true, worker: WORKER, thread: { kind: "gone" } })), null);
   }
+});
+
+test("exhausted recovery parks with the remaining validation problems and stops before inspection", () => {
+  const current = job({ phase: { state: "working" }, threadId: "thr_w", control: { ...initialControl(), recoveries: MAX_RECOVERIES, bestReasons: ["Tests failed."] } });
+  const change = recover(current, "the worker stopped");
+  const parked = apply(current, change);
+  assert.equal(parked.phase.state, "publishing");
+  assert.deepEqual(parked.control.parked, { reason: "automatic recovery exhausted: the worker stopped", remaining: ["Tests failed."] });
+  assert.equal(parked.control.parks, 1);
+  assert.equal(parked.deadline, null);
+  assert.ok("effects" in parked.phase);
+  assert.deepEqual(parked.phase.effects.map((effect) => effect.op), ["stop-thread", "inspect-work"]);
+  assert.equal(acceptsReport(parked), false);
+});
+
+test("parking and terminal guards bound repeated unfinished attempts", () => {
+  const current = job({ phase: { state: "working" }, threadId: "thr_w", control: { ...initialControl(), parks: MAX_PARKS } });
+  assert.equal(park(current, "still incomplete", []).phase?.state, "sticking");
+  for (const state of ["stopping", "stopped", "sticking", "stuck", "done", "ignored"] as const) {
+    const change = park({ ...current, phase: state === "stopping" || state === "sticking" ? enter(state, [labelEffect]) : { state }, control: initialControl() }, "incomplete", []);
+    assert.equal(change.phase?.state, state === "stopping" || state === "stopped" ? "stopped" : "stuck");
+  }
+});
+
+test("parked work preserves its reason, bypasses automatic repair, and accepts current reports only while checking", () => {
+  const control = { ...initialControl(), parked: { reason: "repair exhausted", remaining: ["CI failed"] }, parks: 1, feedbackRounds: MAX_FEEDBACK_ROUNDS };
+  const current = inReview({ phase: { state: "checking" }, error: "repair exhausted", control });
+  const observed = facts({ review: { kind: "observed", target: { pr: current.pr!.number, head: HEAD, base: HEAD }, state: "open", draft: true, complete: true, ready: false, pending: false, mergeability: "conflicting", observedAt: NOW, reasons: ["CI failed"], fingerprint: "CI" } });
+  assert.equal(plan(current, observed), null);
+  assert.equal(acceptsReport(current), true);
+  assert.equal(acceptsReport({ ...current, phase: { state: "stuck" } }), false);
+  const action = plan(current, facts(pending([inline(1, NOW - 5 * MIN)])));
+  assert.equal(action?.type, "change");
+  if (action?.type !== "change") throw new Error("expected feedback round");
+  assert.equal(action.change.phase?.state, "sending");
+  assert.equal(action.change.control?.parked, null);
+  assert.equal(action.change.control?.parks, 1);
+  assert.equal(action.change.control?.recoveries, 0);
+  assert.deepEqual(moreFacts(current, facts({ pr: { state: "open" }, feedback: { pending: [inline(1, NOW - 5 * MIN)] } })), ["thread", "rounds", "remote"]);
+});
+
+test("a parked publication refuses remote divergence without starting a repair round", () => {
+  const current = job({ phase: enter("publishing", [pushEffect]), control: { ...initialControl(), parked: { reason: "incomplete", remaining: [] }, parks: 1 } });
+  const change = settle(current, { kind: "publication-diverged", remoteSha: "b".repeat(40) as Sha, reason: "stale-remote" }, NOW);
+  assert.equal(change.phase?.state, "stuck");
+  assert.match(change.error!, /branch moved on GitHub; unpublished commits at/);
+  assert.equal(change.startRound, undefined);
+});
+
+test("a stale parked draft target retains its body and remaining effects", () => {
+  const target = { pr: 90, head: HEAD, base: HEAD };
+  const current = job({ phase: enter("publishing", [{ op: "set-draft", key: "draft", target, draft: true }, { op: "edit-pr", key: "body", body: "unfinished" }]), control: { ...initialControl(), parked: { reason: "incomplete", remaining: [] }, parks: 1 } });
+  const moved = { ...target, base: "b".repeat(40) as Sha };
+  const change = settle(current, { kind: "changed-target", target: moved }, NOW);
+  assert.ok(change.phase && "effects" in change.phase);
+  assert.equal(change.phase.state, "publishing");
+  assert.deepEqual(change.phase.effects.at(-1), { op: "edit-pr", key: "body", body: "unfinished" });
+  const first = change.phase.effects[0];
+  assert.equal(first.op, "set-draft");
+  if (first.op === "set-draft") assert.deepEqual(first.target, moved);
+});
+
+test("the one empty-work retry bypasses exhausted recovery without replenishing it", () => {
+  const current = job({ phase: enter("publishing", [{ op: "inspect-work", key: "inspect" }]), control: { ...initialControl(), parked: { reason: "exhausted", remaining: [] }, parks: 1, recoveries: MAX_RECOVERIES, workspace: { hostId: "host_1", environmentId: "env_1", path: "/worktree", branch: "bb/work" } } });
+  const change = settle(current, { kind: "work", work: { kind: "empty", dirty: true } }, NOW);
+  assert.equal(change.phase?.state, "recovering");
+  assert.equal(change.control?.emptyRetried, true);
+  assert.equal(change.control?.parked, null);
+  assert.equal(change.control?.recoveries, MAX_RECOVERIES + 1);
+  const retry = apply(current, change);
+  assert.equal(recover(retry, "still failed").phase?.state, "publishing");
+});
+
+
+test("unfinished PR text stays bounded, describes remaining work, and never closes an issue", () => {
+  const current = job({ snapshot: { ...job().snapshot, title: "A long title ".repeat(20) }, control: { ...initialControl(), parked: { reason: "Could not finish. Fixes #41 @maya", remaining: ["CI must pass. Closes #42", "Resolve the interface mismatch."] }, preservation: "dirty and untracked work retained" } });
+  assert.deepEqual(titleProblems(stuckTitle(current), "conventional"), []);
+  assert.ok(stuckTitle(current).length <= 72);
+  const body = stuckBody(current);
+  assert.match(body, /CI must pass/);
+  assert.match(body, /Resolve the interface mismatch/);
+  assert.match(body, /did not complete validation/);
+  assert.match(body, /Uncommitted changes remain/);
+  assert.match(body, /Related to #41/);
+  assert.doesNotMatch(body, /(?:fixes|closes|resolves) #\d+/i);
+  assert.match(body, /`@maya`/);
 });

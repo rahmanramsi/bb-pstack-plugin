@@ -60,7 +60,7 @@ test("a crash after accepted reminder send retains delivery intent until lease e
   assert.equal(h.spawned.length, 2);
 });
 
-test("exhausted feedback-worker recovery preserves its failure and leaves feedback pending", async () => {
+test("a pending trusted review resumes an exhausted feedback worker after parking", async () => {
   const h = harness();
   const { job, pr } = await h.toReview();
   const row = h.store.get(job.id)!;
@@ -69,11 +69,11 @@ test("exhausted feedback-worker recovery preserves its failure and leaves feedba
   h.review(pr, { body: "Correct the footer spacing." });
   await h.advance(3 * MIN);
   const failed = await h.only();
-  assert.equal(failed.state, "stuck");
-  assert.match(failed.error!, /automatic recovery exhausted.*feedback worker/);
-  assert.equal(failed.round, job.round);
-  assert.equal(h.store.pendingFeedback(job.id).length, 1);
+  assert.equal(failed.state, "addressing");
+  assert.equal(failed.round, job.round + 1);
+  assert.equal(h.store.pendingFeedback(job.id).length, 0);
   assert.equal(h.spawned.length, 1);
+  assert.equal(h.store.get(job.id)!.control.parks, 1);
 });
 
 for (const merged of [true, false]) {
@@ -329,7 +329,8 @@ test("persistent unknown mergeability exhausts its bounded diagnostic repairs", 
     await h.settle();
     await h.advance(MIN);
   }
-  assert.equal((await h.only()).state, "stuck");
+  assert.equal((await h.only()).state, "checking");
+  assert.ok(h.store.get((await h.only()).id)!.control.parked);
   assert.match((await h.only()).error!, /repair exhausted.*mergeability is unknown/);
   assert.equal(h.sent.length, 5);
 });

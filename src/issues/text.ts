@@ -2,7 +2,7 @@
  * Text the issue feature writes: the worker's prompts and reminders, and everything posted on GitHub with the checks
  * and sanitizing it gets first. Pure.
  */
-import { MAX_FEEDBACK_ROUNDS, MAX_NUDGES, TERMINAL, type ChildFact, type Feedback, type GateFact, type Job, type RoundSummary, type Sha, type ReportFacts } from "./job.ts";
+import { MAX_FEEDBACK_ROUNDS, MAX_NUDGES, PROVIDER_WAIT, TERMINAL, type ChildFact, type Feedback, type GateFact, type Job, type RoundSummary, type Sha, type ReportFacts } from "./job.ts";
 
 /**
  * Phrases that describe how a change was made instead of the change. Whole phrases, so "thread pool", "user agent"
@@ -369,6 +369,28 @@ function statusProse(text: string): string {
   return issueText(unmarked(text).replace(/[&<`~\\]/g, (char) => STATUS_PROSE_ENTITIES[char]!));
 }
 
+export function stuckTitle(job: Job): string {
+  const prefix = `chore(issue-${job.issue}): unfinished work`;
+  const title = `${prefix} for ${job.snapshot.title.replace(/[\r\n]+/g, " ")}`.slice(0, 72).trim();
+  return titleProblems(title, "conventional").length ? prefix : title;
+}
+
+export function stuckBody(job: Job): string {
+  const parked = job.control.parked;
+  const remaining = parked?.remaining.length ? parked.remaining.map((reason) => `- ${issueText(reason)}`).join("\n") : "The work was not verified.";
+  const body = [
+    "## Unfinished work",
+    issueText(parked?.reason ?? job.error ?? "The worker could not finish."),
+    "The work did not complete validation. This draft pull request was opened without `gate pr`.",
+    "## What remains",
+    remaining,
+    job.control.preservation === "dirty and untracked work retained" ? "Uncommitted changes remain in the worker's workspace." : null,
+    "Review this pull request to start another round; close it to give up.",
+    `Related to #${job.issue}`,
+  ].filter(Boolean).join("\n\n");
+  return outsideCode(body, (text) => text.replace(CLOSING_KEYWORD, ""));
+}
+
 /**
  * The status comment's body, within GitHub's limit once `statusComment` wraps it. The outcome and the fixed facts come
  * first. The report's prose and the sub-issue progress follow with Markdown's structural characters as entities, so
@@ -376,11 +398,12 @@ function statusProse(text: string): string {
  */
 export function statusBody(job: Job): string {
   const result = job.control.disposition;
-  const status = result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : ISSUE_STAGE[job.phase.state];
+  const status = job.control.parked && job.pr ? "Unfinished: draft pull request open" : result === "closed" ? "Closed without merging" : result === "failure" ? "Failed" : result === "stopped" ? "Stopped" : result === "no-change" ? "No change needed" : result === "merged" ? "Merged" : job.control.readiness ? "Ready for review" : ISSUE_STAGE[job.phase.state];
   const failure = job.control.publicFailure;
   let reason: string | null = null;
-  let reported: string | null = null;
-  if (result === "failure") {
+  let reported: string | null = job.error?.startsWith(PROVIDER_WAIT) ? job.error : null;
+  if (job.control.parked && job.pr) reported = job.control.parked.reason;
+  else if (result === "failure") {
     switch (failure?.kind) {
       case "workflow-permission": reason = "Workflow changes require a workflow write permission that is unavailable. The work is preserved."; break;
       case "publication-denied": reason = "Repository permissions denied publication. The work is preserved."; break;
