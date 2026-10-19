@@ -333,10 +333,14 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       .prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'")
       .get(job.repo, job.issue) as { earlier: number };
     const generation = earlier + 1;
+    const last = db
+      .prepare("SELECT branch, state, pushed_sha, error FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored' ORDER BY generation DESC LIMIT 1")
+      .get(job.repo, job.issue) as { branch: BranchName; state: string; pushed_sha: Sha | null; error: string | null } | undefined;
+    const resume = last?.state === "stuck" && last.pushed_sha ? { branch: last.branch, sha: last.pushed_sha, reason: last.error } : null;
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, runtime_protocol)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, control_json, runtime_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     ).run(
       job.id,
       job.repo,
@@ -356,6 +360,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       now,
       now,
       job.parentId ?? null,
+      JSON.stringify(resume ? { resume } : {}),
     );
     const inserted = get(job.id);
     if (inserted) projectStatus(inserted);

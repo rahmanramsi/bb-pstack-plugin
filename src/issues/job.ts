@@ -294,8 +294,10 @@ export type Control = {
   disposition: "merged" | "closed" | "no-change" | "failure" | "stopped" | null;
   preservedSha: Sha | null;
   preservation: string | null;
+  /** The issue's previous job got stuck after pushing this branch, so the first worker continues from its commits. */
+  resume: { branch: BranchName; sha: Sha; reason: string | null } | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null, resume: null });
 export type Job = {
   control: Control;
   id: JobId;

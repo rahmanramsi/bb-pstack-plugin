@@ -211,6 +211,8 @@ Creating or provisioning environments and recognized transient pre-spawn faults,
 
 A job gets 2 recoveries. The count resets once, when the job's first `changes` report is accepted. When recoveries run out, or the environment is conclusively unsafe to reuse, the job fails. Its public status names the failure category and retained commit; local details remain available in bb.
 
+**Continuing a failed job.** When the issue's previous job failed after pstack pushed its branch, the next job continues from that work. Its first worker still starts from the default branch, and its prompt names the earlier branch, the pushed commit, and why that job ended. The worker merges the branch and builds on it. Pull requests and report validation still count commits against the default branch. Deleting the earlier branch on GitHub before relabeling forces a fresh start: the worker finds no branch and starts from the default branch. Work that was never pushed stays in the earlier job's worktree.
+
 A worker that keeps making progress has no time limit. pstack records no deadline for a round.
 
 ## Publication

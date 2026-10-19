@@ -175,6 +175,7 @@ export function workerPrompt(job: Job): string {
     "",
     ...parentSection(job),
     ...job.control.prerequisites.map((item) => `Include prerequisite #${item.issue}. Fetch with bb pstack gh fetch, then merge origin/${item.branch} at ${item.sha} before implementing and verifying this issue.`),
+    ...(job.control.resume ? [`An earlier job for this issue pushed ${job.control.resume.sha} to \`${job.control.resume.branch}\` and then stopped${job.control.resume.reason ? `: ${job.control.resume.reason}` : ""}. Fetch with bb pstack gh fetch, merge origin/${job.control.resume.branch}, and continue from its commits instead of starting over. If that branch no longer exists, start from \`${job.baseBranch}\`.`, ""] : []),
     ...(job.progress ? ["## Integration", "", fenced(job.progress), ""] : []),
     "## Rules",
     "",

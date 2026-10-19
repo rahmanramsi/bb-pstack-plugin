@@ -33,6 +33,7 @@ import {
   type ReportFacts,
   type ReviewFact,
   type Sha,
+  type BranchName,
   type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
@@ -410,6 +411,16 @@ test("the worker prompt fences the issue as data, even when the issue contains a
   assert.match(prompt, /built-in PR tool/);
   assert.match(prompt, /Never run `git push`, never use `gh`/);
   assert.match(prompt, /pull_request_template\.md/);
+});
+
+test("the worker prompt tells a resumed job to merge the stuck job's branch, and a fresh job says nothing of it", () => {
+  const sha = "a".repeat(40) as Sha;
+  const resumed = job({ control: { ...initialControl(), resume: { branch: "agent/issue-41-submit-button-hides" as BranchName, sha, reason: "automatic recovery exhausted" } } });
+  const prompt = workerPrompt(resumed);
+  assert.match(prompt, new RegExp(`pushed ${sha} to \`agent/issue-41-submit-button-hides\` and then stopped: automatic recovery exhausted`));
+  assert.match(prompt, /merge origin\/agent\/issue-41-submit-button-hides, and continue from its commits/);
+  assert.match(prompt, /If that branch no longer exists, start from `main`/);
+  assert.doesNotMatch(workerPrompt(job()), /An earlier job/);
 });
 
 test("unattended workers keep decision guidance at start, after compaction, and when reminded", () => {
