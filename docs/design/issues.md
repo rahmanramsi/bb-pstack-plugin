@@ -315,7 +315,7 @@ bb pstack issues stop <job>
 bb pstack issues retry <job>          # a new job for the issue of a stuck or stopped job
 ```
 
-`issues list` shows open jobs and each issue's latest stuck job with its reason, until a newer job for the issue replaces it; `--all` adds the rest. `issues retry` starts a new job for the issue once its cause is fixed, and refuses while the issue has an open job.
+`issues list` shows open jobs and each issue's latest stuck job with its reason, until a newer job for the issue replaces it; an ignored label event does not replace it. `--all` adds the rest. `issues retry` starts a new job for the issue once its cause is fixed, and refuses while the issue has an open job. A sub-issue's job is not retried on its own: stop and retry its parent, which creates its sub-issues' jobs again.
 
 The **Issues** panel in the bb app lists every catalog issue with its job. A job's badge shows its outcome once it has one and its current step before that. A job that ended before an upgrade and left no record of merge, closure, or a no-change report shows a neutral **Outcome unknown** badge, never Merged or a success. Notes under the badge show the failure reason first, then a branch-policy limitation, then delivery and polling state. **Needs attention** filters to failed and closed-unmerged jobs, delivery errors, poll errors, and issues that cannot start.
 
