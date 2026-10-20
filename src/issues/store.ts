@@ -338,18 +338,16 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
 
   for (const row of db.prepare("SELECT * FROM issue_jobs ORDER BY generation, created_at").all() as JobRow[]) projectStatus(parse(row));
 
-  const insert = db.transaction((job: NewJob, now: number): Job | null => {
-    if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
-    if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
-    if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
-    const { earlier } = db
-      .prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'")
-      .get(job.repo, job.issue) as { earlier: number };
-    const generation = earlier + 1;
+  /** The issue's next generation: one more than its jobs that were not ignored. */
+  const nextGeneration = (repo: RepoName, issue: number) =>
+    (db.prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'").get(repo, issue) as { earlier: number }).earlier + 1;
+
+  /** `published`: the pull request and head an adopted job starts with. */
+  function insertRow(job: NewJob, now: number, generation: number, branch: BranchName, published: { pr: { number: number; url: string }; head: Sha } | null): Job {
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, runtime_protocol)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, pr_number, pr_url, pushed_sha, runtime_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     ).run(
       job.id,
       job.repo,
@@ -363,16 +361,50 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       job.hostId ?? NO_HOST,
       job.hostId === null ? 0 : 1,
       job.baseBranch,
-      branchFor(job.issue, job.snapshot.title, generation),
+      branch,
       job.state,
       job.error,
       now,
       now,
       job.parentId ?? null,
+      published?.pr.number ?? null,
+      published?.pr.url ?? null,
+      published?.head ?? null,
     );
-    const inserted = get(job.id);
-    if (inserted) projectStatus(inserted);
+    const inserted = get(job.id)!;
+    projectStatus(inserted);
     return inserted;
+  }
+
+  const insert = db.transaction((job: NewJob, now: number): Job | null => {
+    if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
+    if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
+    if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
+    const generation = nextGeneration(job.repo, job.issue);
+    return insertRow(job, now, generation, branchFor(job.issue, job.snapshot.title, generation), null);
+  });
+
+  const adopt = db.transaction((job: NewAdoption, now: number): Adoption => {
+    const open = openRow(job.repo, job.issue);
+    if (open) {
+      if (open.pr_number === job.pr.number && open.branch === job.branch) return { kind: "already", job: parse(open) };
+      return { kind: "refused", reason: `${open.id} is open on issue #${job.issue} (${open.state}); stop it first with \`bb pstack issues stop ${open.id}\`` };
+    }
+    const holder = db
+      .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND (branch = ? OR pr_number = ?) AND state NOT IN (${placeholders(TERMINAL_LIST)})`)
+      .get(job.repo, job.branch, job.pr.number, ...TERMINAL_LIST) as JobRow | undefined;
+    if (holder) return { kind: "refused", reason: `${holder.branch === job.branch ? job.branch : `pull request #${job.pr.number}`} belongs to ${holder.id} on issue #${holder.issue}` };
+    const { branch, pr, head, ...fields } = job;
+    const inserted = insertRow({ ...fields, state: "queued", error: null }, now, nextGeneration(job.repo, job.issue), branch, { pr, head });
+    const transferred = db
+      .prepare(
+        `UPDATE issue_feedback SET job_id = ?, round = NULL
+         WHERE repo = ? AND pr_number = ? AND job_id IN (SELECT id FROM issue_jobs WHERE state IN (${placeholders(TERMINAL_LIST)}))
+           AND (round IS NULL OR NOT EXISTS (SELECT 1 FROM issue_rounds r WHERE r.job_id = issue_feedback.job_id
+             AND coalesce(r.feedback_round, r.ordinal) = issue_feedback.round AND r.report_json IS NOT NULL))`,
+      )
+      .run(inserted.id, job.repo, pr.number, ...TERMINAL_LIST).changes;
+    return { kind: "adopted", job: inserted, transferred };
   });
 
   const addFeedback = db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
@@ -616,8 +648,10 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     }),
   };
   const adoptions: Adoptions = {
-    adopt() {
-      throw new Error("not implemented");
+    adopt(job, now) {
+      const outcome = adopt(job, now);
+      if (outcome.kind === "adopted") onChange();
+      return outcome;
     },
   };
   return { ...reads, ...notifying(writes, onChange), ...deliveries, ...adoptions };
