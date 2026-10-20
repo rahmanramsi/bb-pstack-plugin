@@ -73,6 +73,7 @@ import { commentBody, effectMarker, mergeNote, workerInstructions, workerPrompt,
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
+const RETRY_ENQUEUE_GRACE_MS = 60_000;
 const MAX_STEPS = 20;
 const SETTLE_MARGIN_MS = 5_000;
 /** Kept back from the push so the token can still be revoked before the lease ends. */
@@ -584,10 +585,15 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (thread.status === "error" || thread.queuedMessageCount > 0) {
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
         const retry = queued.filter((item) => item.payload.kind === "retry").map((item) => item.sendAt ?? clock() + SWEEP_MS);
-        if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt: retry.length ? Math.max(...retry) : null };
+        const retryAt = retry.length ? Math.max(...retry) : clock() < thread.updatedAt + RETRY_ENQUEUE_GRACE_MS ? thread.updatedAt + RETRY_ENQUEUE_GRACE_MS : null;
+        if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt };
         if (thread.status === "idle" && queued.length) return { kind: "waiting" };
       }
       if (thread.status === "idle" && (thread.activeBackgroundAgentCount > 0 || thread.runtime && !["idle", "error"].includes(thread.runtime.displayStatus))) return { kind: "waiting" };
+      if (thread.status === "idle" && thread.environmentId) {
+        const activity = (await workspaceThreads(thread.environmentId)).find((row) => row.id === threadId)?.activity;
+        if (activity && (activity.activeBackgroundCommandCount > 0 || activity.activeGoalCount > 0 || activity.activeWorkflowCount > 0)) return { kind: "waiting" };
+      }
       if (thread.status === "idle") return { kind: "idle", since: thread.updatedAt };
       return { kind: "active" };
     } catch (error) {
