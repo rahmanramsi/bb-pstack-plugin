@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 import { MIGRATIONS } from "../store.ts";
-import { RESTING_STATES, TERMINAL, TRANSIT, enter, type AcceptedReport, type Change, type Effect, type Feedback, type JobId, type RepoName, type Sha } from "./job.ts";
-import { openIssueStore, type NewJob } from "./store.ts";
+import { RESTING_STATES, TERMINAL, TRANSIT, adopted, enter, type AcceptedReport, type BranchName, type Change, type Effect, type Feedback, type JobId, type RepoName, type Sha } from "./job.ts";
+import { openIssueStore, type NewAdoption, type NewJob } from "./store.ts";
 
 const REPO = "acme/web" as RepoName;
 let ids = 0;
@@ -369,4 +369,93 @@ test("submission evaluations and status revisions survive lost writers and newer
   assert.equal(store.statuses(9)[0]!.jobId, second.id);
   assert.ok(!store.statuses(9)[0]!.body.includes("historical"));
   db.close();
+});
+
+const SALVAGED = "agent/issue-41-salvaged" as BranchName;
+function adoption(overrides: Partial<NewAdoption> = {}): NewAdoption {
+  const { state: _, error: __, ...job } = newJob({ trigger: { eventId: null, actor: "the bb CLI", at: 1 } });
+  return { ...job, branch: SALVAGED, pr: { number: 57, url: "https://github.com/acme/web/pull/57" }, head: SHA, ...overrides };
+}
+
+test("adopting a pull request inserts a queued job that owns it, once, as the issue's next generation", () => {
+  const { db, store, changes } = setup();
+  const stuck = store.insert(newJob(), 10)!;
+  store.write(stuck.id, 0, { phase: { state: "stuck" } }, 11);
+  const before = changes.count;
+  const outcome = store.adopt(adoption(), 20);
+  assert.equal(outcome.kind, "adopted");
+  assert.equal(changes.count - before, 1, "an adoption signals once");
+  if (outcome.kind !== "adopted") return;
+  const { job } = outcome;
+  assert.equal(outcome.transferred, 0);
+  assert.equal(adopted(job), true);
+  assert.deepEqual([job.phase.state, job.branch, job.pr, job.pushedSha, job.generation, job.trigger.eventId, job.round], ["queued", SALVAGED, { number: 57, url: "https://github.com/acme/web/pull/57" }, SHA, 2, null, 1]);
+  assert.equal(store.open(REPO, 41)!.id, job.id);
+  const status = db.prepare("SELECT job_id, generation, body FROM issue_status WHERE repo = ? AND issue = 41").get(REPO) as { job_id: string; generation: number; body: string };
+  assert.deepEqual([status.job_id, status.generation], [job.id, 2], "the new generation takes over the issue's status comment");
+  assert.match(status.body, /Pull request: https:\/\/github\.com\/acme\/web\/pull\/57/);
+
+  const again = store.adopt(adoption(), 30);
+  assert.deepEqual(again, { kind: "already", job });
+  assert.equal(changes.count - before, 1, "a repeated adoption changes nothing");
+});
+
+test("an adoption is refused while another open job holds the issue, the branch or the pull request", () => {
+  const { store, changes } = setup();
+  const open = store.insert(newJob(), 10)!;
+  const before = changes.count;
+  const holder = store.adopt(adoption(), 20);
+  assert.equal(holder.kind, "refused");
+  assert.match(holder.kind === "refused" ? holder.reason : "", new RegExp(`${open.id} is open on issue #41`));
+  assert.equal(changes.count - before, 0, "a refusal changes nothing");
+
+  const other = store.adopt(adoption({ issue: 42, id: nextId() }), 30);
+  assert.equal(other.kind, "adopted");
+  const branch = store.adopt(adoption({ issue: 43, id: nextId(), pr: { number: 58, url: "u58" } }), 40);
+  assert.equal(branch.kind, "refused");
+  assert.match(branch.kind === "refused" ? branch.reason : "", /agent\/issue-41-salvaged belongs to psi_\S+ on issue #42/);
+  const pull = store.adopt(adoption({ issue: 43, id: nextId(), branch: "agent/issue-43-x" as BranchName }), 50);
+  assert.equal(pull.kind, "refused");
+  assert.match(pull.kind === "refused" ? pull.reason : "", /pull request #57 belongs to psi_\S+ on issue #42/);
+  assert.equal(store.open(REPO, 43), null);
+});
+
+test("re-adopting a pull request takes over the unanswered feedback of the job that ended and leaves the answered rounds with it", () => {
+  const { db, store } = setup();
+  const first = store.insert(newJob(), 10)!;
+  store.write(first.id, 0, { phase: enter("starting", [spawn]), startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] } }, 11);
+  let row = store.write(first.id, 1, { phase: { state: "review" }, threadId: "thr_r", pushedSha: SHA, pr: { number: 7, url: "u" }, finishRound: true }, 12)!;
+  const add = (...items: Feedback[]) => store.addFeedback(REPO, items.map((feedback) => ({ jobId: first.id, pr: 7, feedback })));
+  add(comment(1, 100), comment(2, 110));
+  row = store.write(first.id, row.version, { phase: { state: "addressing" }, startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [{ kind: "review-comment", id: 1 }, { kind: "review-comment", id: 2 }] } }, 120)!;
+  const report: AcceptedReport = { outcome: "no-change", round: 1, replies: [], verification: ["read it"], summary: "Answered.", headSha: SHA, acceptedAt: 130 };
+  row = store.write(first.id, row.version, { report, phase: { state: "review" }, finishRound: true }, 130)!;
+  add(comment(3, 140));
+  row = store.write(first.id, row.version, { phase: { state: "addressing" }, startRound: { ordinal: 3, kind: "feedback", baseSha: SHA, feedback: [{ kind: "review-comment", id: 3 }] } }, 150)!;
+  add(comment(4, 160));
+  store.write(first.id, row.version, { phase: { state: "stuck" } }, 170);
+
+  const outcome = store.adopt(adoption({ pr: { number: 7, url: "u" }, branch: first.branch }), 200);
+  assert.equal(outcome.kind, "adopted");
+  if (outcome.kind !== "adopted") return;
+  assert.equal(outcome.transferred, 2);
+  assert.deepEqual(store.pendingFeedback(outcome.job.id).map((item) => item.id), [3, 4], "the unanswered round's item and the pending one");
+  assert.deepEqual(store.roundFeedback(first.id, 2).map((item) => item.id), [1, 2], "the answered round keeps its items");
+  assert.deepEqual(store.pendingFeedback(first.id), []);
+  assert.equal(store.addFeedback(REPO, [comment(1, 100), comment(4, 160)].map((feedback) => ({ jobId: outcome.job.id, pr: 7, feedback }))), 0, "the new job's first poll replays nothing");
+  assert.deepEqual(db.prepare("SELECT count(*) AS n FROM issue_feedback WHERE job_id = ?").get(outcome.job.id), { n: 2 });
+});
+
+test("the adopted job's first round is written without a round 1 before it", () => {
+  const { db, store } = setup();
+  const outcome = store.adopt(adoption(), 10);
+  assert.equal(outcome.kind, "adopted");
+  if (outcome.kind !== "adopted") return;
+  const { job } = outcome;
+  store.addFeedback(REPO, [comment(1, 5)].map((feedback) => ({ jobId: job.id, pr: 57, feedback })));
+  const started = store.write(job.id, job.version, { phase: enter("respawning", [spawn]), startRound: { ordinal: 2, kind: "feedback", baseSha: SHA, feedback: [{ kind: "review-comment", id: 1 }] }, roundBase: SHA }, 20)!;
+  assert.equal(started.round, 2);
+  assert.equal(started.phase.state, "respawning");
+  assert.deepEqual(db.prepare("SELECT ordinal, kind, base_sha, finished_at FROM issue_rounds WHERE job_id = ?").all(job.id), [{ ordinal: 2, kind: "feedback", base_sha: SHA, finished_at: null }]);
+  assert.deepEqual(store.roundFeedback(job.id, 2).map((item) => item.id), [1]);
 });

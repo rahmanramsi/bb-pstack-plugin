@@ -9,6 +9,9 @@ import {
   parseReport,
   TRANSIT,
   acceptReport,
+  adopted,
+  adoptionProblems,
+  awaitingThread,
   branchFor,
   FEEDBACK_QUIET_MS,
   MAX_FEEDBACK_ROUNDS,
@@ -18,10 +21,12 @@ import {
   isReasoningLevel,
   needsMachine,
   owesSpawn,
+  moreFacts,
   plan,
   settle,
   stop,
   toView,
+  type BranchName,
   type Change,
   type Effect,
   type Facts,
@@ -36,6 +41,7 @@ import {
   type SpawnSpec,
   type WorkerSettings,
 } from "./job.ts";
+import type { PullDetail } from "./github.ts";
 import { issueText, nudgeText, prBody, replyText, roundPrompt, workerInstructions, workerPrompt } from "./text.ts";
 
 const NOW = 10_000_000;
@@ -780,4 +786,137 @@ test("a prerequisite wait preserves evidence and gates ready promotion, repair, 
   for (const state of ["working", "addressing", "queued"] as const) {
     assert.equal(plan(inReview({ phase: { state }, control }), facts({ prerequisiteWait: true, worker: WORKER, thread: { kind: "gone" } })), null);
   }
+});
+
+const SALVAGED = "agent/issue-41-salvaged" as BranchName;
+const PR57 = { number: 57, url: "https://github.com/acme/web/pull/57" };
+const APP_LOGIN = "pstack-agent[bot]";
+const PULL: PullDetail = { number: 57, url: PR57.url, title: "fix(login): keep the button visible", body: "b", author: APP_LOGIN, state: "open", draft: true, head: SALVAGED, headSha: PUSHED, base: "main", headRepo: "acme/web" };
+const EXPECTED = { repo: "acme/web" as RepoName, baseBranch: "main", appLogin: APP_LOGIN, issue: null };
+const refusals = (pull: Partial<PullDetail>, expected: Partial<typeof EXPECTED> | { issue: number } = {}) => {
+  const verdict = adoptionProblems({ ...PULL, ...pull }, { ...EXPECTED, ...expected });
+  return verdict.ok ? [] : verdict.reasons;
+};
+
+test("a pull request is adopted only when the App opened it from this repository's agent branch against the default branch", () => {
+  assert.deepEqual(adoptionProblems(PULL, EXPECTED), { ok: true, issue: 41, branch: SALVAGED }, "the issue comes from the branch");
+  assert.deepEqual(adoptionProblems(PULL, { ...EXPECTED, issue: 41 }), { ok: true, issue: 41, branch: SALVAGED });
+  assert.deepEqual(refusals({ state: "closed" }), ["it is closed"]);
+  assert.deepEqual(refusals({ state: "merged" }), ["it is merged"]);
+  assert.deepEqual(refusals({ headRepo: "someone/web" }), ["its head is in fork someone/web, not acme/web"]);
+  assert.deepEqual(refusals({ headRepo: null }), ["its head repository was deleted"]);
+  assert.deepEqual(refusals({ base: "release" }), ["it targets release, not the default branch main"]);
+  assert.deepEqual(refusals({ author: "maya" }), [`@maya opened it, not the App (@${APP_LOGIN})`]);
+  assert.deepEqual(refusals({ head: "fix/login" }), ["its branch fix/login is not an agent/issue-<n>-<slug> branch, the only kind pstack pushes to"]);
+  assert.deepEqual(refusals({ head: "fix/login" }, { issue: 41 }), ["its branch fix/login is not an agent/issue-<n>-<slug> branch, the only kind pstack pushes to"], "--issue does not make another branch pushable");
+  assert.deepEqual(refusals({}, { issue: 42 }), ["--issue 42 contradicts its branch agent/issue-41-salvaged, which names issue #41"]);
+  assert.deepEqual(refusals({ state: "closed", author: "maya", headRepo: "someone/web" }), ["it is closed", "its head is in fork someone/web, not acme/web", `@maya opened it, not the App (@${APP_LOGIN})`], "every reason at once");
+});
+
+const adoptedJob = (overrides: Partial<Job> = {}) => job({ generation: 2, branch: SALVAGED, pr: PR57, pushedSha: PUSHED, host: AUTO, trigger: { eventId: null, actor: "the bb CLI", at: NOW - MIN }, ...overrides });
+const due = [inline(1, NOW - 5 * MIN), { ...reviewBody, id: 501 }];
+const ready = (overrides: Partial<Facts> = {}) => facts({ pr: { state: "open" }, feedback: { pending: due }, worker: WORKER, machine: { hostId: "host_b" }, rounds: [], remote: { head: PUSHED }, ...overrides });
+
+test("an adopted job is a queued job that owns a pull request", () => {
+  assert.equal(adopted(adoptedJob()), true);
+  assert.equal(adopted(job()), false, "a queued job with no pull request starts the issue");
+  assert.equal(adopted(inReview()), false);
+  assert.equal(adopted(adoptedJob({ phase: transit("respawning", [spawnEffect]) })), false, "once its worker starts it is in a round like any other");
+});
+
+test("an adopted job waits for its pull request's first poll and then for review feedback, without resolving a worker", () => {
+  const current = adoptedJob();
+  assert.equal(plan(current, facts({ feedback: { pending: due } })), null, "the pull request is not polled yet");
+  const waiting = "waiting for review feedback on pull request #57";
+  assert.deepEqual(plan(current, facts({ pr: { state: "open" }, feedback: { pending: [] } })), { type: "change", change: { error: waiting } });
+  assert.equal(plan(adoptedJob({ error: waiting }), facts({ pr: { state: "open" }, feedback: { pending: [] } })), null);
+  const fresh = [inline(1, NOW - 5 * MIN), inline(2, NOW - MIN)];
+  assert.deepEqual(plan(current, facts({ pr: { state: "open" }, feedback: { pending: fresh } })), { type: "sleep", until: NOW - MIN + FEEDBACK_QUIET_MS });
+
+  assert.deepEqual(moreFacts(current, facts({ pr: { state: "open" }, feedback: { pending: [] } })), [], "no worker is resolved while it waits");
+  assert.deepEqual(moreFacts(current, facts({ pr: { state: "open" }, feedback: { pending: fresh } })), []);
+  assert.deepEqual(moreFacts(current, facts({ pr: { state: "open" }, feedback: { pending: due } })), ["worker", "rounds", "remote"]);
+  assert.deepEqual(moreFacts(job(), facts({ feedback: { pending: [] } })), ["worker"], "an ordinary queued job resolves its worker every pass");
+});
+
+test("a due adopted job starts its first worker from the base branch, as feedback round 1, on the machine picked for it", () => {
+  const current = adoptedJob();
+  assert.equal(plan(current, ready({ worker: null })), null);
+  assert.deepEqual(plan(current, ready({ machine: { wait: "no machine is eligible" } })), { type: "change", change: { error: "no machine is eligible" } });
+  assert.equal(plan(current, ready({ remote: null })), null, "the branch could not be read");
+  assert.equal((plan(current, ready({ remote: { head: null } })) as { change: Change }).change.phase?.state, "stuck");
+
+  const change = (plan(current, ready()) as { change: Change }).change;
+  assert.equal(change.hostId, "host_b");
+  assert.deepEqual(change.worker, WORKER);
+  assert.deepEqual(change.startRound, { ordinal: 2, kind: "feedback", baseSha: PUSHED, feedback: [{ kind: "review-comment", id: 1 }, { kind: "review", id: 501 }] });
+  assert.equal(change.roundBase, PUSHED);
+  assert.equal(change.error, null);
+  assert.equal(change.control?.feedbackRounds, 1);
+  assert.equal(change.control?.workerContext?.round, 2);
+  assert.ok(change.phase && "effects" in change.phase);
+  assert.equal(change.phase.state, "respawning");
+  const [labels, spawn, check] = change.phase.effects;
+  assert.deepEqual(labels, { op: "labels", key: `labels:${current.id}:working:2`, on: "issue", add: ["agent:working"], remove: ["agent:review"] });
+  assert.ok(spawn?.op === "spawn");
+  assert.equal(spawn.spec.baseRef, "origin/main");
+  assert.equal(spawn.spec.model, WORKER.model);
+  for (const id of [1, 501]) assert.match(spawn.spec.prompt, new RegExp(`"commentId": ${id}`));
+  assert.match(spawn.spec.prompt, /^\/poteto-mode /);
+  assert.match(spawn.spec.prompt, /untrusted/);
+  assert.match(spawn.spec.prompt, /This worktree starts at origin\/main\. Before anything else run `bb pstack gh fetch` and `git merge origin\/agent\/issue-41-salvaged`\./);
+  assert.match(spawn.spec.prompt, /Feedback round 1 of 5 on pull request https:\/\/github\.com\/acme\/web\/pull\/57/);
+  assert.equal(spawn.spec.prompt, change.control?.workerContext?.text);
+  assert.deepEqual(check, { op: "check-worktree", key: `adopt-check:${current.id}`, base: PUSHED });
+  assert.equal(change.phase.effects.length, 3);
+
+  const pinned = (plan(adoptedJob({ host: { pinned: true, id: "host_1" } }), ready({ machine: null })) as { change: Change }).change;
+  assert.equal(pinned.phase?.state, "respawning");
+  assert.equal("hostId" in pinned, false, "a pinned job's machine never moves");
+  const moved = (plan(current, ready({ remote: { head: NEXT } })) as { change: Change }).change;
+  assert.equal(moved.roundBase, NEXT);
+  assert.match(moved.control!.workerContext!.text, /## The branch moved/);
+});
+
+test("an adopted pull request merged or closed before its first worker ends the job without a worker to stop", () => {
+  const merged = (plan(adoptedJob(), facts({ pr: { state: "merged" }, feedback: { pending: due } })) as { change: Change }).change;
+  assert.deepEqual(merged.phase, { state: "done" });
+  assert.equal(merged.control?.disposition, "merged");
+  const closed = (plan(adoptedJob(), facts({ pr: { state: "closed" }, feedback: { pending: [] } })) as { change: Change }).change;
+  assert.deepEqual(closed.phase, { state: "stuck" });
+  assert.equal(closed.control?.disposition, "closed");
+});
+
+test("an ordinary queued job still starts the issue from the base branch", () => {
+  const change = (plan(job(), facts({ worker: WORKER, feedback: { pending: [] } })) as { change: Change }).change;
+  assert.equal(change.phase?.state, "starting");
+  assert.deepEqual(change.startRound, { ordinal: 1, kind: "initial", baseSha: null, feedback: [] });
+});
+
+test("the adopted job's first worker binds as its spawn settles, checks its worktree, and answers with the feedback round's report", () => {
+  const current = adoptedJob({ host: { pinned: true, id: "host_1" } });
+  let row = apply(current, (plan(current, ready({ machine: null })) as { change: Change }).change);
+  assert.equal(row.round, 2);
+  const claim = (from: Job): Job => ("effects" in from.phase ? { ...from, phase: { ...from.phase, tries: 1, firstAt: NOW } } : from);
+  row = apply(claim(row), settle(claim(row), { kind: "done", patch: {} }, NOW));
+  assert.ok("effects" in row.phase);
+  assert.deepEqual(row.phase.effects.map((effect) => effect.op), ["spawn", "check-worktree"]);
+  assert.equal(awaitingThread(row), true, "a report that arrives before the spawn settles is kept");
+
+  const workspace = { environmentId: "env_w", hostId: "host_1", path: "/w", branch: "bb/x" };
+  const spawned = settle(claim(row), { kind: "done", patch: { threadId: "thr_w", control: { ...row.control, workspace } } }, NOW);
+  row = apply(claim(row), spawned);
+  assert.equal(row.threadId, "thr_w");
+  assert.deepEqual(row.control.workspace, workspace);
+  assert.ok("effects" in row.phase);
+  assert.equal(row.phase.state, "respawning");
+  assert.deepEqual(row.phase.effects.map((effect) => effect.op), ["check-worktree"]);
+  const checked = settle(claim(row), { kind: "done", patch: {} }, NOW);
+  assert.equal(checked.finishRound, undefined, "the round goes on");
+  row = apply(claim(row), checked);
+  assert.deepEqual(row.phase, { state: "addressing" });
+
+  const answer = { outcome: "no-change", replies: [{ kind: "review-comment", commentId: 1, body: "Kept it." }], verification: ["read it"], summary: "s" };
+  assert.equal(parseReport(row, { ...answer, round: 1 }).ok, true);
+  assert.equal(parseReport(row, { ...answer, round: 2 }).ok, false);
 });
