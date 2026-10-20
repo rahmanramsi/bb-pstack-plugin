@@ -136,6 +136,7 @@ for (const overdue of [false, true]) {
     h.failures.scheduledRetryAt = h.clock.now - (overdue ? RETRY_WAIT_MS + 1 : SWEEP_MS);
     await h.settle();
     if (overdue) {
+      await h.advance(2 * MIN);
       assert.equal(h.spawned.length, 2);
       return;
     }
