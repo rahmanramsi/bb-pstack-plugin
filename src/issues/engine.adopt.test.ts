@@ -25,7 +25,8 @@ function salvaged(h: ReturnType<typeof harness>, { feedback = true } = {}) {
   return { stuck, ask };
 }
 
-const adopt = (h: ReturnType<typeof harness>, pr: number, threadId?: string) => h.engine().run(["issues", "adopt", "--repo", "acme/web", "--pr", String(pr)], threadId);
+const adopt = (h: ReturnType<typeof harness>, pr: number, threadId?: string, flags: string[] = []) => h.engine().run(["issues", "adopt", "--repo", "acme/web", "--pr", String(pr), ...flags], threadId);
+const errorCode = (result: { stdout?: string }) => (JSON.parse(result.stdout!) as { error: { code: string } }).error.code;
 const roundReport = (commentId: number) => ({ outcome: "changes", round: 1, replies: [{ kind: "pr-comment", commentId, body: "The 320px layout is covered too." }], verification: ["npm test -- login: 15 passed"], summary: "Covered the 320px layout." });
 const appReplies = (h: ReturnType<typeof harness>) => (h.gh().comments.get(57) ?? []).filter((comment) => comment.user.login === APP && comment.body.includes("<!-- pstack:reply:"));
 
@@ -58,7 +59,8 @@ test("an adopted pull request's earlier feedback becomes its first round, answer
   assert.equal(appReplies(h).length, 1);
   assert.match(appReplies(h)[0]!.body, /^> `@pstack-test` please also cover the 320px layout\n\nThe 320px layout is covered too\./);
   const back = (await h.views()).find((view) => view.id === id)!;
-  assert.ok(["checking", "review"].includes(back.state), `${back.state}: ${back.error}`);
+  assert.equal(back.state, "review", back.error ?? "");
+  assert.equal(h.gh().issues.get(57)!.pr!.draft, false, "verified like any round, then marked ready");
   assert.equal(back.pushedSha, SHA3);
   assert.equal(h.stopped.length, 0, "the stop posted before adoption is not a command to this job");
   assert.equal((await h.views()).find((view) => view.id === stuck.id)!.state, "stuck");
@@ -105,8 +107,8 @@ test("bb pstack issues adopt refuses a fork's pull request and a worker thread, 
 
   const fork = await adopt(h, 58);
   assert.equal(fork.exitCode, 1);
-  assert.match(fork.stderr!, /adopt_refused/);
-  assert.match(fork.stderr!, /PR #58 cannot be adopted:\n {2}- its head is in fork someone\/web, not acme\/web/);
+  assert.equal(fork.stderr, "PR #58 cannot be adopted:\n  - its head is in fork someone/web, not acme/web\n");
+  assert.equal(errorCode(await adopt(h, 58, undefined, ["--json"])), "adopt_refused");
   assert.equal((await h.views()).length, 1, "a refusal inserts nothing");
 
   assert.equal((await adopt(h, 57)).exitCode, 0);
@@ -117,8 +119,8 @@ test("bb pstack issues adopt refuses a fork's pull request and a worker thread, 
 
   await h.settle();
   const worker = (await h.views()).find((view) => view.id === id)!.threadId!;
-  const fromWorker = await adopt(h, 57, worker);
+  const fromWorker = await adopt(h, 57, worker, ["--json"]);
   assert.equal(fromWorker.exitCode, 1);
-  assert.match(fromWorker.stderr!, /worker_cannot_adopt/);
+  assert.equal(errorCode(fromWorker), "worker_cannot_adopt");
   assert.equal((await h.views()).length, 2);
 });
