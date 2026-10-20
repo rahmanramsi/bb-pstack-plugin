@@ -37,7 +37,7 @@ export function hold(key: string): Hold {
   return { key, hit, reached, release, free };
 }
 
-type Issue = { number: number; title: string; body: string; user: string; updatedAt: number; labels: Set<string>; closed?: boolean; subIssues?: number[]; blockedBy?: number[]; pr?: { head: string; base: string; title: string; body: string; draft: boolean } };
+type Issue = { number: number; title: string; body: string; user: string; updatedAt: number; labels: Set<string>; closed?: boolean; subIssues?: number[]; blockedBy?: number[]; pr?: { head: string; base: string; title: string; body: string; draft: boolean; headRepo?: string | null } };
 type Comment = { id: number; body: string; user: { login: string }; created_at: string; updated_at: string };
 type ReviewComment = Comment & { path: string; line: number; diff_hunk: string; in_reply_to_id?: number; pull_request_review_id: number };
 type Review = { id: number; body: string; user: { login: string }; state: string; submitted_at: string };
@@ -235,7 +235,7 @@ async function route(method: string, url: URL, body: any, headers: IncomingMessa
     if (method === "GET") {
       const issue = gh.issues.get(Number(match[1]));
       if (!issue?.pr) return [404, { message: "Not Found" }];
-      return etagged({ title: issue.title, body: issue.pr.body, user: { login: issue.user }, number: issue.number, node_id: `PR_${issue.number}`, html_url: `https://github.com/acme/web/pull/${issue.number}`, state: pull.state, merged: pull.merged, merged_at: pull.merged ? iso(gh.now()) : null, draft: issue.pr.draft, mergeable: gh.mergeable, mergeable_state: gh.mergeable ? "clean" : "dirty", head: { sha: gh.refs.get(issue.pr.head), ref: issue.pr.head, repo: { full_name: REPO } }, base: { sha: gh.refs.get("main"), ref: issue.pr.base, repo: { full_name: REPO } } });
+      return etagged({ title: issue.title, body: issue.pr.body, user: { login: issue.user }, number: issue.number, node_id: `PR_${issue.number}`, html_url: `https://github.com/acme/web/pull/${issue.number}`, state: pull.state, merged: pull.merged, merged_at: pull.merged ? iso(gh.now()) : null, draft: issue.pr.draft, mergeable: gh.mergeable, mergeable_state: gh.mergeable ? "clean" : "dirty", head: { sha: gh.refs.get(issue.pr.head), ref: issue.pr.head, repo: issue.pr.headRepo === null ? null : { full_name: issue.pr.headRepo ?? REPO } }, base: { sha: gh.refs.get("main"), ref: issue.pr.base, repo: { full_name: REPO } } });
     }
     if (method === "PATCH") {
       const issue = gh.issues.get(Number(match[1]))!;
