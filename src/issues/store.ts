@@ -343,11 +343,11 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     (db.prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'").get(repo, issue) as { earlier: number }).earlier + 1;
 
   /** `published`: the pull request and head an adopted job starts with. */
-  function insertRow(job: NewJob, now: number, generation: number, branch: BranchName, published: { pr: { number: number; url: string }; head: Sha } | null): Job {
+  function insertRow(job: NewJob, now: number, generation: number, branch: BranchName, published: { pr: { number: number; url: string }; head: Sha } | null, resume: Control["resume"]): Job {
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, pr_number, pr_url, pushed_sha, runtime_protocol)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, pr_number, pr_url, pushed_sha, control_json, runtime_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     ).run(
       job.id,
       job.repo,
@@ -370,6 +370,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       published?.pr.number ?? null,
       published?.pr.url ?? null,
       published?.head ?? null,
+      JSON.stringify(resume ? { resume } : {}),
     );
     const inserted = get(job.id)!;
     projectStatus(inserted);
@@ -381,7 +382,11 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
     if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
     if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
     const generation = nextGeneration(job.repo, job.issue);
-    return insertRow(job, now, generation, branchFor(job.issue, job.snapshot.title, generation), null);
+    const last = db
+      .prepare("SELECT branch, state, pushed_sha, error FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored' ORDER BY generation DESC LIMIT 1")
+      .get(job.repo, job.issue) as { branch: BranchName; state: string; pushed_sha: Sha | null; error: string | null } | undefined;
+    const resume = last?.state === "stuck" && last.pushed_sha ? { branch: last.branch, sha: last.pushed_sha, reason: last.error } : null;
+    return insertRow(job, now, generation, branchFor(job.issue, job.snapshot.title, generation), null, resume);
   });
 
   const adopt = db.transaction((job: NewAdoption, now: number): Adoption => {
@@ -395,7 +400,7 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       .get(job.repo, job.branch, job.pr.number, ...TERMINAL_LIST) as JobRow | undefined;
     if (holder) return { kind: "refused", reason: `${holder.branch === job.branch ? job.branch : `pull request #${job.pr.number}`} belongs to ${holder.id} on issue #${holder.issue}` };
     const { branch, pr, head, ...fields } = job;
-    const inserted = insertRow({ ...fields, state: "queued", error: null }, now, nextGeneration(job.repo, job.issue), branch, { pr, head });
+    const inserted = insertRow({ ...fields, state: "queued", error: null }, now, nextGeneration(job.repo, job.issue), branch, { pr, head }, null);
     const transferred = db
       .prepare(
         `UPDATE issue_feedback SET job_id = ?, round = NULL

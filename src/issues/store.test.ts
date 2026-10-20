@@ -87,6 +87,22 @@ test("one open job per issue; a label event is recorded once; a re-label after a
   assert.deepEqual(store.list({ all: false }).map((job) => job.id), [second.id]);
 });
 
+test("a job after a stuck job that pushed its branch continues from that branch; other earlier endings start fresh", () => {
+  const { store } = setup();
+  const sha = "a".repeat(40) as Sha;
+  const stuck = store.insert(newJob({ trigger: { eventId: 1, actor: "maya", at: 1 } }), 10)!;
+  store.write(stuck.id, 0, { phase: { state: "stuck" }, pushedSha: sha, error: "automatic recovery exhausted" }, 20);
+  const resumed = store.insert(newJob({ trigger: { eventId: 2, actor: "maya", at: 2 } }), 30)!;
+  assert.deepEqual(resumed.control.resume, { branch: stuck.branch, sha, reason: "automatic recovery exhausted" });
+
+  store.write(resumed.id, 0, { phase: { state: "stuck" }, error: "the worker failed before pushing" }, 40);
+  assert.equal(store.insert(newJob({ trigger: { eventId: 3, actor: "maya", at: 3 } }), 50)!.control.resume, null, "nothing was pushed");
+
+  const other = store.insert(newJob({ issue: 42, trigger: { eventId: 4, actor: "maya", at: 4 } }), 60)!;
+  store.write(other.id, 0, { phase: { state: "stopped" }, pushedSha: sha }, 70);
+  assert.equal(store.insert(newJob({ issue: 42, trigger: { eventId: 5, actor: "maya", at: 5 } }), 80)!.control.resume, null, "a person stopped it");
+});
+
 test("repository poll state is stored per repository", () => {
   const { store } = setup();
   assert.deepEqual(store.repoPoll(REPO), { poll: null, polledAt: null, error: null });

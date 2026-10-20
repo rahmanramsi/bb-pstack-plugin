@@ -25,6 +25,7 @@ import { acceptSync,
   FACTS_FOR,
   LABEL,
   REPORTING,
+  SILENCE_MS,
   TERMINAL,
   acceptReport,
   enter,
@@ -67,6 +68,7 @@ import { acceptSync,
   type ReportFacts,
   type Sha,
   type SubIssue,
+  type TreeFact,
   type WorkerProblem,
   type WorkerSettings,
 } from "./job.ts";
@@ -78,6 +80,7 @@ export const POLL_MS = 60_000;
 const RETRY_ENQUEUE_GRACE_MS = 60_000;
 const MAX_STEPS = 20;
 const SETTLE_MARGIN_MS = 5_000;
+const RECHECK_MS = 60_000;
 /** Kept back from the push so the token can still be revoked before the lease ends. */
 const REVOKE_MS = 30_000;
 
@@ -104,6 +107,8 @@ export type IssuesDeps = {
   checkWorker: (hostId: string, tuple: string) => Promise<string | null>;
   /** Placement's facts for a worker on any machine with a worktree of the project and `provider/model` at `level`. */
   machines: (query: { projectId: string; model: string; level: string }) => Promise<PlacementFacts>;
+  /** Progress across the worker's thread tree, or null when it cannot be read whole. */
+  treeActivity: (threadId: string) => Promise<TreeFact | null>;
   /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
   activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
@@ -628,8 +633,27 @@ export function createIssues(deps: IssuesDeps): Issues {
     return { ...facts, machine: pick.hostId === null ? { wait: pick.why } : { hostId: pick.hostId } };
   }
 
+  /** When to walk a job's tree next, and when a walk last saw a member held. Not persisted: a restart costs one walk. */
+  type TreeWalks = { nextWalkAt: number; lastHeldAt: number | null };
+  const treeWalks = new Map<JobId, TreeWalks>();
+
+  async function treeFact(job: Job, threadId: string, now: number): Promise<TreeFact | null> {
+    const memo = treeWalks.get(job.id);
+    if (memo && now < memo.nextWalkAt) return null;
+    const tree = await deps.treeActivity(threadId).catch(() => null);
+    const lastHeldAt = tree?.queued ? now : (memo?.lastHeldAt ?? null);
+    if (!tree) {
+      treeWalks.set(job.id, { nextWalkAt: now + RECHECK_MS, lastHeldAt });
+      return null;
+    }
+    const lastActiveAt = lastHeldAt === null ? tree.lastActiveAt : Math.max(tree.lastActiveAt ?? 0, lastHeldAt);
+    const nextWalkAt = tree.queued ? now + RECHECK_MS : Math.max(lastActiveAt ?? 0, job.updatedAt) + SILENCE_MS;
+    treeWalks.set(job.id, { nextWalkAt, lastHeldAt });
+    return { lastActiveAt, queued: tree.queued };
+  }
+
   async function gather(job: Job, observations?: { review: boolean }): Promise<Facts> {
-    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, machine: null };
+    const facts: Facts = { now: clock(), worker: null, thread: null, waiting: null, gate: null, feedback: null, rounds: null, remote: null, pr: null, children: null, blockers: null, machine: null, tree: null };
     const unobserved = new Set<number>();
     const first = FACTS_FOR[job.phase.state];
     if (first.includes("feedback")) facts.feedback = { pending: store.pendingFeedback(job.id) };
@@ -718,6 +742,9 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       if (wanted.includes("gate")) facts.gate = deps.prGate(threadId);
     }
+    const live = facts.thread?.kind === "active" || facts.thread?.kind === "idle" || facts.thread?.kind === "waiting";
+    if (!wanted.includes("tree")) treeWalks.delete(job.id);
+    else if (live && job.threadId) facts.tree = await treeFact(job, job.threadId, facts.now);
     return facts;
   }
 

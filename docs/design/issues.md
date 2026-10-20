@@ -192,8 +192,13 @@ Recovery starts when one of these happens while the job waits for a report:
 - The worker thread is archived or deleted.
 - The worker thread is in an error state, and bb has no provider retry scheduled. A scheduled retry is waited out first.
 - The worker went idle without reporting after 2 reminders. A worker whose own pstack run or child threads are still working is waiting, not idle.
+- The worker's whole thread tree showed no progress for 20 minutes after 2 reminders for silence.
 - 3 reports in a row were rejected without progress.
 - A round message could not be delivered to the worker.
+
+**Silence.** A waiting worker can still be stuck, for example on a child that hangs, and so can a worker that hangs mid-turn. So pstack also watches the worker's thread tree: the worker, its child threads at any depth, and the hidden threads of the pstack runs any of them started. Progress is the newest event that shows work, such as a started or completed item, streamed output, or reasoning. A message sent to the worker, which is how a reminder arrives, and bookkeeping such as token usage do not count. A member still waiting for a concurrency slot, or a run job waiting for one, is not silence. The time it waited counts as activity.
+
+After 20 minutes with no progress anywhere in the tree, the worker gets a reminder. Each reminder restarts the 20 minutes. After 2 reminders the worker is recovered. Progress more than 5 minutes after the last reminder starts the count again. Reading the tree costs two or three bb calls per member, so pstack reads it only once silence is possible, and about once a minute while a member waits for a slot. A tree of more than 64 threads gives no verdict.
 
 Recovery runs as the transit state `recovering`:
 
@@ -206,6 +211,8 @@ Each recovery starts a new worker epoch. Reports from an earlier epoch are kept 
 Creating or provisioning environments and recognized transient pre-spawn faults, including SDK transport errors, retry with increasing delays, for up to 8 observations. A missing, destroyed, or errored environment ends recovery with the work preserved. These observation attempts are separate from the spawn claim. Once a spawn call may have been issued, the probe-only rule applies. Reminder delivery is also persisted before the send. A lost SDK response can duplicate a reminder, but cannot silently discard it.
 
 A job gets 2 recoveries. The count resets once, when the job's first `changes` report is accepted. When recoveries run out, or the environment is conclusively unsafe to reuse, the job fails. Its public status names the failure category and retained commit; local details remain available in bb.
+
+**Continuing a failed job.** When the issue's previous job failed after pstack pushed its branch, the next job continues from that work. Its first worker still starts from the default branch, and its prompt names the earlier branch, the pushed commit, and why that job ended. The worker merges the branch and builds on it. Pull requests and report validation still count commits against the default branch. Deleting the earlier branch on GitHub before relabeling forces a fresh start: the worker finds no branch and starts from the default branch. Work that was never pushed stays in the earlier job's worktree.
 
 A worker that keeps making progress has no time limit. pstack records no deadline for a round.
 
@@ -392,6 +399,7 @@ These are constants:
 
 - No cap on concurrent jobs in pstack. An automatic job starts once a machine is eligible. bb's per-machine and global concurrency limits decide when worker threads run.
 - 2 reminders to an idle worker before recovery (`MAX_NUDGES`).
+- 20 minutes with no progress anywhere in the worker's thread tree before a reminder for silence (`SILENCE_MS`).
 - 2 recoveries per job, reset once by the first accepted change (`MAX_RECOVERIES`).
 - 3 rejected reports in a row without progress before recovery (`MAX_INVALID_REPORTS`).
 - 5 repair rounds per distinct CI or conflict cause (`MAX_REPAIRS`).
@@ -427,6 +435,7 @@ These are constants:
 - An issue edited after work starts is sent to the worker as a note. A large edit does not restart the job.
 - Two jobs that touch the same files are not coordinated. Conflicts surface as repair rounds.
 - Workers use the project's default permission mode. A project whose default needs approvals can stall a worker until reminders and recovery run out.
+- Progress is read from thread events by type. A provider that works without writing any of those events looks silent, and gets reminders and a recovery it does not need.
 - Whether bb logs host RPC payloads, which carry the push token, is unverified.
 - The spawn probe relies on bb listing pinned threads first and then newest first. That order is observed, not documented.
 - Feedback is stored when it is polled. A review dismissed before its round starts is still answered.

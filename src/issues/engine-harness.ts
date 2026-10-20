@@ -12,7 +12,7 @@ import { createPlacement } from "../placement.ts";
 import { MIGRATIONS } from "../store.ts";
 import { createIssues, SWEEP_MS, type IssuesDeps } from "./engine.ts";
 import { createGitHub } from "./github.ts";
-import type { JobView, RepoName } from "./job.ts";
+import type { JobView, RepoName, TreeFact } from "./job.ts";
 import { openIssueStore, type IssueStore } from "./store.ts";
 
 
@@ -330,6 +330,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const work = { activeRuns: 0, activeChildren: 0 };
   const late: FakeThread[] = [];
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
+  const treeReads = { count: 0 };
   const threadReads = { count: 0 };
   const queued = new Set<string>();
   let next = 0;
@@ -487,6 +488,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   }
   let repoLine: { repo: RepoName; projectId: string; hostId: string | null } = { repo: REPO, projectId: "prj_web", hostId: "host_worker" };
   let workerRole = "codex/gpt-6.1-sol/high";
+  let tree = (_threadId: string): TreeFact | null => ({ lastActiveAt: clock.now, queued: false });
 
   /** A store that goes dead when its engine "crashes": reads find nothing and writes change nothing. */
   function engine() {
@@ -541,6 +543,10 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
       resolveRole: (role) => (role === "issue worker" ? [parseChoice(workerRole)!] : []),
       prGate: () => (failures.gate ? { pass: false, reason: failures.gate } : { pass: true }),
       activeWork: async () => ({ ...work }),
+      treeActivity: async (threadId: string) => {
+        treeReads.count++;
+        return tree(threadId);
+      },
       checkWorker: async (hostId: string, tuple: string) => {
         assert.equal(hostId, "host_worker");
         return CATALOG.has(tuple) ? null : `${tuple}: not in the host's catalog`;
@@ -661,6 +667,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     late,
     calls,
     threadReads,
+    treeReads,
     queued,
     spawned,
     sent,
@@ -691,6 +698,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     engine: () => current,
     setRepo: (line: typeof repoLine) => (repoLine = line),
     setWorkerRole: (value: string) => (workerRole = value),
+    setTree: (value: (threadId: string) => TreeFact | null) => (tree = value),
     holdAt: (key: string, where: "sdk" | "github") => {
       const h = hold(key);
       (where === "sdk" ? holds : gh.holds).push(h);
