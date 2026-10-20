@@ -470,7 +470,8 @@ export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
 }
 
 function roundDue(facts: Facts): boolean {
-  return facts.pr?.state === "open" && Boolean(facts.feedback?.pending.length) && quietAt(facts.feedback!.pending) <= facts.now;
+  const pending = facts.feedback?.pending ?? [];
+  return facts.pr?.state === "open" && pending.length > 0 && quietAt(pending) <= facts.now;
 }
 
 /**
