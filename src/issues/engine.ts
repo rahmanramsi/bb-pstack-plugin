@@ -17,10 +17,11 @@ import type { ModelChoice } from "../models.ts";
 import { hostId, pickHost, type Facts as PlacementFacts, type Hold, type HostId } from "../placement.ts";
 import { repoFromRemote } from "../gh/commands.ts";
 import { createStatusDelivery } from "./delivery.ts";
-import { issueCommands, type RepoMapping } from "./commands.ts";
+import { issueCommands, type AdoptOutcome, type RepoMapping } from "./commands.ts";
 import { issueBoard, type BoardFilter, type IssueBoardSchema, type IssueSummarySchema } from "./board.ts";
 import { CAN_TRIGGER, GitHubPermanentError, GitHubSetupError, GitHubTransientError, type ActivityCursor, type GitHub, type PollCursor, type RepoClient } from "./github.ts";
 import { acceptSync,
+  adoptionProblems,
   EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
@@ -50,6 +51,7 @@ import { acceptSync,
   plan,
   settle,
   stop as stopChange,
+  toView,
   type Action,
   type Change,
   type Effect,
@@ -75,6 +77,7 @@ import { commentBody, effectMarker, mergeNote, workerInstructions, workerPrompt,
 
 export const SWEEP_MS = 15_000;
 export const POLL_MS = 60_000;
+const RETRY_ENQUEUE_GRACE_MS = 60_000;
 const MAX_STEPS = 20;
 const SETTLE_MARGIN_MS = 5_000;
 /** Kept back from the push so the token can still be revoked before the lease ends. */
@@ -111,6 +114,8 @@ export type IssuesDeps = {
 export type Issues = {
   board(filter: BoardFilter): Promise<z.infer<typeof IssueBoardSchema>>;
   start(repo: string, issue: number): Promise<JobId>;
+  /** A new job for an open pull request the App opened, whose first worker answers the pull request's feedback. */
+  adopt(input: { repo: string; pr: number; issue: number | null }): Promise<AdoptOutcome>;
   /** `bb pstack issues …`, spread into the plugin's single CLI. */
   commands: Record<string, PluginCliCommand>;
   /** Thread events and the `pstack-issues` service. */
@@ -609,10 +614,15 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (thread.status === "error" || thread.queuedMessageCount > 0) {
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
         const retry = queued.filter((item) => item.payload.kind === "retry").map((item) => item.sendAt ?? clock() + SWEEP_MS);
-        if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt: retry.length ? Math.max(...retry) : null };
+        const retryAt = retry.length ? Math.max(...retry) : clock() < thread.updatedAt + RETRY_ENQUEUE_GRACE_MS ? thread.updatedAt + RETRY_ENQUEUE_GRACE_MS : null;
+        if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt };
         if (thread.status === "idle" && queued.length) return { kind: "waiting" };
       }
       if (thread.status === "idle" && (thread.activeBackgroundAgentCount > 0 || thread.runtime && !["idle", "error"].includes(thread.runtime.displayStatus))) return { kind: "waiting" };
+      if (thread.status === "idle" && thread.environmentId) {
+        const activity = (await workspaceThreads(thread.environmentId)).find((row) => row.id === threadId)?.activity;
+        if (activity && (activity.activeBackgroundCommandCount > 0 || activity.activeGoalCount > 0 || activity.activeWorkflowCount > 0)) return { kind: "waiting" };
+      }
       if (thread.status === "idle") return { kind: "idle", since: thread.updatedAt };
       return { kind: "active" };
     } catch (error) {
@@ -1282,6 +1292,39 @@ export function createIssues(deps: IssuesDeps): Issues {
     return admit(mapping, job.issue, by, { reuseOpen: false });
   }
 
+  async function adopt(input: { repo: string; pr: number; issue: number | null }): Promise<AdoptOutcome> {
+    const refused = (reason: string): AdoptOutcome => ({ kind: "refused", reasons: [reason] });
+    const mapping = deps.repos().find(({ repo }) => repo === input.repo.toLowerCase());
+    if (!mapping) return refused(`${input.repo} is not configured for issue workers`);
+    const { primaryHostId } = await bb.sdk.system.config();
+    if (mapping.hostId !== null && mapping.hostId === primaryHostId) return refused(`${mapping.repo} runs on the bb server's machine; map it to another host`);
+    const repo = github.repo(mapping.repo);
+    const [pull, appLogin, baseBranch] = await Promise.all([repo.pull(input.pr), repo.appLogin(), repo.defaultBranch()]);
+    if (!pull) return refused(`${mapping.repo} has no pull request #${input.pr}`);
+    const verdict = adoptionProblems(pull, { repo: mapping.repo, baseBranch, appLogin, issue: input.issue });
+    if (!verdict.ok) return { kind: "refused", reasons: verdict.reasons };
+    const issue = (await repo.repositoryIssues(true)).find((item) => item.number === verdict.issue);
+    if (!issue) return refused(`${mapping.repo} has no issue #${verdict.issue}`);
+    if (issue.state !== "open") return refused(`issue #${verdict.issue} is closed`);
+    const now = clock();
+    const outcome = store.adopt({
+      id: `psi_${randomUUID()}` as JobId, repo: mapping.repo, issue: verdict.issue,
+      trigger: { eventId: null, actor: "the bb CLI", at: now },
+      snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
+      projectId: mapping.projectId, hostId: mapping.hostId, baseBranch,
+      branch: verdict.branch, pr: { number: pull.number, url: pull.url }, head: pull.headSha as Sha,
+    }, now);
+    switch (outcome.kind) {
+      case "refused":
+        return refused(outcome.reason);
+      case "already":
+        return { kind: "already", job: toView(outcome.job) };
+      case "adopted":
+        background(tick(outcome.job.id));
+        return { kind: "adopted", job: toView(outcome.job), generation: outcome.job.generation };
+    }
+  }
+
   const openJob = (threadId: string) => {
     const job = store.byThread(threadId);
     return job && !TERMINAL.has(job.phase.state) ? job : null;
@@ -1339,7 +1382,8 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       return [...checks.values()].map(({ host, tuple, repos, ok, detail }) => ({ ok, subject: `issue worker on ${host} (${repos.join(", ")})${tuple ? `: ${tuple}` : ""}`, detail }));
     },
-    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop, retry }),
+    adopt,
+    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop, retry, adopt }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
         bb.events.on(event, ({ thread }) => {

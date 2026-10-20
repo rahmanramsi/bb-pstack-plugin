@@ -5,8 +5,11 @@ import { PluginCliError, cliCommand, type BbPluginApi, type PluginCliCommand } f
 import { z } from "zod";
 import { readThreadFile } from "../thread-files.ts";
 import { issueBoard, listed, repoView, type ListedJob, type RepoView } from "./board.ts";
-import { JOB_ID, MAX_FEEDBACK_ROUNDS, machineLabel, type JobId, type JobState, type JobView, type RepoName } from "./job.ts";
+import { FEEDBACK_QUIET_MS, JOB_ID, MAX_FEEDBACK_ROUNDS, machineLabel, type JobId, type JobState, type JobView, type RepoName } from "./job.ts";
 import type { IssueStore } from "./store.ts";
+
+/** What `bb pstack issues adopt` did: a new job, the open job that already owns the pull request, or why neither. */
+export type AdoptOutcome = { kind: "adopted"; job: JobView; generation: number } | { kind: "already"; job: JobView } | { kind: "refused"; reasons: string[] };
 
 /** `hostId` null: each job's machine is picked when the job starts. */
 export type RepoMapping = { repo: RepoName; projectId: string; hostId: string | null };
@@ -139,6 +142,7 @@ export function issueCommands(deps: {
   sync(threadId: string): Promise<{ ok: true; message: string } | { ok: false; code: string; message: string }>;
   stop(id: JobId, by: string): Promise<boolean>;
   retry(id: JobId, by: string): Promise<{ ok: true; id: JobId } | { ok: false; code: string; message: string }>;
+  adopt(input: { repo: string; pr: number; issue: number | null }): Promise<AdoptOutcome>;
 }): Record<string, PluginCliCommand> {
   const { bb, store } = deps;
   const json = (value: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(value, null, 2)}\n` });
@@ -192,6 +196,32 @@ export function issueCommands(deps: {
         const result = await deps.retry(id, ctx.threadId ? `thread ${ctx.threadId}` : "the bb CLI");
         if (!result.ok) throw new PluginCliError(result.message, { code: result.code });
         return { exitCode: 0, stdout: `Retrying ${id} as ${result.id}.\n` };
+      },
+    }),
+    "issues adopt": cliCommand({
+      summary: "Give an open pull request the App opened to a new issue job, which answers its review feedback",
+      description:
+        `For a pull request whose job ended, such as a stuck one. The pull request must be open, opened by the App from this repository's agent/issue-<n>-<slug> branch against the default branch, and its issue open. The job waits until review feedback has been quiet for ${FEEDBACK_QUIET_MS / 60_000} minutes, then starts a worker from the default branch that merges the pull request's branch and answers the feedback as feedback round 1. Adopting a pull request again prints the job that owns it.`,
+      options: {
+        repo: { type: "string", required: true, description: "owner/name, as configured in issueRepos" },
+        pr: { type: "integer", min: 1, max: Number.MAX_SAFE_INTEGER, required: true, description: "The pull request's number" },
+        issue: { type: "integer", min: 1, max: Number.MAX_SAFE_INTEGER, description: "The issue it resolves; must match the number in its branch, which is the default" },
+        json: { type: "boolean", description: "Emit { kind, job } as JSON" },
+      },
+      async run(input, ctx) {
+        if (ctx.threadId && store.byThread(ctx.threadId)) {
+          throw new PluginCliError("an issue worker cannot adopt pull requests", { code: "worker_cannot_adopt" });
+        }
+        const pr = input.options.pr!;
+        const result = await deps.adopt({ repo: input.options.repo!.toLowerCase(), pr, issue: input.options.issue ?? null });
+        if (result.kind === "refused") {
+          throw new PluginCliError([`PR #${pr} cannot be adopted:`, ...result.reasons.map((reason) => `  - ${reason}`)].join("\n"), { code: "adopt_refused" });
+        }
+        if (input.options.json) return json(result);
+        const { job } = result;
+        if (result.kind === "already") return { exitCode: 0, stdout: `PR #${pr} is already owned by ${job.id} (${job.state}).\n` };
+        const quiet = FEEDBACK_QUIET_MS / 60_000;
+        return { exitCode: 0, stdout: `Adopted PR #${pr} (${job.branch}) for issue #${job.issue} as ${job.id}; generation ${result.generation}.\nIts first feedback round starts once review feedback has been quiet for ${quiet} minutes.\n` };
       },
     }),
     "issues report": cliCommand({

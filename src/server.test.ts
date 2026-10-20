@@ -198,3 +198,38 @@ test("stopping an issue job from the app moves it to stopping once, and signals 
   assert.deepEqual(Object.keys(signal.payload as object), ["revision"]);
   await harness.dispose();
 });
+
+for (const child of [{ status: "pending", retry: false, label: "a pending" }, { status: "error", retry: true, label: "an errored" }] as const) {
+  test(`a delegate waiting on ${child.label} child${child.retry ? " with a scheduled retry" : ""} gets no checklist nudge`, async (t) => {
+    const db = new Database(":memory:");
+    t.after(() => db.close());
+    type IdleHandler = (payload: { thread: ReturnType<typeof thread>; lastAssistantText: string }) => unknown;
+    const idle: IdleHandler[] = [];
+    const sends: string[] = [];
+    const bb = {
+      pluginId: "pstack",
+      settings: { define: () => ({ get: async () => ({ models: "" }), onChange() {} }) },
+      storage: { database: () => db, migrate: (_db: unknown, migrations: string[]) => migrations.forEach((sql) => db.exec(sql)) },
+      sdk: {
+        threads: {
+          list: async ({ parentThreadId }: { parentThreadId?: string }) => (parentThreadId === "thr_delegate" ? [{ id: "thr_child", status: child.status }] : []),
+          queuedMessages: { list: async ({ threadId }: { threadId: string }) => (child.retry && threadId === "thr_child" ? [{ payload: { kind: "retry" }, sendAt: 1 }] : []) },
+          send: async ({ threadId }: { threadId: string }) => sends.push(threadId),
+        },
+      },
+      realtime: { publish() {} },
+      rpc: { register() {} },
+      cli: { register() {} },
+      agents: { registerTool() {}, configure() {}, contributeInstructions() {} },
+      events: { on: (event: string, handler: IdleHandler) => { if (event === "thread.idle") idle.push(handler); } },
+      background: { service() {} },
+      hosts: { experimental_client: () => ({}) },
+      experimental_hooks: { on() {} },
+      log: { error() {}, warn() {} },
+    } as unknown as BbPluginApi;
+    await plugin(bb);
+    openChecklistStore(db).createChecklist("thr_delegate", "feature", [{ section: "playbook", text: "Verify the change.", afterPr: false, skipPolicy: "agent" }], 0);
+    await idle.at(-1)!({ thread: thread("thr_delegate"), lastAssistantText: "done" });
+    assert.deepEqual(sends, []);
+  });
+}

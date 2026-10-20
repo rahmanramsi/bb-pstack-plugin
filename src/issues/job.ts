@@ -8,7 +8,9 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
+import { AGENT_BRANCH } from "../host-contract.ts";
+import type { PullDetail } from "./github.ts";
+import { COMMENT_MAX, adoptionPrompt, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
 /** "owner/name", lowercased at the config boundary. */
@@ -436,7 +438,7 @@ export type FactName = Exclude<keyof Facts, "now" | "machine">;
 
 export const FACTS_FOR: { readonly [S in JobState]: readonly FactName[] } = {
   ignored: [],
-  queued: ["blockers", "worker", "children"],
+  queued: ["blockers", "children", "pr", "feedback"],
   starting: [],
   working: ["thread", "waiting", "gate", "children"],
   publishing: [],
@@ -469,8 +471,15 @@ export const ROUND_FACTS: readonly FactName[] = ["thread", "rounds", "remote"];
 
 /** The facts to gather after FACTS_FOR's, given what those showed. */
 export function moreFacts(job: Job, facts: Facts): readonly FactName[] {
-  if (!["review", "checking"].includes(job.phase.state) || facts.pr?.state !== "open" || !facts.feedback?.pending.length || job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) return [];
-  return quietAt(facts.feedback.pending) <= facts.now ? ROUND_FACTS : [];
+  if (job.phase.state === "queued" && !adopted(job)) return ["worker"];
+  if (job.phase.state === "queued") return roundDue(facts) ? ["worker", "rounds", "remote"] : [];
+  if (!["review", "checking"].includes(job.phase.state) || job.control.feedbackRounds >= MAX_FEEDBACK_ROUNDS) return [];
+  return roundDue(facts) ? ROUND_FACTS : [];
+}
+
+function roundDue(facts: Facts): boolean {
+  const pending = facts.feedback?.pending ?? [];
+  return facts.pr?.state === "open" && pending.length > 0 && quietAt(pending) <= facts.now;
 }
 
 /**
@@ -563,18 +572,9 @@ function next(job: Job, facts: Facts): Action | null {
 
   switch (phase.state) {
     case "queued": {
-      if (facts.blockers?.length) return waitFor(job, `waiting for ${facts.blockers.join(", ")}`);
-      // An unblocked child drops its waiting reason before it starts.
-      if (facts.blockers && job.error?.startsWith("waiting for ")) return { type: "change", change: { error: null } };
-      if (!facts.worker) return null;
-      if ("error" in facts.worker) {
-        if (facts.worker.permanent) return { type: "change", change: stick(job, facts.worker.error) };
-        return job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } };
-      }
-      const host = spawnHost(job, facts);
-      if (!host) return null;
-      if ("wait" in host) return waitFor(job, host.wait);
-      return { type: "change", change: start(job, facts.worker, host.hostId, now) };
+      if (adopted(job)) return adoptAction(job, facts);
+      const ready = workerAndHost(job, facts);
+      return "action" in ready ? ready.action : { type: "change", change: start(job, ready.worker, ready.hostId, now) };
     }
     case "checking":
       if (!facts.prerequisiteWait && facts.feedback?.pending.length && facts.review?.kind === "observed" && facts.review.draft) return feedbackAction(job, facts);
@@ -614,6 +614,36 @@ function next(job: Job, facts: Facts): Action | null {
     default:
       return null;
   }
+}
+
+/** A queued job's worker settings and machine, or the action to take while either is missing. */
+function workerAndHost(job: Job, facts: Facts): { worker: WorkerSettings; hostId: string } | { action: Action | null } {
+  if (facts.blockers?.length) return { action: waitFor(job, `waiting for ${facts.blockers.join(", ")}`) };
+  // An unblocked child drops its waiting reason before it starts.
+  if (facts.blockers && job.error?.startsWith("waiting for ")) return { action: { type: "change", change: { error: null } } };
+  if (!facts.worker) return { action: null };
+  if ("error" in facts.worker) {
+    if (facts.worker.permanent) return { action: { type: "change", change: stick(job, facts.worker.error) } };
+    return { action: job.error === facts.worker.error ? null : { type: "change", change: { error: facts.worker.error } } };
+  }
+  const host = spawnHost(job, facts);
+  if (!host) return { action: null };
+  if ("wait" in host) return { action: waitFor(job, host.wait) };
+  return { worker: facts.worker, hostId: host.hostId };
+}
+
+/** An adopted job waits for its pull request's first poll, then for quiet review feedback, then starts its first worker. */
+function adoptAction(job: AdoptedJob, facts: Facts): Action | null {
+  if (!facts.pr || !facts.feedback) return null;
+  const { pending } = facts.feedback;
+  if (pending.length === 0) return waitFor(job, `waiting for review feedback on pull request #${job.pr.number}`);
+  const quiet = quietAt(pending);
+  if (quiet > facts.now) return { type: "sleep", until: quiet };
+  const ready = workerAndHost(job, facts);
+  if ("action" in ready) return ready.action;
+  if (!facts.rounds || !facts.remote) return null;
+  if (facts.remote.head === null) return { type: "change", change: stick(job, `the branch ${job.branch} no longer exists on GitHub`) };
+  return { type: "change", change: adoptRound(job, ready.worker, ready.hostId, pending, facts.rounds, facts.remote.head) };
 }
 
 function feedbackAction(job: Job, facts: Facts): Action | null {
@@ -827,6 +857,61 @@ export function start(job: Job, worker: WorkerSettings, hostId: string, now: num
     { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
   return { phase: enter("starting", effects), deadline: null, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] }, ...hostChange(job, hostId) };
+}
+
+/**
+ * Queued and already owning a pull request: `issues adopt` bound it and no worker has started.
+ */
+export type AdoptedJob = Job & { phase: { state: "queued" }; pr: { number: number; url: string }; pushedSha: Sha };
+
+export function adopted(job: Job): job is AdoptedJob {
+  return job.phase.state === "queued" && job.pr !== null && job.pushedSha !== null;
+}
+
+/**
+ * Why pstack cannot take over this pull request: it must be open, opened by the App from this repository against the
+ * default branch, on an agent branch (the only kind the host pushes) that names the issue `--issue` gives, if any.
+ */
+export function adoptionProblems(
+  pull: PullDetail,
+  expected: { repo: RepoName; baseBranch: string; appLogin: string; issue: number | null },
+): { ok: true; issue: number; branch: BranchName } | { ok: false; reasons: string[] } {
+  const reasons: string[] = [];
+  if (pull.state !== "open") reasons.push(`it is ${pull.state}`);
+  if (pull.headRepo === null) reasons.push("its head repository was deleted");
+  else if (pull.headRepo !== expected.repo) reasons.push(`its head is in fork ${pull.headRepo}, not ${expected.repo}`);
+  if (pull.base !== expected.baseBranch) reasons.push(`it targets ${pull.base}, not the default branch ${expected.baseBranch}`);
+  if (pull.author !== expected.appLogin) reasons.push(`@${pull.author} opened it, not the App (@${expected.appLogin})`);
+  const named = AGENT_BRANCH.test(pull.head) ? Number(/^agent\/issue-(\d+)-/.exec(pull.head)![1]) : null;
+  if (named === null) reasons.push(`its branch ${pull.head} is not an agent/issue-<n>-<slug> branch, the only kind pstack pushes to`);
+  else if (expected.issue !== null && expected.issue !== named) reasons.push(`--issue ${expected.issue} contradicts its branch ${pull.head}, which names issue #${named}`);
+  return reasons.length > 0 || named === null ? { ok: false, reasons } : { ok: true, issue: named, branch: pull.head as BranchName };
+}
+
+/**
+ * queued (adopted) → respawning: the first worker on a pull request pstack did not open in this job. It starts from the
+ * base branch like start()'s, merges the pull request's branch, and answers the pending feedback as feedback round 1.
+ * The round's row and its feedback are written with this change, as in startRound.
+ */
+function adoptRound(job: AdoptedJob, worker: WorkerSettings, hostId: string, pending: readonly Feedback[], rounds: readonly RoundSummary[], head: Sha): Change {
+  const ordinal = job.round + 1;
+  const text = adoptionPrompt(job, ordinal, pending, rounds, head);
+  return {
+    phase: enter("respawning", [
+      { op: "labels", key: `labels:${job.id}:working:${ordinal}`, on: "issue", add: [LABEL.working], remove: [LABEL.review] },
+      { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: text, baseRef: `origin/${job.baseBranch}` } },
+      { op: "check-worktree", key: `adopt-check:${job.id}`, base: head },
+    ]),
+    startRound: { ordinal, kind: "feedback", baseSha: head, feedback: pending.map(({ kind, id }) => ({ kind, id })) },
+    roundBase: head,
+    worker,
+    ...hostChange(job, hostId),
+    deadline: null,
+    rejections: 0,
+    nudges: 0,
+    error: null,
+    control: { ...job.control, feedbackRounds: job.control.feedbackRounds + 1, workerContext: { round: ordinal, text, recoveryReason: null } },
+  };
 }
 
 /**

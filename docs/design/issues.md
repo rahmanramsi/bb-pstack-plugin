@@ -107,6 +107,7 @@ Jobs that start in the same sweep spread out. An open job whose outbox still hol
 | CI or GitHub | Reports a failing check or a merge conflict on the pull request | The worker starts a repair round. |
 | A user with write access | Comments `@pstack-agent stop` on the issue or the pull request | The job stops. |
 | A person in bb | Runs `bb pstack issues stop <job>` or presses **Stop** in the app and confirms | The job stops. |
+| A person in bb | Runs `bb pstack issues adopt --repo <owner/name> --pr <n>` on a pull request the App opened | A new job owns the pull request and answers its review feedback. See [Adopting a pull request](#adopting-a-pull-request). |
 | A user with write access | Adds the `agent` label to an issue that has sub-issues | Each open sub-issue gets its own job. See [Sub-issues](#sub-issues). |
 
 The service reads a user's permission from `GET /repos/{owner}/{repo}/collaborators/{user}/permission` and caches it for 10 minutes. It ignores everything the App wrote and everything from users without write access. A label from such a user becomes an `ignored` job with the reason, so `bb pstack issues list --all` explains why the label did nothing.
@@ -280,6 +281,30 @@ After the report, the job publishes in `republishing` (with a new commit) or `re
 
 A job gets 5 feedback rounds (`MAX_FEEDBACK_ROUNDS`). New feedback after the fifth fails the job with "unresolved feedback after 5 feedback rounds".
 
+## Adopting a pull request
+
+A pull request the App opened can outlive its job, for example when the job got stuck after publishing it. `bb pstack issues adopt` gives the pull request to a new job:
+
+```sh
+bb pstack issues adopt --repo <owner/name> --pr <n> [--issue <n>] [--json]
+```
+
+The pull request qualifies when all of these hold:
+
+- It is open.
+- Its head is a branch of this repository, not of a fork.
+- It targets the default branch.
+- The App opened it.
+- Its branch is `agent/issue-<n>-<slug>`, the only kind of branch pstack pushes. `<n>` is the issue. `--issue`, when given, must match it.
+- The issue is open.
+- No other open job holds the issue, the branch, or the pull request.
+
+A refusal lists every reason and exits 1 with the code `adopt_refused`. Adopting a pull request that an open job already owns prints that job and exits 0. An issue worker cannot adopt.
+
+The new job is the issue's next generation and takes over its status comment. It starts `queued`, owning the pull request and its current head, and the issue shows `agent:review` while it waits. Nothing runs until review feedback arrives. Once the newest feedback has been quiet for 2 minutes, the job starts a worker in `respawning`. The worker's worktree starts at the default branch, and its first message tells it to fetch and merge the pull request's branch. From there the round is an ordinary feedback round: the report answers every item, its commit must contain the branch's head, and the push expects that head.
+
+Feedback posted on the pull request before the adoption counts. An `@<app> stop` posted before the adoption does not stop the new job. When an ended job owned the pull request, the feedback no accepted report answered moves to the new job. Answered feedback stays with the round that answered it.
+
 ## Sub-issues
 
 A parent issue with sub-issues gets a `tracking` job. Each open sub-issue gets its own job, with the parent issue as context. A sub-issue blocked by an open sub-issue of the same parent waits until that blocker is closed, ready for review, merged, or needs no change. A ready blocker's branch and commit become prerequisites: the dependent worker merges them, and its report must contain them.
@@ -313,6 +338,7 @@ bb pstack issues list                 # each repository's last poll and its erro
 bb pstack issues show <job>           # machine, thread, pull request, outcome, limitation, delivery, last error, and last polls
 bb pstack issues stop <job>
 bb pstack issues retry <job>          # a new job for the issue of a stuck or stopped job
+bb pstack issues adopt --repo <owner/name> --pr <n>   # a new job for a pull request the App opened
 ```
 
 `issues list` shows open jobs and each issue's latest stuck job with its reason, until a newer job for the issue replaces it; an ignored label event does not replace it. `--all` adds the rest. `issues retry` starts a new job for the issue once its cause is fixed, and refuses while the issue has an open job. A sub-issue's job is not retried on its own: stop and retry its parent, which creates its sub-issues' jobs again.
@@ -328,6 +354,7 @@ queued ─► starting ─► working ─► publishing ─► checking ─► r
                          │                       └──── drafting ◄──────────┘   (head, base, checks, or feedback changed)
 working, addressing ─(stalled worker)─► recovering ─► working or addressing
 review ─(feedback)─► sending ─► addressing ─► republishing or replying ─► checking
+queued (adopted pull request) ─(feedback)─► respawning ─► addressing
 working ─(no-change)─► closing ─► done
 any open state ─(merged)─► closing ─► done
 any open state ─(failure, closed unmerged, exhausted budget)─► sticking ─► stuck

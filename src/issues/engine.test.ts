@@ -500,7 +500,7 @@ test("in the service, one job's slow push does not hold back another job", { tim
   await pushing.hit;
 
   const oldWorker = (await issue(42)).threadId!;
-  h.threads.get(oldWorker)!.status = "error";
+  Object.assign(h.threads.get(oldWorker)!, { status: "error", updatedAt: h.clock.now - 2 * MIN });
   h.engine().issues.register();
   const service = new AbortController();
   const serving = h.serviceStarts.get("pstack-issues")!(service.signal);

@@ -175,7 +175,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   const activeWork = async (threadId: string) => {
     const children = await bb.sdk.threads.list({ parentThreadId: threadId, limit: 100 });
-    const activeChildren = children.filter((child) => child.status === "active" || child.status === "starting").length;
+    const retrying = async (child: (typeof children)[number]) => child.status === "error" && (await bb.sdk.threads.queuedMessages.list({ threadId: child.id })).some((item) => item.payload.kind === "retry");
+    const activeChildren = (await Promise.all(children.map(async (child) => ["active", "starting", "pending"].includes(child.status) || await retrying(child)))).filter(Boolean).length;
     return { activeRuns: runner.activeRuns(threadId).length, activeChildren };
   };
 
