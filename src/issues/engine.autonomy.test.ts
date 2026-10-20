@@ -408,10 +408,16 @@ test("failure reports retain dirty and unreachable work without calling arbitrar
     const result = await h.report(worker, { outcome: "failure", reason: "Required interface is unavailable", summary: "No usable implementation could be completed.", verification: ["touch /tmp/pstack-untrusted-command; failed to obtain required interface"] }, { dirty: true, headSha: SHA1, ahead: 0 });
     assert.equal(result.exitCode, 0);
     await h.settle();
+    if (!unreachable) {
+      const retry = await h.only();
+      assert.equal(retry.state, "working");
+      assert.notEqual(retry.threadId, worker);
+      await h.report(retry.threadId!, { outcome: "failure", reason: "Required interface is unavailable", summary: "No implementation.", verification: ["Interface unavailable."] }, { dirty: true, headSha: SHA1, ahead: 0 });
+      await h.settle();
+    }
     assert.equal((await h.only()).outcome, "failure");
     assert.equal(h.pushes.length, 0);
     assert.equal(h.worktrees.get(h.threads.get(worker)!.environmentId)!.dirty, true);
-    assert.match(h.gh().comments.get(41)![0]!.body, /Required interface is unavailable/);
   }
 });
 
@@ -437,7 +443,8 @@ test("terminal status retries independently from labels and unrelated execution,
   h.gh().outages.push({ key: "POST /repos/acme/web/issues/41/labels", times: 2, status: 403 });
   h.gh().comments.delete(41);
   h.gh().outages.push({ key: "POST /repos/acme/web/issues/41/comments", times: 2 });
-  await h.report(worker, { outcome: "failure", reason: "Essential capability unavailable", summary: "Work retained.", verification: ["Capability request denied"] });
+  h.failures.pushRejected = "denied";
+  await h.report(worker, GOOD);
   h.label(42);
   await h.settle();
   assert.equal((await h.byIssue(41)).outcome, "failure");
@@ -445,13 +452,13 @@ test("terminal status retries independently from labels and unrelated execution,
   h.restart();
   for (let i = 0; i < 4; i++) { h.clock.now += 2 * MIN; await h.settle(); }
   assert.equal(h.gh().comments.get(41)!.length, 1);
-  assert.match(h.gh().comments.get(41)![0]!.body, /Essential capability unavailable/);
+  assert.match(h.gh().comments.get(41)![0]!.body, /Repository permissions denied publication/);
   h.gh().comments.delete(41);
   h.clock.now += 12 * 60 * MIN; await h.settle();
   assert.equal(h.gh().comments.get(41), undefined, "a deleted terminal comment waits for the daily audit");
   h.clock.now += 12 * 60 * MIN; await h.settle();
   assert.equal(h.gh().comments.get(41)!.length, 1);
-  assert.match(h.gh().comments.get(41)![0]!.body, /Essential capability unavailable/);
+  assert.match(h.gh().comments.get(41)![0]!.body, /Repository permissions denied publication/);
 });
 
 test("pending CI waits while active and missing producers exhaust bounded repair rounds", async () => {
@@ -466,12 +473,13 @@ test("pending CI waits while active and missing producers exhaust bounded repair
   for (let i = 0; i < 6; i++) {
     await h.advance(MIN);
     const job = h.store.get((await h.only()).id)!;
-    if (job.phase.state === "stuck") break;
+    if (job.control.parked) break;
     assert.equal(job.phase.state, "addressing");
     await h.report(job.threadId!, { outcome: "no-change", round: job.round - 1, replies: [], summary: "The producer is unavailable in this repository.", verification: ["Inspected workflow configuration and the missing check producer."] }, { headSha: SHA2, ahead: 1 });
   }
   await h.settle();
-  assert.equal((await h.only()).outcome, "failure");
+  assert.equal((await h.only()).state, "checking");
+  assert.ok(h.store.get((await h.only()).id)!.control.parked);
   assert.match((await h.only()).error!, /repair exhausted/);
 });
 
@@ -508,7 +516,7 @@ test("retired workers cannot poison an identical pending report from the replace
   assert.equal((await h.only()).outcome, "ready");
 });
 
-test("alternating invalid reports exhaust a persisted two-recovery budget", async () => {
+test("alternating invalid reports exhaust recovery into a draft PR with the preserved commits", async () => {
   const h = harness();
   h.label(41); await h.settle();
   for (let episode = 0; episode < 3; episode++) {
@@ -517,10 +525,13 @@ test("alternating invalid reports exhaust a persisted two-recovery budget", asyn
     await h.settle(); h.restart();
   }
   const job = await h.only();
-  assert.equal(job.outcome, "failure");
+  assert.equal(job.state, "checking");
   assert.match(job.error!, /recovery exhausted/);
   assert.equal(h.spawned.length, 3);
   assert.equal(h.store.get(job.id)!.control.recoveries, 2);
+  assert.equal(h.pushes.length, 1);
+  assert.equal(h.gh().issues.get(job.pr!.number)!.pr!.draft, true);
+  assert.ok(h.gh().issues.get(job.pr!.number)!.labels.has("agent:stuck"));
 });
 
 test("CI repair recovers a gone published worker in the preserved environment", async () => {
@@ -593,7 +604,8 @@ test("persistently unknown mergeability stays unready and exhausts its actual re
     await h.report(job.threadId!, { outcome: "no-change", round: current.round - 1, replies: [], summary: "Verified the current implementation.", verification: ["local tests passed; mergeability is still unknown"] }, { headSha: SHA2, ahead: 1 });
     await h.advance(MIN);
   }
-  assert.equal((await h.only()).outcome, "failure");
+  assert.equal((await h.only()).state, "checking");
+  assert.ok(h.store.get((await h.only()).id)!.control.parked);
   assert.match((await h.only()).error!, /repair exhausted.*mergeability is unknown/);
 });
 

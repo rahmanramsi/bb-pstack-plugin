@@ -12,9 +12,16 @@ const SETTLE_MARGIN_MS = 5_000;
 export function desiredLabels(job: Job): Extract<Effect, { op: "labels" }> {
   const review = job.control.readiness !== null || adopted(job);
   const terminal = TERMINAL.has(job.phase.state);
-  const add: Extract<Effect, { op: "labels" }>["add"] = review ? [LABEL.review] : terminal ? [] : [LABEL.working];
+  const add: Extract<Effect, { op: "labels" }>["add"] = review ? [LABEL.review] : (terminal || job.control.parked) ? [] : [LABEL.working];
   const remove = [LABEL.working, LABEL.needsInfo, LABEL.review].filter((label) => !add.includes(label));
   return { op: "labels", key: `status-labels:${JSON.stringify({ add, remove })}`, on: "issue", add, remove };
+}
+
+export function desiredPrLabels(job: Job): Extract<Effect, { op: "labels" }> | null {
+  if (!job.pr) return null;
+  const add = job.control.parked ? [LABEL.stuck] : [];
+  const remove = job.control.parked ? [] : [LABEL.stuck];
+  return { op: "labels", key: `status-pr-labels:${job.pr.number}:${JSON.stringify({ add, remove })}`, on: "pr", add, remove };
 }
 
 type DeliveryDeps = {

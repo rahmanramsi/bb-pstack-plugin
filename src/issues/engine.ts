@@ -24,7 +24,9 @@ import { acceptSync,
   EFFECT_POLICY,
   FACTS_FOR,
   LABEL,
-  REPORTING,
+  acceptsReport,
+  park,
+  PROVIDER_WAIT,
   TERMINAL,
   acceptReport,
   enter,
@@ -74,6 +76,7 @@ import type { IssueStore, Submission } from "./store.ts";
 import { commentBody, effectMarker, mergeNote, workerInstructions, workerPrompt, roundPrompt } from "./text.ts";
 
 export const SWEEP_MS = 15_000;
+export const RETRY_WAIT_MS = 60 * 60_000;
 export const POLL_MS = 60_000;
 const RETRY_ENQUEUE_GRACE_MS = 60_000;
 const MAX_STEPS = 20;
@@ -238,17 +241,19 @@ export function createIssues(deps: IssuesDeps): Issues {
   const deliverStatuses = createStatusDelivery({ store, github, clock, runEffect });
 
   async function worktree(job: Job, signal?: AbortSignal): Promise<Worktree> {
-    if (!job.threadId) return { ok: false, transient: false, error: "the job has no worker thread" };
-    const thread = await bb.sdk.threads.get({ threadId: job.threadId, ...(signal ? { signal } : {}) });
-    if (!thread.environmentId) return { ok: false, transient: true, error: "the worker's worktree is not ready" };
-    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId, ...(signal ? { signal } : {}) }).catch((error) => { if (isMissing(error)) return null; throw error; });
+    const thread = job.threadId ? await bb.sdk.threads.get({ threadId: job.threadId, ...(signal ? { signal } : {}) }).catch((error) => { if (isMissing(error)) return null; throw error; }) : null;
+    const environmentId = thread && thread.archivedAt === null && thread.deletedAt === null ? thread.environmentId : job.control.workspace?.environmentId;
+    if (!environmentId) return { ok: false, transient: true, error: "the worker's worktree is not ready" };
+    const environment = await bb.sdk.environments.get({ environmentId, ...(signal ? { signal } : {}) }).catch((error) => { if (isMissing(error)) return null; throw error; });
     if (!environment || environment.status === "error" || environment.status === "destroyed") return { ok: false, transient: false, error: `the worker environment is ${environment?.status ?? "missing"}; original work location retained` };
     if (environment.hostId !== workerHost(job)) return { ok: false, transient: false, error: `the worker runs on ${environment.hostId}, not the job's machine ${workerHost(job)}` };
     if (environment.status === "creating" || environment.status === "provisioning") return { ok: false, transient: true, error: `the worker's worktree is ${environment.status}` };
     if (!environment.path) return { ok: false, transient: false, error: "the ready worker environment has no workspace path" };
+    const recorded = job.control.workspace;
+    if (recorded && (environment.id !== recorded.environmentId || environment.hostId !== recorded.hostId || environment.path !== recorded.path)) return { ok: false, transient: false, error: "the recorded workspace identity changed; original work location retained" };
     const origin = await deps.inspectOrigin(workerHost(job), environment.path);
     if (!origin || repoFromRemote(origin) !== job.repo.toLowerCase()) return { ok: false, transient: false, error: "the recorded workspace origin does not match the authorized repository" };
-    const status = await bb.sdk.environments.status({ environmentId: thread.environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
+    const status = await bb.sdk.environments.status({ environmentId, mergeBaseBranch: `origin/${job.baseBranch}`, ...(signal ? { signal } : {}) });
     if (status.outcome === "unavailable") return { ok: false, transient: status.failure.code === "unknown", error: `the worktree status is unavailable: ${status.failure.message}` };
     if (status.outcome !== "available") return { ok: false, transient: false, error: status.message };
     const { checkout, workingTree, mergeBase } = status.workspace;
@@ -257,7 +262,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     return {
       ok: true,
       path: environment.path,
-      environmentId: thread.environmentId,
+      environmentId,
       branch: checkout.kind === "branch" ? checkout.branchName : "detached",
       headSha: headSha as Sha,
       dirty: workingTree.hasUncommittedChanges || workingTree.files.some((file) => file.status === "??"),
@@ -390,7 +395,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       async perform(job, effect) {
         if (!job.threadId) return { kind: "fail", error: "the job has no worker thread" };
         const thread = await threadFact(job.threadId);
-        if (thread?.kind === "failed" && thread.retryAt && thread.retryAt > clock()) return { kind: "retry", error: thread.error, notBefore: thread.retryAt };
+        if (thread?.kind === "failed" && thread.retryAt && thread.retryAt > clock()) return { kind: "retry", error: PROVIDER_WAIT, notBefore: thread.retryAt };
         if (thread === null || thread.kind === "waiting") return { kind: "retry", error: "worker activity is unavailable or awaiting queued work", notBefore: null };
         if (thread?.kind === "gone" || thread?.kind === "failed") return { kind: "fail", error: "the repair worker is unavailable" };
         try {
@@ -441,8 +446,21 @@ export function createIssues(deps: IssuesDeps): Issues {
     "edit-pr": {
       async perform(job, effect, deadline) {
         if (!job.pr) return { kind: "fail", error: "the pull request to edit is not recorded" };
-        await github.repo(job.repo, until(deadline)).editPull(job.pr.number, { body: commentBody(effect.body, `pr:${job.id}`) });
+        await github.repo(job.repo, until(deadline)).editPull(job.pr.number, { ...(effect.title ? { title: effect.title } : {}), body: commentBody(effect.body, `pr:${job.id}`) });
         return done();
+      },
+    },
+    "inspect-work": {
+      async perform(job, _effect, deadline) {
+        try {
+          const tree = await worktree(job, until(deadline));
+          if (!tree.ok) return { kind: tree.transient ? "retry-unissued" : "fail", error: tree.error, notBefore: null };
+          const remote = await github.repo(job.repo, until(deadline)).branchSha(job.branch);
+          const added = job.round === 1 ? tree.ahead > 0 : tree.headSha !== (job.roundBase ?? job.pushedSha);
+          return { kind: "work", work: added && tree.headSha !== remote ? { kind: "commits", sha: tree.headSha, dirty: tree.dirty } : { kind: "empty", dirty: tree.dirty } };
+        } catch (error) {
+          return isTransientObservation(error) ? { kind: "retry-unissued", error: message(error), notBefore: null } : { kind: "fail", error: message(error) };
+        }
       },
     },
     "check-worktree": {
@@ -588,7 +606,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (thread.archivedAt !== null || thread.deletedAt !== null) return { kind: "gone" };
       if (thread.status === "error" || thread.queuedMessageCount > 0) {
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
-        const retry = queued.filter((item) => item.payload.kind === "retry").map((item) => item.sendAt ?? clock() + SWEEP_MS);
+        const retry = queued.filter((item) => item.payload.kind === "retry" && (item.sendAt === null || item.sendAt >= clock() - RETRY_WAIT_MS)).map((item) => Math.max(item.sendAt ?? 0, clock() + SWEEP_MS));
         const retryAt = retry.length ? Math.max(...retry) : clock() < thread.updatedAt + RETRY_ENQUEUE_GRACE_MS ? thread.updatedAt + RETRY_ENQUEUE_GRACE_MS : null;
         if (retry.length || thread.status === "error") return { kind: "failed", error: "the thread is in an error state", retryAt };
         if (thread.status === "idle" && queued.length) return { kind: "waiting" };
@@ -781,7 +799,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       const job = store.get(id);
       if (!job) return;
       const pending = store.pendingSubmissions(id);
-      if (pending.length > 0 && (REPORTING.has(job.phase.state) || TERMINAL.has(job.phase.state))) {
+      if (pending.length > 0 && (acceptsReport(job) || TERMINAL.has(job.phase.state))) {
         const result = await evaluateSubmission(job, pending[0]!, true);
         if (result.code === "pending") return;
         if (result.code === "worker-action") {
@@ -887,7 +905,7 @@ export function createIssues(deps: IssuesDeps): Issues {
   async function sync(threadId: string): Promise<ReportResult> {
     const bound = store.byThread(threadId);
     if (!bound) return { ok: false, code: "not_issue_worker", message: "only an issue worker thread can sync" };
-    if (bound.phase.state !== "review") return { ok: false, code: "not_review", message: `job ${bound.id} is ${bound.phase.state}; sync is only for a job in review${REPORTING.has(bound.phase.state) ? ", so report with `bb pstack issues report`" : ""}` };
+    if (bound.phase.state !== "review") return { ok: false, code: "not_review", message: `job ${bound.id} is ${bound.phase.state}; sync is only for a job in review${acceptsReport(bound) ? ", so report with `bb pstack issues report`" : ""}` };
     let facts: Parameters<typeof acceptSync>[1];
     try {
       const tree = await worktree(bound);
@@ -911,7 +929,7 @@ export function createIssues(deps: IssuesDeps): Issues {
 
   async function evaluateSubmission(job: Job, submission: Submission, notify = false): Promise<{ code: string; result: ReportResult }> {
     const reject = (code: string, explanation: string) => ({ code, result: { ok: false, code, message: explanation } as const });
-    const rejectedChange = (change: Change, explanation: string): Change => notify && (!change.phase || REPORTING.has(change.phase.state))
+    const rejectedChange = (change: Change, explanation: string): Change => notify && (!change.phase || acceptsReport({ ...job, ...change, phase: change.phase }))
       ? { ...change, phase: enter("recovering", [{ op: "send-round", key: `evaluation:${job.id}:${submission.id}`, text: `${explanation}\nCorrect the report in this worker and submit current verification with bb pstack issues report.` }]) }
       : change;
     if (submission.epoch !== job.control.epoch || submission.round !== job.round || submission.threadId !== job.threadId) {
@@ -926,7 +944,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       } catch {}
       return reject("pending", "Report saved while the current worker message is delivered.");
     }
-    if (!REPORTING.has(job.phase.state)) {
+    if (!acceptsReport(job)) {
       store.finishSubmission(submission.id, "job no longer reporting", clock());
       return reject("not_working", `job ${job.id} is ${job.phase.state}`);
     }
@@ -948,10 +966,10 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (tree.ok) { headSha = tree.headSha; control = { ...control, workspace: { environmentId: tree.environmentId, hostId: workerHost(job), path: tree.path, branch: tree.branch }, preservation: tree.dirty ? "dirty and untracked work retained" : "local commits retained" }; }
         else control = { ...control, preservation: tree.error };
       } catch (error) { control = { ...control, preservation: message(error) }; }
-      const change = stick({ ...job, control }, report.reason, { kind: "report", reason: report.reason });
+      const change = park({ ...job, control }, report.reason, control.bestReasons ?? []);
       const accepted: AcceptedReport = { ...report, headSha, acceptedAt: clock() };
       const result = { ok: true, message: "Failure report saved. The original work and reason are preserved." } as const;
-      const written = store.write(job.id, job.version, { ...change, control: { ...control, publicFailure: { kind: "report", reason: report.reason }, disposition: "failure", readiness: null }, report: accepted, evaluation: { submissionId: submission.id, result: JSON.stringify(result) } }, clock());
+      const written = store.write(job.id, job.version, { ...change, control: { ...(change.control ?? control), publicFailure: { kind: "report", reason: report.reason } }, report: accepted, evaluation: { submissionId: submission.id, result: JSON.stringify(result) } }, clock());
       return written ? { code: "accepted", result } : reject("pending", "Report saved for evaluation after the current transition.");
     }
     try {
@@ -1013,7 +1031,7 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!named || candidate?.epoch !== named.control.epoch || !awaitingThread(named)) return { ok: false, code: "not_issue_worker", message: "only a confirmed issue worker can report" };
       job = named;
     }
-    if (!REPORTING.has(job.phase.state) && !awaitingThread(job) && !sendingToWorker(job)) return { ok: false, code: "not_working", message: `job ${job.id} is not accepting a worker report` };
+    if (!acceptsReport(job) && !awaitingThread(job) && !sendingToWorker(job)) return { ok: false, code: "not_working", message: `job ${job.id} is not accepting a worker report` };
     if (awaitingThread(job) || sendingToWorker(job)) {
       const candidate = await namedJob(threadId);
       if (!candidate || candidate.epoch !== job.control.epoch) return { ok: false, code: "stale_report", message: "the worker epoch is retired" };

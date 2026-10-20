@@ -4,7 +4,7 @@
  * the row's version, in one transaction with the round history and feedback rows it implies.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { desiredLabels, STATUS_CONCURRENCY, TERMINAL_STATUS_AUDIT_MS } from "./delivery.ts";
+import { desiredPrLabels, desiredLabels, STATUS_CONCURRENCY, TERMINAL_STATUS_AUDIT_MS } from "./delivery.ts";
 import { statusBody } from "./text.ts";
 import type { Db } from "../store.ts";
 import {
@@ -326,13 +326,18 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       .run(terminatedAt + TERMINAL_STATUS_AUDIT_MS, job.repo, job.issue, job.id);
     const row = db.prepare("SELECT job_id, decorations_json, desired_labels_key FROM issue_status WHERE repo = ? AND issue = ?").get(job.repo, job.issue) as { job_id: string; decorations_json: string; desired_labels_key: string | null } | undefined;
     if (!row || row.job_id !== job.id) return;
-    const effect = desiredLabels(job);
+    const effects = [desiredLabels(job), desiredPrLabels(job)].filter((effect) => effect !== null);
+    const key = JSON.stringify(effects.map((effect) => effect.key));
     const current = JSON.parse(row.decorations_json) as Decoration[];
-    const labels = current.filter((item) => item.effect.op === "labels" && item.effect.on === "issue");
-    const retained = current.filter((item) => item.effect.op !== "labels" || item.effect.on !== "issue");
-    if (row.desired_labels_key !== effect.key || labels.length) {
-      if (row.desired_labels_key !== effect.key || labels.some((item) => item.effect.key === effect.key)) retained.push(labels.find((item) => item.effect.key === effect.key) ?? { effect, nextAt: 0, attempts: 0, error: null });
-      db.prepare("UPDATE issue_status SET decorations_json = ?, desired_labels_key = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(retained), effect.key, job.repo, job.issue);
+    const projected = (effect: Effect) => effect.op === "labels" && (effect.on === "issue" || effect.key.startsWith("status-pr-labels:"));
+    const labels = current.filter((item) => projected(item.effect));
+    const retained = current.filter((item) => !projected(item.effect));
+    if (row.desired_labels_key !== key || labels.length) {
+      for (const effect of effects) {
+        const previous = labels.find((item) => item.effect.key === effect.key);
+        if (row.desired_labels_key !== key || previous) retained.push(previous ?? { effect, nextAt: 0, attempts: 0, error: null });
+      }
+      db.prepare("UPDATE issue_status SET decorations_json = ?, desired_labels_key = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(retained), key, job.repo, job.issue);
     }
   }
 

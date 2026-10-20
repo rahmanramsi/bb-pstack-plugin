@@ -17,7 +17,7 @@ The bb Plugin SDK and the deployment set these limits:
 
 ## What a job delivers
 
-Every accepted trigger ends in one of these outcomes. The app, `bb pstack issues list` and `issues show`, and the issue's status comment all report it.
+An accepted trigger can produce one of these outcomes, or pause with unfinished work in a draft pull request. The app, `bb pstack issues list` and `issues show`, and the issue's status comment all report it.
 
 | Outcome | Meaning |
 |---|---|
@@ -53,7 +53,12 @@ flowchart TD
   ready -->|Human merges| merged[Merged]
   worker -->|Stalled| recovery[Stop owned writers and recover the same worktree]
   recovery -->|Safe reuse| worker
-  recovery -->|Unsafe or exhausted| failure
+  recovery -->|Unsafe| failure
+  recovery -->|Exhausted| unfinished[Inspect and publish unfinished commits in a draft PR]
+  report -->|Worker cannot finish| unfinished
+  checks -->|Repair exhausted| unfinished
+  unfinished -->|Publication denied or no commits after one retry| failure
+  unfinished -->|Trusted review or current worker report| worker
 ```
 
 Every transition updates the desired issue status in the database. Independent delivery retries the issue comment and labels when GitHub recovers. A temporary outage keeps the accepted work and its pending effects. A permanent publication denial records failure without discarding the commit.
@@ -154,7 +159,7 @@ A feedback round's report also answers the round's comments:
 }
 ```
 
-`round` is the round the message named. `replies` has exactly one entry for each item the round listed, named by `kind` (`review`, `review-comment`, or `pr-comment`) and `commentId`. `pr.body` is optional and replaces the pull request description. A feedback report has no `pr.title`. A repair round for CI or a conflict lists no comments, so its `replies` is empty.
+`round` is the round the message named. `replies` has exactly one entry for each item the round listed, named by `kind` (`review`, `review-comment`, or `pr-comment`) and `commentId`. `pr.body` is optional and replaces the pull request description. A feedback report may also supply `pr.title` to replace an unfinished title. Supplied titles pass the same checks as the initial title. A repair round for CI or a conflict lists no comments, so its `replies` is empty.
 
 **Submissions are saved before they are judged.** pstack stores every submission in `issue_submissions` before it evaluates it. Identical submissions by the same worker at the same job version share a row. When the host or GitHub is temporarily unreachable, the command exits 0 with "Report saved", and evaluation resumes when the dependency recovers. A submission from a retired worker or an earlier round is kept and answered with `stale_report`. It cannot move the job.
 
@@ -190,7 +195,7 @@ A worker that stops making progress is replaced in its own worktree. pstack neve
 Recovery starts when one of these happens while the job waits for a report:
 
 - The worker thread is archived or deleted.
-- The worker thread is in an error state, and bb has no provider retry scheduled. A scheduled retry is waited out first.
+- The worker thread is in an error state, and bb has no current provider retry queued. A queued retry waits with the visible reason "waiting for the worker's provider to retry", including for up to 60 minutes after its scheduled time. An older overdue retry permits recovery.
 - The worker went idle without reporting after 2 reminders. A worker whose own pstack run or child threads are still working is waiting, not idle.
 - 3 reports in a row were rejected without progress.
 - A round message could not be delivered to the worker.
@@ -205,9 +210,25 @@ Each recovery starts a new worker epoch. Reports from an earlier epoch are kept 
 
 Creating or provisioning environments and recognized transient pre-spawn faults, including SDK transport errors, retry with increasing delays, for up to 8 observations. A missing, destroyed, or errored environment ends recovery with the work preserved. These observation attempts are separate from the spawn claim. Once a spawn call may have been issued, the probe-only rule applies. Reminder delivery is also persisted before the send. A lost SDK response can duplicate a reminder, but cannot silently discard it.
 
-A job gets 2 recoveries. The count resets once, when the job's first `changes` report is accepted. When recoveries run out, or the environment is conclusively unsafe to reuse, the job fails. Its public status names the failure category and retained commit; local details remain available in bb.
+A job gets 2 recoveries. The count resets when the first `changes` report is accepted or external input resumes parked work. When recoveries run out, pstack inspects the work for publication as unfinished work. An environment that is conclusively unsafe to reuse still ends the job with its work preserved.
 
 A worker that keeps making progress has no time limit. pstack records no deadline for a round.
+
+## Unfinished work
+
+A worker's failure report, exhausted recovery budget, exhausted repair cause, or feedback round limit parks the job. Parking uses the existing `publishing` state and returns to `checking`; it adds no job state. The control record stores the stop reason, remaining work, park count, and whether the empty-workspace retry was used.
+
+Parking stops the worker before `inspect-work` reads its workspace. Missing or archived threads use the recorded environment with the same host, path, and repository checks. Inspection distinguishes unpublished commits from an empty contribution. Transient workspace observations retry at most 8 times. Definite inspection failures retain the workspace and end the job.
+
+Unpublished commits go through the existing `push` effect. Fresh repository grants, the expected remote head, the inspected nonempty diff, workflow permission, scoped credentials, and token revocation still apply. A denied publication ends the job without pushing. A moved remote branch ends a parked push without starting another repair round.
+
+The result is a draft pull request labelled `agent:stuck`. An existing pull request is returned to draft when its target is known. Its title identifies unfinished work. Its description states why the job stopped, what remains, and whether uncommitted changes remain in the workspace. It explicitly says validation did not complete and the draft was opened without `gate pr`. It relates to the issue without a closing keyword.
+
+Already published work keeps its pull request even when inspection finds no new commits. An empty workspace with nothing published gets one replacement worker in the recorded environment. That retry preserves files and the recovery count. Another empty result ends the job with "the worker produced no commits".
+
+A parked job stays in `checking` without automatic repair or ready conversion. Trusted pending review feedback starts another round. The bound worker can also submit a report for its current epoch and round. Resume clears the parked marker and recovery, invalid-report, and repair counters. A report that supplies pull request text replaces the unfinished body and can replace the title. Pending saved reports are evaluated before feedback starts a new round.
+
+A job can park twice (`MAX_PARKS`). Resuming does not reset that count. Further attempts to park end the job. Security failures, unsafe workspace identity, uncertain spawns with no trace, closed unmerged pull requests, and permanent prerequisites still end in `stuck`.
 
 ## Publication
 
@@ -229,7 +250,7 @@ Then the service opens the pull request as a draft with the `agent` label. A pro
 
 A divergent remote head starts a publication repair round in the preserved worktree. The round retains the accepted commit, observed remote head, assigned feedback and remaining publication effects. Its fresh report must contain both commits and include new verification. When the remote already contains the accepted work, a verified no-change report can continue publication without an empty commit. A changed remote is never accepted as a new lease for the old commit alone.
 
-**Retries.** A temporary GitHub, host, or bb fault retries the same effect with backoff of 5 s, 15 s, 1 min, 5 min, and then 15 min, and waits longer when GitHub names a time. There is no try limit for temporary faults. A permanent fault, such as a denied grant or a rejected ref, fails the job and keeps the commits and the report.
+**Retries.** Except for bounded workspace observations, a temporary GitHub, host, or bb fault retries the same effect with backoff of 5 s, 15 s, 1 min, 5 min, and then 15 min, and waits longer when GitHub names a time. There is no try limit for temporary faults. A permanent fault, such as a denied grant or a rejected ref, fails the job and keeps the commits and the report.
 
 ## CI, conflicts, and readiness
 
@@ -249,7 +270,7 @@ Aggregate check-suite observations can keep the job pending or identify a failur
 
 **Readying needs a fresh observation.** The transit state `readifying` converts the draft only if the head and base still match what was checked, then reads the pull request again. Conversion records the intended target. A later fresh healthy snapshot establishes readiness. Checks triggered by ready conversion clear the ready outcome while they run. They do not repeatedly turn the same target back into a draft.
 
-**Repair rounds.** When checks fail, mergeability is conflicting, or local verification is stale, the job returns the pull request to draft and starts a repair round in `repairing`. The round message lists the failures and the exact head and base, and tells the worker to fetch, merge as needed, and run checks itself. Each distinct failure cause, identified by its failure text with commit ids removed, gets 5 repair rounds. After that the job fails with the work kept. A new commit alone does not reset a failing-CI count. Fresh verification that reaches readiness closes the stale-local-evidence episode, so healthy base updates do not consume a lifetime failure budget. While checks are still pending, the job waits. Temporary GitHub faults wait without spending a repair round. A permanent denial of the essential pull request snapshot fails the job.
+**Repair rounds.** When checks fail, mergeability is conflicting, or local verification is stale, the job returns the pull request to draft and starts a repair round in `repairing`. The round message lists the failures and the exact head and base, and tells the worker to fetch, merge as needed, and run checks itself. Each distinct failure cause, identified by its failure text with commit ids removed, gets 5 repair rounds. After that the job parks with the review reasons listed as remaining work. A new commit alone does not reset a failing-CI count. Fresh verification that reaches readiness closes the stale-local-evidence episode, so healthy base updates do not consume a lifetime failure budget. While checks are still pending, the job waits. Temporary GitHub faults wait without spending a repair round. A permanent denial of the essential pull request snapshot fails the job.
 
 **Branch policy that cannot be read.** Classic branch protection needs the Administration read grant, and some rules are not visible through the API. When pstack cannot read the whole policy, the job can still become ready on complete observed checks and local verification. The result carries a limitation such as "Branch policy could not be inspected… merge prerequisites are not established". Ready for review never claims that unread required checks passed.
 
@@ -277,7 +298,7 @@ The worker decides the effort. Mechanical feedback such as a rename is applied d
 
 After the report, the job publishes in `republishing` (with a new commit) or `replying` (without one) and returns to `checking`. Replies and review requests are delivered like the status comment: each has its own retries, and a failure does not hold the job back.
 
-A job gets 5 feedback rounds (`MAX_FEEDBACK_ROUNDS`). New feedback after the fifth fails the job with "unresolved feedback after 5 feedback rounds".
+A job gets 5 feedback rounds (`MAX_FEEDBACK_ROUNDS`) before parking with a feedback round limit reason. A parked job can resume from trusted feedback beyond that limit; the park count bounds repeated attempts.
 
 ## Adopting a pull request
 
@@ -313,7 +334,7 @@ The parent fails when a sub-issue's job fails, when blockers form a cycle, or wh
 
 ## Issue status on GitHub
 
-Each issue has one status comment owned by the App. It states the outcome or current step, a public failure category or intentional failure report, any branch-policy limitation, the report summary, the pull request, the reported or preserved commit, the branch, and the verification lines. Status generation does not copy raw runtime errors, environment identifiers or workspace paths into the comment. Intentional report text remains worker-authored. Unknown historical outcomes say Outcome unknown. Mentions and embedded pstack markers are normalized before transport adds its own status marker.
+Each issue has one status comment owned by the App. It states the outcome or current step, a public failure category or intentional failure report, any branch-policy limitation, the report summary, the pull request, the reported or preserved commit, the branch, and the verification lines. Parked work also reports its recorded stop reason. Other statuses omit raw runtime errors, environment identifiers, and workspace paths. Intentional report text remains worker-authored. Unknown historical outcomes say Outcome unknown. Mentions and embedded pstack markers are normalized before transport adds its own status marker.
 
 A parent's public sub-issue progress stays visible during integration and after failure. It is stored separately from the instructions that tell its worker which branches to merge.
 
@@ -324,7 +345,7 @@ The comment's desired text lives in the `issue_status` table, one row per reposi
 - It claims the row with a lease, finds every App-owned comment on the issue with the marker `<!-- pstack:issue-status:<repo>:<issue> -->`, edits the oldest, deletes the other App-owned copies, and creates the comment when none exists.
 - It acknowledges only the revision it delivered. A newer revision stays due.
 - It audits delivered comments hourly for active jobs and daily for terminal jobs. A deleted or edited comment is restored on the next audit. New desired text becomes due immediately, subject to any persisted GitHub cooldown.
-- The status labels (`agent:working` while active, `agent:review` when ready, none once the job ends), replies, and review requests are queued on the same row with their own retry times. An unchanged desired label set retains its retry time and is not rewritten on comment audits. A newer set supersedes stale issue labels without dropping replies or review requests.
+- The status labels (`agent:working` while active, `agent:review` when ready, none while parked or once the job ends), replies, and review requests are queued on the same row with their own retry times. An unchanged desired label set retains its retry time and is not rewritten on comment audits. A newer set supersedes stale issue labels without dropping replies or review requests. The same projection adds `agent:stuck` to a parked job's pull request and removes it when the job resumes, replacing stale pending label deliveries.
 - At most four delivery leases are held across engines. Leases carry owner tokens across issue generations; an expired or replaced owner cannot settle newer work. A lost response may still require later reconciliation.
 
 A delivery error is stored on the row and shown in the app and in `issues show`. It never changes the job's outcome or holds back another job. Pending decoration retries remain due independently of the comment audit. A rate-limit deadline from a comment or decoration holds all delivery on that issue until the deadline, including after restart or a newer job generation. Other comment faults leave decoration delivery independent. Terminal jobs are delivered the same way, so a failure reaches the issue once GitHub is reachable.
@@ -352,7 +373,10 @@ review ─(feedback)─► sending ─► addressing ─► republishing or repl
 queued (adopted pull request) ─(feedback)─► respawning ─► addressing
 working ─(no-change)─► closing ─► done
 any open state ─(merged)─► closing ─► done
-any open state ─(failure, closed unmerged, exhausted budget)─► sticking ─► stuck
+working, addressing, checking, review ─(unfinished work)─► publishing ─► checking (parked)
+checking (parked) ─(trusted feedback)─► sending or recovering
+checking (parked) ─(current worker report)─► publishing or republishing
+any open state ─(security failure, closed unmerged, exhausted park budget)─► sticking ─► stuck
 any open state ─(stop)─► stopping ─► stopped
 parent: tracking ⇄ updating, then queued for the integration worker
 ```
@@ -361,7 +385,7 @@ parent: tracking ⇄ updating, then queued for the integration worker
 
 The state says where the job is. The outcome is stored separately in the job's control record, so a later step cannot overwrite a stop or a failure, and a ready result is cleared the moment its evidence goes stale.
 
-**A pure core.** `src/issues/job.ts` imports only zod and SDK types. `plan(job, facts)` returns at most one action, `settle(job, outcome, now)` turns an effect's outcome into the next change, and `acceptReport(job, report, facts)` is the only way out of `working` and `addressing` with a report. `EFFECT_POLICY` gives each effect a lease and a recovery: `replay` runs it again, `probe` looks for its trace and runs it again only when there is none, and `once` looks for its trace and never runs it again (spawns). The engine writes every change with `store.write(id, version, change)`, one `UPDATE` guarded by the row's version. The poller, thread events, the 15 s sweep, and the report command all end in the same `tick(jobId)`, which runs one reconcile per job at a time.
+**A pure core.** `src/issues/job.ts` uses zod, SDK types, and pure text helpers. `plan(job, facts)` returns at most one action, `settle(job, outcome, now)` turns an effect's outcome into the next change, and `acceptReport(job, report, facts)` is the only way out of `working` and `addressing` with a report. `EFFECT_POLICY` gives each effect a lease and a recovery: `replay` runs it again, `probe` looks for its trace and runs it again only when there is none, and `once` looks for its trace and never runs it again (spawns). The engine writes every change with `store.write(id, version, change)`, one `UPDATE` guarded by the row's version. The poller, thread events, the 15 s sweep, and the report command all end in the same `tick(jobId)`, which runs one reconcile per job at a time.
 
 **Polling, not webhooks.** The server has no stable public endpoint, and polling resumes from a cursor after downtime. The `pstack-issues` service polls each repository every 60 s with conditional requests, and reads each open job's issue comments, pull request comments, reviews, and state on its own. A job GitHub cannot read keeps its cursor and records the error, and every other job continues. GitHub dates a review's inline comments from when they were drafted, so each newly seen review has its comments read separately, and the inline list reads 10 minutes behind its cursor.
 
@@ -392,7 +416,8 @@ These are constants:
 
 - No cap on concurrent jobs in pstack. An automatic job starts once a machine is eligible. bb's per-machine and global concurrency limits decide when worker threads run.
 - 2 reminders to an idle worker before recovery (`MAX_NUDGES`).
-- 2 recoveries per job, reset once by the first accepted change (`MAX_RECOVERIES`).
+- 2 recoveries, reset by the first accepted change and when parked work resumes (`MAX_RECOVERIES`).
+- 2 parks per job, with one extra workspace retry when nothing was committed (`MAX_PARKS`).
 - 3 rejected reports in a row without progress before recovery (`MAX_INVALID_REPORTS`).
 - 5 repair rounds per distinct CI or conflict cause (`MAX_REPAIRS`).
 - 5 feedback rounds per pull request (`MAX_FEEDBACK_ROUNDS`).

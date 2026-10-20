@@ -185,7 +185,7 @@ for (const point of ROUND_CRASH_POINTS) {
   });
 }
 
-test("a feedback round's report follows the round contract: replies are required, and a pull request title or a question is a schema error", async () => {
+test("a feedback round's report follows the round contract: replies are required, and unknown fields and questions are schema errors", async () => {
   const h = harness();
   const { job, pr } = await h.toReview();
   const { comments } = h.review(pr, { author: "maya", body: "", comments: ["Rename `x`."] });
@@ -195,7 +195,7 @@ test("a feedback round's report follows the round contract: replies are required
   assert.equal((await h.only()).state, "addressing");
   const reply = { kind: "review-comment", commentId: comments[0]!, body: "Renamed in 3333333." };
   for (const bad of [
-    roundReport([reply], { pr: { title: "fix(login): rename x", body: "## Why\nRenamed." } }),
+    roundReport([reply], { pr: { extra: "unsupported", body: "## Why\nRenamed." } }),
     { outcome: "no-change", verification: ["read it"], summary: "Explained." },
     { outcome: "needs-info", questions: ["Which x?"], replies: [reply], verification: ["read it"] },
   ]) {
