@@ -140,7 +140,7 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
     (need.affinity === "home" ? home.free === 0 : away.free > home.free);
   const picked = move ? away : home;
   const where = picked.id === home.id ? "home" : "away";
-  const why = need.away === null ? `pinned to ${home.name}`
+  const why = need.away === null ? `pinned to ${home.name}${home.blocker ? `; ${home.blocker}, bb will queue the thread` : ""}`
     : facts.limits === null || home.limit === null ? `${home.name}; concurrency limits unknown, staying home`
     : where === "away" ? `${home.name} has ${home.free} free; ${picked.name} has ${picked.free} free`
     : home.free > 0 ? `${home.name} has ${home.free} free`
