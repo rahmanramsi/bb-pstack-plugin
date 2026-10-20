@@ -53,6 +53,11 @@ export type NewJob = {
   error: string | null;
 };
 
+/** A queued job that already owns an open pull request whose head is `head`; see `adopt`. */
+export type NewAdoption = Omit<NewJob, "state" | "error" | "parentId"> & { branch: BranchName; pr: { number: number; url: string }; head: Sha };
+/** `transferred`: how many of the pull request's unanswered feedback items moved from ended jobs to this one. */
+export type Adoption = { kind: "adopted"; job: Job; transferred: number } | { kind: "already"; job: Job } | { kind: "refused"; reason: string };
+
 /** A job's last poll of its pull request: the cursor github.ts hands back, the state it read, and why it last failed. */
 export type JobPoll = { cursor: unknown; prState: PullState | null; polledAt: number | null; error: string | null };
 
@@ -125,7 +130,15 @@ export type DurableDelivery = {
   /** A `notBefore` from GitHub holds the whole issue's delivery, comment and decorations, until then. */
   settleDecoration(status: IssueStatus, key: string, error: string | null, nextAt: number, now: number, notBefore?: number): void;
 };
-export type IssueStore = IssueReads & IssueWrites & DurableDelivery;
+export type Adoptions = {
+  /**
+   * Inserts a queued job that owns `job.pr`, in one transaction with its refusals: `already` when the issue's open job
+   * owns this pull request and branch, `refused` when another open job holds the issue, the branch or the pull request.
+   * The pull request's unanswered feedback that ended jobs own moves to the new job.
+   */
+  adopt(job: NewAdoption, now: number): Adoption;
+};
+export type IssueStore = IssueReads & IssueWrites & DurableDelivery & Adoptions;
 
 type JobRow = {
   id: string;
@@ -602,7 +615,12 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), status.repo, status.issue);
     }),
   };
-  return { ...reads, ...notifying(writes, onChange), ...deliveries };
+  const adoptions: Adoptions = {
+    adopt() {
+      throw new Error("not implemented");
+    },
+  };
+  return { ...reads, ...notifying(writes, onChange), ...deliveries, ...adoptions };
 }
 
 function notifying(writes: IssueWrites, onChange: () => void): IssueWrites {

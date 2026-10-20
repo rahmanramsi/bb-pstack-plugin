@@ -8,6 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import type { PullDetail } from "./github.ts";
 import { COMMENT_MAX, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
 export type JobId = string & { readonly __brand: "IssueJobId" };
@@ -819,6 +820,22 @@ export function start(job: Job, worker: WorkerSettings, hostId: string, now: num
     { op: "spawn", key: `spawn:${job.id}`, spec: { ...worker, title: workerTitle(job), prompt: workerPrompt(job), baseRef: `origin/${job.baseBranch}` } },
   ];
   return { phase: enter("starting", effects), deadline: null, error: null, worker, startRound: { ordinal: 1, kind: "initial", baseSha: null, feedback: [] }, ...hostChange(job, hostId) };
+}
+
+/**
+ * Queued and already owning a pull request: `issues adopt` bound it and no worker has started.
+ */
+export type AdoptedJob = Job & { phase: { state: "queued" }; pr: { number: number; url: string }; pushedSha: Sha };
+
+export function adopted(job: Job): job is AdoptedJob {
+  throw new Error("not implemented");
+}
+
+export function adoptionProblems(
+  pull: PullDetail,
+  expected: { repo: RepoName; baseBranch: string; appLogin: string; issue: number | null },
+): { ok: true; issue: number; branch: BranchName } | { ok: false; reasons: string[] } {
+  throw new Error("not implemented");
 }
 
 /**
