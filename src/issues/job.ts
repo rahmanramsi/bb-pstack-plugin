@@ -288,6 +288,8 @@ export type Control = {
   repair: { cause: string; attempts: number; counts?: Record<string, number> } | null;
   objectRepair: { sha: Sha } | null;
   idleObservation: { since: number; remindedAt: number } | null;
+  /** Messages pstack queued behind a worker's running turn: recovery may delete these, never another sender's. */
+  queuedSends: readonly string[];
   mergeabilityGrace: { target: ReviewTarget; firstAt: number; lastObservedAt: number; observations: number } | null;
   publicationRepair: { acceptedSha: Sha; remoteSha: Sha; remaining: readonly Effect[]; attempts: number } | null;
   workerContext: { round: number; text: string; recoveryReason: string | null } | null;
@@ -297,7 +299,7 @@ export type Control = {
   preservedSha: Sha | null;
   preservation: string | null;
 };
-export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
+export const initialControl = (): Control => ({ publicFailure: null, childrenProgress: null, epoch: 0, feedbackRounds: 0, workspace: null, recoveries: 0, invalid: 0, bestReasons: null, milestones: [], readiness: null, mergedHead: null, recoveryObservation: null, reviewIntent: null, localEvidence: null, repair: null, objectRepair: null, idleObservation: null, queuedSends: [], mergeabilityGrace: null, publicationRepair: null, workerContext: null, prerequisites: [], policyLimitation: null, disposition: null, preservedSha: null, preservation: null });
 export type Job = {
   control: Control;
   id: JobId;

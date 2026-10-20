@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer } from "node:http";
-import { GOOD, MIN, SHA2, harness } from "./engine-harness.ts";
+import { GOOD, MIN, SHA2, SHA3, harness } from "./engine-harness.ts";
 import { EFFECT_POLICY, recover } from "./job.ts";
 
 for (const race of ["held", "restart", "cas"] as const) {
@@ -341,3 +341,36 @@ for (const status of ["error", "destroyed", "missing"] as const) {
     assert.equal(h.pushes.length, 0);
   });
 }
+
+test("recovery retires pstack's own message queued behind the worker's turn instead of sticking", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const worker = (await h.only()).threadId!;
+  h.failures.queueSends = true;
+  h.failures.missingObject = SHA3;
+  assert.equal((await h.report(worker, GOOD)).exitCode, 0);
+  await h.settle();
+  assert.equal(h.rows.get(worker)?.length, 1);
+  assert.match(h.rows.get(worker)![0]!.text, /bb pstack gh fetch/);
+  Object.assign(h.threads.get(worker)!, { status: "error", updatedAt: h.clock.now });
+  await h.advance(3 * MIN);
+  const job = await h.only();
+  assert.notEqual(job.state, "stuck", job.error ?? "");
+  assert.deepEqual(h.rows.get(worker), []);
+  assert.equal(h.spawned.length, 2);
+  assert.equal(h.spawned[1]!.environment.type, "reuse");
+  assert.match(h.spawned[1]!.prompt, new RegExp(`Fetch the missing object ${SHA3}`));
+});
+
+test("recovery still refuses a workspace whose worker holds a message pstack did not queue", async () => {
+  const h = harness();
+  h.label(41); await h.settle();
+  const worker = (await h.only()).threadId!;
+  Object.assign(h.threads.get(worker)!, { status: "error", updatedAt: h.clock.now, queuedMessageCount: 1 });
+  h.queued.add(worker);
+  await h.advance(3 * MIN);
+  const job = await h.only();
+  assert.equal(job.state, "stuck");
+  assert.match(job.error!, /exclusive reuse is unavailable/);
+  assert.equal(h.spawned.length, 1);
+});

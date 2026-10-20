@@ -393,14 +393,15 @@ export function createIssues(deps: IssuesDeps): Issues {
         if (thread?.kind === "failed" && thread.retryAt && thread.retryAt > clock()) return { kind: "retry", error: thread.error, notBefore: thread.retryAt };
         if (thread === null || thread.kind === "waiting") return { kind: "retry", error: "worker activity is unavailable or awaiting queued work", notBefore: null };
         if (thread?.kind === "gone" || thread?.kind === "failed") return { kind: "fail", error: "the repair worker is unavailable" };
+        let sent: Awaited<ReturnType<typeof bb.sdk.threads.send>>;
         try {
           // Queued behind a turn that is still running, never steered into it.
-          await bb.sdk.threads.send({ threadId: job.threadId, mode: "queue-if-active", input: [{ type: "text", text: effect.text, mentions: [] }] });
+          sent = await bb.sdk.threads.send({ threadId: job.threadId, mode: "queue-if-active", input: [{ type: "text", text: effect.text, mentions: [] }] });
         } catch (error) {
           if (isMissing(error)) return { kind: "fail", error: "the worker thread is gone" };
           throw error;
         }
-        return thread.kind === "idle" ? done({ control: { ...job.control, idleObservation: { since: thread.since, remindedAt: clock() } } }) : done();
+        return done({ control: { ...job.control, ...(thread.kind === "idle" ? { idleObservation: { since: thread.since, remindedAt: clock() } } : {}), ...(sent.delivery === "queued" ? { queuedSends: [...job.control.queuedSends, sent.queuedMessage.id] } : {}) } });
       },
     },
     reply: {
@@ -530,11 +531,17 @@ export function createIssues(deps: IssuesDeps): Issues {
         }
         for (const threadId of threads) {
           await bb.sdk.threads.stop({ threadId, signal }).catch((error) => { if (!isMissing(error)) throw error; });
-          const stopped = await bb.sdk.threads.get({ threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });
+          let stopped = await bb.sdk.threads.get({ threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });
           if (stopped && (stopped.status !== "idle" && stopped.status !== "error" || (stopped.runtime !== undefined && !["idle", "error"].includes(stopped.runtime.displayStatus)))) return { kind: "retry", error: `stop is not confirmed for ${threadId}`, notBefore: clock() + SWEEP_MS };
+          if (job.phase.state === "recovering" && stopped && stopped.queuedMessageCount > 0) {
+            for (const row of await bb.sdk.threads.queuedMessages.list({ threadId })) {
+              if (job.control.queuedSends.includes(row.id)) await bb.sdk.threads.queuedMessages.delete({ threadId, queuedMessageId: row.id }).catch((error) => { if (!isMissing(error)) throw error; });
+            }
+            stopped = await bb.sdk.threads.get({ threadId, signal }).catch((error) => { if (isMissing(error)) return null; throw error; });
+          }
           if (job.phase.state === "recovering" && stopped && (stopped.queuedMessageCount > 0 || stopped.activeBackgroundAgentCount > 0)) return { kind: "fail", error: `exclusive reuse is unavailable for ${threadId}: queued or background work remains after stop; the original workspace is preserved` };
         }
-        return done({ control: { ...job.control, workspace } });
+        return done({ control: { ...job.control, workspace, queuedSends: [] } });
       },
     },
   };
