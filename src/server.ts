@@ -45,6 +45,7 @@ import {
   loadCatalog,
   providerIds,
   renderChecks,
+  workerProblem,
   type Check,
 } from "./doctor.ts";
 
@@ -250,15 +251,7 @@ export default async function plugin(bb: BbPluginApi) {
       return result.pass ? result : { pass: false, reason: [result.reason, renderOpenSteps(state, 1200)].filter(Boolean).join("\n") };
     },
     activeWork,
-    checkWorker: async (hostId, tuple) => {
-      const provider = tuple.split("/")[0]!;
-      const catalog = await loadCatalog(bb, { hostId }, [provider]);
-      const check = checkTuple(tuple, catalog);
-      if (check.ok) return null;
-      // A catalog that failed to load says nothing about the tuple, so the job waits instead of sticking.
-      if (catalog.get(provider)?.state === "error") throw new Error(`${tuple}: ${check.detail}`);
-      return `${tuple}: ${check.detail}`;
-    },
+    checkWorker: async (hostId, tuple) => workerProblem(tuple, await loadCatalog(bb, { hostId }, [tuple.split("/")[0]!])),
     machines: (query) => placement.facts(query),
   });
   issues.register();
@@ -393,7 +386,7 @@ export default async function plugin(bb: BbPluginApi) {
         }),
         doctor: cliCommand({
           summary:
-            "Check that every role's model exists in the live provider catalog",
+            "Check that every role's model exists in the live provider catalog, and that each pinned issueRepos host can run the issue worker",
           options: {
             environment: {
               type: "string",
@@ -410,7 +403,7 @@ export default async function plugin(bb: BbPluginApi) {
               environmentId = thread.environmentId ?? undefined;
             }
             const catalog = await loadCatalog(bb, environmentId ? { environmentId } : {}, providerIds(roles));
-            const checks: Check[] = checkRoles(roles, catalog);
+            const checks: Check[] = [...checkRoles(roles, catalog), ...(await issues.workerChecks())];
             const failed = failedChecks(checks);
             return {
               exitCode: failed.length > 0 ? 1 : 0,

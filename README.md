@@ -33,7 +33,7 @@ the skills show up in every thread's `/` menu. the plugin also adds a small cli:
 | `bb pstack models [--role <role>] [--json]` | the model each role uses, configured values merged over the defaults. |
 | `bb pstack spawn --new-environment worktree --prompt-stdin` | creates a delegate on the eligible machine with the most free slots. `--parent-self` sets its parent. `--machine here` pins local work. `--dry-run` prints the decision and spawn arguments. |
 | `bb pstack machines [--provider <id> --model <id>] [--ask-clone] [--json]` | shows running threads, held slots, concurrency limits, and placement blockers. automatic placement onto another machine requires a known limit. `--ask-clone` asks you in the thread whether to clone the project onto machines that have no checkout. |
-| `bb pstack doctor` | checks every role against the live provider catalog. run it after setup. |
+| `bb pstack doctor` | checks every role against the live provider catalog, and the issue worker on each pinned `issueRepos` host. run it after setup. |
 | `bb pstack run start --file <plan.json>` | runs a review panel or a swarm on hidden worker threads, with a live card in the chat. skills write the plan for you. |
 | `bb pstack run status <id>` / `run stop <id>` | a run's progress and results, or stop it. |
 | `bb pstack checklist begin <playbook>` | copies a playbook's steps into the thread's checklist. `checklist done <id> --evidence …`, `checklist skip <id> --reason …` and `checklist add` close and extend it. |

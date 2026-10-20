@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { BbPluginApi, PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import type { Check } from "../doctor.ts";
 import type { HostPush, HostInspectCommit } from "../host-contract.ts";
 import type { ModelChoice } from "../models.ts";
 import { hostId, pickHost, type Facts as PlacementFacts, type Hold, type HostId } from "../placement.ts";
@@ -68,6 +69,7 @@ import { acceptSync,
   type Sha,
   type SubIssue,
   type WorkerProblem,
+  type WorkerReadiness,
   type WorkerSettings,
 } from "./job.ts";
 import type { IssueStore, Submission } from "./store.ts";
@@ -122,11 +124,16 @@ export type Issues = {
   instructions(threadId: string): string | null;
   /** One pass of the service: poll every repository, reconcile every job that may act, and wait for any reconcile in flight. */
   sweep(): Promise<void>;
+  /** One doctor check per pinned machine and issue worker tuple, naming the repositories mapped to it. */
+  workerChecks(): Promise<Check[]>;
+  /** Starts a new job for the issue of a stuck or stopped job, when the issue has no open job. */
+  retry(id: JobId, by: string): Promise<StartResult>;
   /** Moves the job to stopping and starts its ending effects. False when it already ended or is ending, or does not exist. */
   stop(id: JobId, by: string): Promise<boolean>;
 };
 
 export type ReportResult = { ok: true; message: string } | { ok: false; code: string; message: string };
+export type StartResult = { ok: true; id: JobId } | { ok: false; code: string; message: string };
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const isMissing = (error: unknown) => {
@@ -554,28 +561,46 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
-  async function resolveWorker(job: Job): Promise<WorkerSettings | WorkerProblem> {
-    const permanent = (error: string): WorkerProblem => ({ error, permanent: true });
+  /**
+   * Which worker a repository's new job would run, and whether it can: the first `issue worker` choice, with the
+   * project's defaults, and on a pinned machine that machine's catalog. Never throws and makes no GitHub call. The
+   * poll, a job, a start and doctor all ask it, so they agree on the tuple.
+   */
+  async function readiness(target: { projectId: string; hostId: string | null }): Promise<WorkerReadiness> {
+    const blocked = (error: string, tuple: string | null = null, permanent = true): WorkerReadiness => ({ kind: "blocked", permanent, error, tuple });
     const choice = deps.resolveRole("issue worker")[0];
-    if (!choice) return permanent("no model is configured for the issue worker role");
+    if (!choice) return blocked("no model is configured for the issue worker role");
+    let tuple = choice.kind === "tuple" ? `${choice.provider}/${choice.model}/${choice.reasoningLevel}` : null;
     try {
-      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: job.projectId });
+      const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: target.projectId });
       const permissionMode = defaults?.permissionMode ?? null;
       let worker: WorkerSettings;
       if (choice.kind === "tuple") {
-        if (!isReasoningLevel(choice.reasoningLevel)) return permanent(`the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows`);
+        if (!isReasoningLevel(choice.reasoningLevel)) return blocked(`the issue worker role's reasoning level "${choice.reasoningLevel}" is not one bb knows`, tuple);
         worker = { providerId: choice.provider, model: choice.model, reasoningLevel: choice.reasoningLevel, permissionMode };
       } else {
-        if (!defaults) return permanent(`the issue worker role inherits the project's model, and project ${job.projectId} has no default`);
+        if (!defaults) return blocked(`the issue worker role inherits the project's model, and project ${target.projectId} has no default`);
         worker = { providerId: defaults.providerId, model: defaults.model, reasoningLevel: defaults.reasoningLevel, permissionMode };
       }
+      tuple = `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`;
+      if (target.hostId === null) return { kind: "ready", worker, tuple };
+      const problem = await deps.checkWorker(target.hostId, tuple);
+      return problem ? blocked(problem, tuple) : { kind: "ready", worker, tuple };
+    } catch (error) {
+      return blocked(message(error), tuple, false);
+    }
+  }
+
+  async function resolveWorker(job: Job): Promise<WorkerSettings | WorkerProblem> {
+    const ready = await readiness({ projectId: job.projectId, hostId: job.host.pinned ? job.host.id : null });
+    if (ready.kind === "blocked") return { error: ready.error, permanent: ready.permanent };
+    const permanent = (error: string): WorkerProblem => ({ error, permanent: true });
+    try {
       const capabilities = await github.repo(job.repo).capabilities({ fresh: true });
       if (capabilities.archived) return permanent("the repository is archived");
       if (capabilities.defaultBranch !== job.baseBranch) return permanent("the configured base no longer matches the repository default branch");
       if (capabilities.permissions.contents !== "write" || capabilities.permissions.pullRequests !== "write") return permanent("the existing installation lacks publication grants");
-      if (!job.host.pinned) return worker;
-      const problem = await deps.checkWorker(job.host.id, `${worker.providerId}/${worker.model}/${worker.reasoningLevel}`);
-      return problem ? permanent(problem) : worker;
+      return ready.worker;
     } catch (error) {
       return { error: message(error), permanent: error instanceof GitHubSetupError || error instanceof GitHubPermanentError };
     }
@@ -1131,6 +1156,9 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
   }
 
+  const notReady = (mapping: RepoMapping, ready: Extract<WorkerReadiness, { kind: "blocked" }>) =>
+    `issue worker${ready.tuple && !ready.error.includes(ready.tuple) ? ` ${ready.tuple}` : ""} cannot take new jobs${mapping.hostId ? ` on ${mapping.hostId}` : ""}: ${ready.error}`;
+
   async function pollRepo(mapping: RepoMapping, primaryHostId: string | null): Promise<void> {
     const now = clock();
     let cursor = store.repoPoll(mapping.repo).poll as PollCursor | null;
@@ -1140,10 +1168,15 @@ export function createIssues(deps: IssuesDeps): Issues {
     }
     const repo = github.repo(mapping.repo);
     const errors: string[] = [];
-    try {
-      cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
-    } catch (error) {
-      errors.push(message(error));
+    // The cursor stays put while the worker cannot run, so the label events it skips are read again once it can.
+    const ready = await readiness(mapping);
+    if (ready.kind === "blocked") errors.push(notReady(mapping, ready));
+    else {
+      try {
+        cursor = (await pollLabels(mapping, repo, cursor, now)) ?? cursor;
+      } catch (error) {
+        errors.push(message(error));
+      }
     }
     try {
       await pollJobs(repo);
@@ -1213,6 +1246,50 @@ export function createIssues(deps: IssuesDeps): Issues {
       }
       await sleep(SWEEP_MS, undefined, { signal }).catch(() => {});
     }
+  }
+
+  /**
+   * Inserts a job for an open issue, as a person starting it, and runs it. A job opened for it meanwhile wins the race:
+   * with `reuseOpen` that job is returned as started, otherwise admit refuses with issue_has_open_job.
+   */
+  async function admit(mapping: RepoMapping, number: number, actor: string, { reuseOpen }: { reuseOpen: boolean }): Promise<StartResult> {
+    const { primaryHostId } = await bb.sdk.system.config();
+    if (mapping.hostId !== null && mapping.hostId === primaryHostId) return { ok: false, code: "bb_server_host", message: "Map this repository to a worker host before starting an issue." };
+    const ready = await readiness(mapping);
+    if (ready.kind === "blocked") return { ok: false, code: "worker_not_ready", message: notReady(mapping, ready) };
+    const repo = github.repo(mapping.repo);
+    const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
+    if (!issue || issue.state !== "open") return { ok: false, code: "issue_not_open", message: "Only an open GitHub issue can be started." };
+    const baseBranch = await repo.defaultBranch();
+    const now = clock();
+    const inserted = store.insert({
+      id: `psi_${randomUUID()}` as JobId, repo: mapping.repo, issue: number,
+      trigger: { eventId: null, actor, at: now },
+      snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
+      projectId: mapping.projectId, hostId: mapping.hostId, baseBranch,
+      state: issue.subIssues > 0 ? "tracking" : "queued", error: null,
+    }, now);
+    let job = inserted;
+    if (!job) {
+      const open = store.open(mapping.repo, number);
+      if (open && !reuseOpen) return { ok: false, code: "issue_has_open_job", message: `${mapping.repo}#${number} already has the open job ${open.id}` };
+      job = open;
+    }
+    if (!job) return { ok: false, code: "start_failed", message: "The issue could not be started. Refresh and try again." };
+    background(tick(job.id));
+    return { ok: true, id: job.id };
+  }
+
+  async function retry(id: JobId, by: string): Promise<StartResult> {
+    const job = store.get(id);
+    if (!job) return { ok: false, code: "job_not_found", message: `no issue job ${id}` };
+    if (job.phase.state !== "stuck" && job.phase.state !== "stopped") return { ok: false, code: "job_not_retryable", message: `${id} is ${job.phase.state}; only a stuck or stopped job can be retried` };
+    if (job.parentId !== null) return { ok: false, code: "child_job_not_retryable", message: `${id} is a sub-issue job of ${job.parentId}; stop and retry the parent job instead` };
+    const mapping = deps.repos().find(({ repo }) => repo === job.repo);
+    if (!mapping) return { ok: false, code: "repo_not_configured", message: `${job.repo} is not configured for issue workers` };
+    const open = store.open(job.repo, job.issue);
+    if (open) return { ok: false, code: "issue_has_open_job", message: `${job.repo}#${job.issue} already has the open job ${open.id}` };
+    return admit(mapping, job.issue, by, { reuseOpen: false });
   }
 
   async function adopt(input: { repo: string; pr: number; issue: number | null }): Promise<AdoptOutcome> {
@@ -1286,26 +1363,27 @@ export function createIssues(deps: IssuesDeps): Issues {
       if (!mapping) throw new Error("This repository is not configured for issue workers.");
       const existing = store.open(mapping.repo, number);
       if (existing) return existing.id;
-      const { primaryHostId } = await bb.sdk.system.config();
-      if (mapping.hostId !== null && mapping.hostId === primaryHostId) throw new Error("Map this repository to a worker host before starting an issue.");
-      const repo = github.repo(mapping.repo);
-      const issue = (await repo.repositoryIssues(true)).find((item) => item.number === number);
-      if (!issue || issue.state !== "open") throw new Error("Only an open GitHub issue can be started.");
-      const baseBranch = await repo.defaultBranch();
-      const now = clock();
-      const job = store.insert({
-        id: `psi_${randomUUID()}` as JobId, repo: mapping.repo, issue: number,
-        trigger: { eventId: null, actor: "the bb app", at: now },
-        snapshot: { title: issue.title, body: issue.body, url: issue.url, author: issue.author },
-        projectId: mapping.projectId, hostId: mapping.hostId, baseBranch,
-        state: issue.subIssues > 0 ? "tracking" : "queued", error: null,
-      }, now) ?? store.open(mapping.repo, number);
-      if (!job) throw new Error("The issue could not be started. Refresh and try again.");
-      background(tick(job.id));
-      return job.id;
+      const started = await admit(mapping, number, "the bb app", { reuseOpen: true });
+      if (!started.ok) throw new Error(started.message);
+      return started.id;
+    },
+    retry,
+    async workerChecks() {
+      const pinned = deps.repos().filter((mapping) => mapping.hostId !== null);
+      const results = await Promise.all(pinned.map(async (mapping) => ({ mapping, ready: await readiness(mapping) })));
+      const checks = new Map<string, { host: string; tuple: string | null; repos: string[]; ok: boolean; detail: string }>();
+      for (const { mapping, ready } of results) {
+        const key = `${mapping.hostId} ${ready.tuple}`;
+        const detail = ready.kind === "ready" ? "available" : ready.permanent ? ready.error : `could not check: ${ready.error}`;
+        const check = checks.get(key) ?? { host: mapping.hostId!, tuple: ready.tuple, repos: [], ok: true, detail };
+        check.repos.push(mapping.repo);
+        if (check.ok && ready.kind === "blocked") Object.assign(check, { ok: false, detail });
+        checks.set(key, check);
+      }
+      return [...checks.values()].map(({ host, tuple, repos, ok, detail }) => ({ ok, subject: `issue worker on ${host} (${repos.join(", ")})${tuple ? `: ${tuple}` : ""}`, detail }));
     },
     adopt,
-    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop, adopt }),
+    commands: issueCommands({ bb, store, repos: deps.repos, clock, report, sync, stop, retry, adopt }),
     register() {
       for (const event of ["thread.idle", "thread.failed", "thread.archived", "thread.deleted"] as const) {
         bb.events.on(event, ({ thread }) => {

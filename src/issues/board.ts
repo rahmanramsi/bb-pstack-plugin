@@ -65,7 +65,8 @@ export function issueBoard(store: IssueStore, configured: readonly RepoName[], f
     const job = store.byThread(filter.threadId);
     return job ? { repos: [repoView(store, job.repo)], jobs: [listed(store, job)] } : { repos: [], jobs: [] };
   }
-  const jobs = store.list(filter).map((job) => listed(store, job));
+  const rows = filter.all ? store.list(filter) : [...store.list(filter), ...store.latestStuck(filter)].sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+  const jobs = rows.map((job) => listed(store, job));
   const names = [...new Set([...configured, ...jobs.map((job) => job.repo)])].filter((repo) => !filter.repo || repo === filter.repo);
   return { repos: names.map((repo) => repoView(store, repo)), jobs };
 }

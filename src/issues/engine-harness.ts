@@ -1,6 +1,6 @@
 /** The loopback fake GitHub, the fake bb SDK and the engine they drive, shared by the engine tests. */
 import assert from "node:assert/strict";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before } from "node:test";
@@ -13,7 +13,7 @@ import { MIGRATIONS } from "../store.ts";
 import { createIssues, SWEEP_MS, type IssuesDeps } from "./engine.ts";
 import { createGitHub } from "./github.ts";
 import type { JobView, RepoName } from "./job.ts";
-import { openIssueStore, type IssueStore } from "./store.ts";
+import { openIssueStore, type IssueStore, type NewJob } from "./store.ts";
 
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
@@ -323,7 +323,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null, machines: null as string | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null, machines: null as string | null, catalog: null as string | null };
   const fleet = new Map<string, Machine>([["host_server", {}], ["host_worker", {}]]);
   const machine = (id: string) => ({ connected: true, phase: "active", limit: 4, checkout: true, catalog: [...CATALOG], ...fleet.get(id) });
   const hostOf = (thread: FakeThread) => thread.hostId ?? "host_worker";
@@ -543,6 +543,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
       activeWork: async () => ({ ...work }),
       checkWorker: async (hostId: string, tuple: string) => {
         assert.equal(hostId, "host_worker");
+        if (failures.catalog) throw new Error(failures.catalog);
         return CATALOG.has(tuple) ? null : `${tuple}: not in the host's catalog`;
       },
       machines: async (query) => {
@@ -567,6 +568,17 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     const list = gh.events.get(number) ?? [];
     list.push({ id: gh.nextId++, event: "labeled", label: { name: "agent" }, actor: { login: actor }, created_at: iso(clock.now) });
     gh.events.set(number, list);
+  };
+  /** A queued job for an issue, as one the poll inserted before the configuration last changed. */
+  const queue = (number: number, overrides: Partial<NewJob> = {}) => {
+    label(number);
+    const issue = gh.issues.get(number)!;
+    return store.insert({
+      id: `psi_${randomUUID()}` as NewJob["id"], repo: REPO, issue: number,
+      trigger: { eventId: gh.events.get(number)!.at(-1)!.id, actor: "maya", at: clock.now },
+      snapshot: { title: issue.title, body: issue.body, url: `https://github.com/acme/web/issues/${number}`, author: issue.user },
+      projectId: "prj_web", hostId: "host_worker", baseBranch: "main", state: "queued", error: null, ...overrides,
+    }, clock.now)!;
   };
   const unlabel = (number: number) => {
     const issue = gh.issues.get(number)!;
@@ -675,6 +687,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     serviceStarts,
     store,
     label,
+    queue,
     unlabel,
     toReview,
     review,
