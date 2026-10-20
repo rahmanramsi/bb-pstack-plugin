@@ -74,6 +74,7 @@ test("pinned requests exclude every away host even when home is full", () => {
   const result = pick(facts({ occupancy: { requestedAt: 0, threads: threads(HOME, 4) } }), [], { ...need, away: null });
   assert.equal(result.target.where, "home");
   assert.equal(result.board.hosts[1].blocker, "pinned to home");
+  assert.match(result.target.why, /full \(4\/4\), bb will queue the thread/);
 });
 
 test("the global limit caps picks even when machines have room", () => {
