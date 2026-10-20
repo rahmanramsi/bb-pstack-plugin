@@ -323,7 +323,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const stopped: string[] = [];
   const pushes: PushInput[] = [];
   const holds: Hold[] = [];
-  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null, machines: null as string | null };
+  const failures = { spawn: [] as { create: "now" | "never" | "later" }[], gate: null as string | null, pushHangs: false, pushRejected: null as Extract<PushResult, { status: "rejected" }>["reason"] | null, staleWorktree: null as string | null, stopUnconfirmed: false, workspaceUnavailable: false, inspectedEmpty: false, missingObject: null as string | null, workflows: false, scheduledRetryAt: null as number | null, machines: null as string | null, queueSends: false };
   const fleet = new Map<string, Machine>([["host_server", {}], ["host_worker", {}]]);
   const machine = (id: string) => ({ connected: true, phase: "active", limit: 4, checkout: true, catalog: [...CATALOG], ...fleet.get(id) });
   const hostOf = (thread: FakeThread) => thread.hostId ?? "host_worker";
@@ -332,6 +332,8 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
   const calls = { list: 0, getPluginMetadata: 0, listPluginMetadata: 0 };
   const threadReads = { count: 0 };
   const queued = new Set<string>();
+  /** Messages `send` queued behind an active turn, by thread. */
+  const rows = new Map<string, { id: string; text: string }[]>();
   let next = 0;
   const missing = () => Object.assign(new Error("thread not found"), { status: 404 });
   const held = async (key: string) => {
@@ -355,7 +357,16 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
 
   const sdk = {
     threads: {
-      queuedMessages: { list: async ({ threadId }: { threadId: string }) => failures.scheduledRetryAt !== null ? [{ payload: { kind: "retry" }, sendAt: failures.scheduledRetryAt }] : queued.has(threadId) ? [{ payload: { kind: "message" }, sendAt: null }] : [] },
+      queuedMessages: {
+        list: async ({ threadId }: { threadId: string }) => failures.scheduledRetryAt !== null ? [{ payload: { kind: "retry" }, sendAt: failures.scheduledRetryAt }] : [...(queued.has(threadId) ? [{ payload: { kind: "message" }, sendAt: null }] : []), ...(rows.get(threadId) ?? []).map((row) => ({ ...row, payload: { kind: "inline" }, sendAt: null }))],
+        async delete({ threadId, queuedMessageId }: { threadId: string; queuedMessageId: string }) {
+          const list = rows.get(threadId) ?? [];
+          if (!list.some((row) => row.id === queuedMessageId)) throw missing();
+          rows.set(threadId, list.filter((row) => row.id !== queuedMessageId));
+          threads.get(threadId)!.queuedMessageCount! -= 1;
+          return { ok: true };
+        },
+      },
       async get({ threadId }: { threadId: string }) {
         threadReads.count++;
         const thread = threads.get(threadId);
@@ -406,7 +417,14 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
         if (!threads.has(args.threadId)) throw missing();
         sent.push(args);
         await held("send");
-        return {};
+        const thread = threads.get(args.threadId)!;
+        if (failures.queueSends && thread.status === "active" && args.mode === "queue-if-active") {
+          const row = { id: `qm_${++next}`, text: args.input[0].text };
+          rows.set(thread.id, [...(rows.get(thread.id) ?? []), row]);
+          thread.queuedMessageCount = (thread.queuedMessageCount ?? 0) + 1;
+          return { ok: true, delivery: "queued", queuedMessage: row };
+        }
+        return { ok: true, delivery: "sent" };
       },
     },
     environments: {
@@ -662,6 +680,7 @@ export function harness(options: { beforeAutonomyUpgrade?: (db: InstanceType<typ
     calls,
     threadReads,
     queued,
+    rows,
     spawned,
     sent,
     stopped,
