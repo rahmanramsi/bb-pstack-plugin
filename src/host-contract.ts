@@ -9,9 +9,10 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
+import { AGENT_BRANCH } from "./agent-branch.ts";
 
 export const SHA = /^[0-9a-f]{40}$/;
-export const AGENT_BRANCH = /^agent\/issue-\d+-[a-z0-9-]+$/;
+export { AGENT_BRANCH };
 /** A plain branch name: no leading dash or dot, no `..`, `@{`, `//`, trailing `/`, `.lock` or `.`. */
 export const BRANCH = /^(?![-./])(?!.*(?:\.\.|@\{|\/\/|\/\.|\.lock$|[./]$))[A-Za-z0-9._\/-]{1,200}$/;
 const Sha = z.string().regex(SHA);

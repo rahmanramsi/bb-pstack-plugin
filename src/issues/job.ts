@@ -8,7 +8,7 @@
  */
 import type { PluginBoundThreadsArea } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { AGENT_BRANCH } from "../host-contract.ts";
+import { AGENT_BRANCH } from "../agent-branch.ts";
 import type { PullDetail } from "./github.ts";
 import { COMMENT_MAX, adoptionPrompt, bodyProblems, commentBody, nudgeText, prBody, processPhrase, progressBody, replyText, roundPrompt, titleProblems, workerPrompt, workerTitle } from "./text.ts";
 
