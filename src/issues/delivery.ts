@@ -1,4 +1,4 @@
-import { EFFECT_POLICY, LABEL, TERMINAL, type Effect, type EffectMode, type EffectOutcome, type Job } from "./job.ts";
+import { EFFECT_POLICY, LABEL, TERMINAL, adopted, type Effect, type EffectMode, type EffectOutcome, type Job } from "./job.ts";
 import { GitHubTransientError, type GitHub } from "./github.ts";
 import type { IssueStore } from "./store.ts";
 import { statusMarker } from "./text.ts";
@@ -10,9 +10,9 @@ export const STATUS_CONCURRENCY = 4;
 const SETTLE_MARGIN_MS = 5_000;
 
 export function desiredLabels(job: Job): Extract<Effect, { op: "labels" }> {
-  const ready = job.control.readiness !== null;
+  const review = job.control.readiness !== null || adopted(job);
   const terminal = TERMINAL.has(job.phase.state);
-  const add: Extract<Effect, { op: "labels" }>["add"] = ready ? [LABEL.review] : terminal ? [] : [LABEL.working];
+  const add: Extract<Effect, { op: "labels" }>["add"] = review ? [LABEL.review] : terminal ? [] : [LABEL.working];
   const remove = [LABEL.working, LABEL.needsInfo, LABEL.review].filter((label) => !add.includes(label));
   return { op: "labels", key: `status-labels:${JSON.stringify({ add, remove })}`, on: "issue", add, remove };
 }
