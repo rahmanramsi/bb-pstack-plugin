@@ -53,6 +53,11 @@ export type NewJob = {
   error: string | null;
 };
 
+/** A queued job that already owns an open pull request whose head is `head`; see `adopt`. */
+export type NewAdoption = Omit<NewJob, "state" | "error" | "parentId"> & { branch: BranchName; pr: { number: number; url: string }; head: Sha };
+/** `transferred`: how many of the pull request's unanswered feedback items moved from ended jobs to this one. */
+export type Adoption = { kind: "adopted"; job: Job; transferred: number } | { kind: "already"; job: Job } | { kind: "refused"; reason: string };
+
 /** A job's last poll of its pull request: the cursor github.ts hands back, the state it read, and why it last failed. */
 export type JobPoll = { cursor: unknown; prState: PullState | null; polledAt: number | null; error: string | null };
 
@@ -125,7 +130,15 @@ export type DurableDelivery = {
   /** A `notBefore` from GitHub holds the whole issue's delivery, comment and decorations, until then. */
   settleDecoration(status: IssueStatus, key: string, error: string | null, nextAt: number, now: number, notBefore?: number): void;
 };
-export type IssueStore = IssueReads & IssueWrites & DurableDelivery;
+export type Adoptions = {
+  /**
+   * Inserts a queued job that owns `job.pr`, in one transaction with its refusals: `already` when the issue's open job
+   * owns this pull request and branch, `refused` when another open job holds the issue, the branch or the pull request.
+   * The pull request's unanswered feedback that ended jobs own moves to the new job.
+   */
+  adopt(job: NewAdoption, now: number): Adoption;
+};
+export type IssueStore = IssueReads & IssueWrites & DurableDelivery & Adoptions;
 
 type JobRow = {
   id: string;
@@ -325,22 +338,16 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
 
   for (const row of db.prepare("SELECT * FROM issue_jobs ORDER BY generation, created_at").all() as JobRow[]) projectStatus(parse(row));
 
-  const insert = db.transaction((job: NewJob, now: number): Job | null => {
-    if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
-    if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
-    if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
-    const { earlier } = db
-      .prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'")
-      .get(job.repo, job.issue) as { earlier: number };
-    const generation = earlier + 1;
-    const last = db
-      .prepare("SELECT branch, state, pushed_sha, error FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored' ORDER BY generation DESC LIMIT 1")
-      .get(job.repo, job.issue) as { branch: BranchName; state: string; pushed_sha: Sha | null; error: string | null } | undefined;
-    const resume = last?.state === "stuck" && last.pushed_sha ? { branch: last.branch, sha: last.pushed_sha, reason: last.error } : null;
+  /** The issue's next generation: one more than its jobs that were not ignored. */
+  const nextGeneration = (repo: RepoName, issue: number) =>
+    (db.prepare("SELECT count(*) AS earlier FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored'").get(repo, issue) as { earlier: number }).earlier + 1;
+
+  /** `published`: the pull request and head an adopted job starts with. */
+  function insertRow(job: NewJob, now: number, generation: number, branch: BranchName, published: { pr: { number: number; url: string }; head: Sha } | null, resume: Control["resume"]): Job {
     db.prepare(
       `INSERT INTO issue_jobs (id, repo, issue, generation, trigger_event_id, triggered_by, triggered_at, issue_json,
-         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, control_json, runtime_protocol)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+         project_id, host_id, host_pinned, base_branch, branch, state, error, created_at, updated_at, parent_id, pr_number, pr_url, pushed_sha, control_json, runtime_protocol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
     ).run(
       job.id,
       job.repo,
@@ -354,17 +361,55 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       job.hostId ?? NO_HOST,
       job.hostId === null ? 0 : 1,
       job.baseBranch,
-      branchFor(job.issue, job.snapshot.title, generation),
+      branch,
       job.state,
       job.error,
       now,
       now,
       job.parentId ?? null,
+      published?.pr.number ?? null,
+      published?.pr.url ?? null,
+      published?.head ?? null,
       JSON.stringify(resume ? { resume } : {}),
     );
-    const inserted = get(job.id);
-    if (inserted) projectStatus(inserted);
+    const inserted = get(job.id)!;
+    projectStatus(inserted);
     return inserted;
+  }
+
+  const insert = db.transaction((job: NewJob, now: number): Job | null => {
+    if (db.prepare("SELECT 1 FROM issue_jobs WHERE trigger_event_id = ?").get(job.trigger.eventId)) return null;
+    if (job.state !== "ignored" && openRow(job.repo, job.issue)) return null;
+    if (job.parentId && db.prepare("SELECT 1 FROM issue_jobs WHERE parent_id = ? AND issue = ?").get(job.parentId, job.issue)) return null;
+    const generation = nextGeneration(job.repo, job.issue);
+    const last = db
+      .prepare("SELECT branch, state, pushed_sha, error FROM issue_jobs WHERE repo = ? AND issue = ? AND state != 'ignored' ORDER BY generation DESC LIMIT 1")
+      .get(job.repo, job.issue) as { branch: BranchName; state: string; pushed_sha: Sha | null; error: string | null } | undefined;
+    const resume = last?.state === "stuck" && last.pushed_sha ? { branch: last.branch, sha: last.pushed_sha, reason: last.error } : null;
+    return insertRow(job, now, generation, branchFor(job.issue, job.snapshot.title, generation), null, resume);
+  });
+
+  const adopt = db.transaction((job: NewAdoption, now: number): Adoption => {
+    const open = openRow(job.repo, job.issue);
+    if (open) {
+      if (open.pr_number === job.pr.number && open.branch === job.branch) return { kind: "already", job: parse(open) };
+      return { kind: "refused", reason: `${open.id} is open on issue #${job.issue} (${open.state}); stop it first with \`bb pstack issues stop ${open.id}\`` };
+    }
+    const holder = db
+      .prepare(`SELECT * FROM issue_jobs WHERE repo = ? AND (branch = ? OR pr_number = ?) AND state NOT IN (${placeholders(TERMINAL_LIST)})`)
+      .get(job.repo, job.branch, job.pr.number, ...TERMINAL_LIST) as JobRow | undefined;
+    if (holder) return { kind: "refused", reason: `${holder.branch === job.branch ? job.branch : `pull request #${job.pr.number}`} belongs to ${holder.id} on issue #${holder.issue}` };
+    const { branch, pr, head, ...fields } = job;
+    const inserted = insertRow({ ...fields, state: "queued", error: null }, now, nextGeneration(job.repo, job.issue), branch, { pr, head }, null);
+    const transferred = db
+      .prepare(
+        `UPDATE issue_feedback SET job_id = ?, round = NULL
+         WHERE repo = ? AND pr_number = ? AND job_id IN (SELECT id FROM issue_jobs WHERE state IN (${placeholders(TERMINAL_LIST)}))
+           AND (round IS NULL OR NOT EXISTS (SELECT 1 FROM issue_rounds r WHERE r.job_id = issue_feedback.job_id
+             AND coalesce(r.feedback_round, r.ordinal) = issue_feedback.round AND r.report_json IS NOT NULL))`,
+      )
+      .run(inserted.id, job.repo, pr.number, ...TERMINAL_LIST).changes;
+    return { kind: "adopted", job: inserted, transferred };
   });
 
   const addFeedback = db.transaction((repo: RepoName, items: readonly { jobId: JobId; pr: number; feedback: Feedback }[]): number => {
@@ -607,7 +652,14 @@ export function openIssueStore(db: Db, onChange: () => void): IssueStore {
       db.prepare("UPDATE issue_status SET decorations_json = ? WHERE repo = ? AND issue = ?").run(JSON.stringify(decorations), status.repo, status.issue);
     }),
   };
-  return { ...reads, ...notifying(writes, onChange), ...deliveries };
+  const adoptions: Adoptions = {
+    adopt(job, now) {
+      const outcome = adopt(job, now);
+      if (outcome.kind === "adopted") onChange();
+      return outcome;
+    },
+  };
+  return { ...reads, ...notifying(writes, onChange), ...deliveries, ...adoptions };
 }
 
 function notifying(writes: IssueWrites, onChange: () => void): IssueWrites {
