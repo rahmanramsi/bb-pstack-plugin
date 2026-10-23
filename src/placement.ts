@@ -153,7 +153,8 @@ export function choose(facts: Facts, holds: readonly Hold[], need: Need, now: nu
 
 const ANY_WORKTREE: Away = { kind: "worktree", baseBranch: null, pin: null };
 
-export type HostPick = { hostId: HostId } | { hostId: null; why: string };
+/** `clonable`: hosts whose only problem is a missing checkout of the project. */
+export type HostPick = { hostId: HostId } | { hostId: null; why: string; clonable: HostId[] };
 
 /**
  * The host for a worker that may run anywhere: connected, active, with a known limit, a ready worktree of the project
@@ -168,8 +169,9 @@ export function pickHost(facts: Facts, holds: readonly Hold[], need: { model: st
   const [best] = rows.filter((row) => problem(row) === null)
     .sort((a, b) => b.headroom - a.headroom || ratio(b) - ratio(a) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
   if (best) return { hostId: best.id };
-  if (rows.length === 0) return { hostId: null, why: "bb lists no machine" };
-  return { hostId: null, why: `no machine is eligible: ${rows.map((row) => `${row.name}: ${problem(row)}`).join("; ")}` };
+  if (rows.length === 0) return { hostId: null, why: "bb lists no machine", clonable: [] };
+  const clonable = rows.filter((row) => problem(row) === NO_CHECKOUT).map((row) => row.id);
+  return { hostId: null, why: `no machine is eligible: ${rows.map((row) => `${row.name}: ${problem(row)}`).join("; ")}`, clonable };
 }
 
 export type ExecLimits = (file: string, args: readonly string[]) => Promise<string>;

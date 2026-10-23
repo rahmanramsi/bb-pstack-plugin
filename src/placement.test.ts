@@ -165,7 +165,7 @@ const anywhere = (value: Facts, holds: Hold[] = [], exclude = new Map<typeof HOM
 test("pickHost takes the eligible host with the most headroom and passes over the excluded one", () => {
   assert.deepEqual(anywhere(facts({ occupancy: { requestedAt: 0, threads: threads(HOME, 1) } })), { hostId: BOX });
   assert.deepEqual(anywhere(facts(), [], new Map([[HOME, "the bb server's machine"], [BOX, "the bb server's machine"]])), {
-    hostId: null, why: "no machine is eligible: local: the bb server's machine; box: the bb server's machine",
+    hostId: null, why: "no machine is eligible: local: the bb server's machine; box: the bb server's machine", clonable: [],
   });
   assert.deepEqual(anywhere(facts({ occupancy: { requestedAt: 0, threads: threads(BOX, 3) } }), [], new Map([[HOME, "the bb server's machine"]])), { hostId: BOX });
 });
@@ -181,7 +181,7 @@ test("pickHost needs a checkout with a ready worktree and the model on the host"
     assert.deepEqual(anywhere(facts({ ...change, occupancy: { requestedAt: 0, threads: threads(HOME, 4) } })), { hostId: HOME }, JSON.stringify([...Object.values(change)[0]!]));
   }
   assert.deepEqual(anywhere(facts({ checkouts: new Set(), models: new Map([[HOME, "codex/m/high unavailable"]]) })), {
-    hostId: null, why: `no machine is eligible: local: ${NO_CHECKOUT}; box: ${NO_CHECKOUT}`,
+    hostId: null, why: `no machine is eligible: local: ${NO_CHECKOUT}; box: ${NO_CHECKOUT}`, clonable: [HOME, BOX],
   });
 });
 
@@ -192,10 +192,10 @@ test("pickHost passes over offline, suspended and unknown-limit hosts", () => {
     { id: VPS, name: VPS, connected: true, phase: "active" },
   ];
   assert.deepEqual(anywhere(facts({ hosts, worktrees: new Map([[VPS, null]]), models: new Map([[VPS, null]]) })), {
-    hostId: null, why: "no machine is eligible: local: disconnected; box: phase suspended; vps: unknown concurrency limit",
+    hostId: null, why: "no machine is eligible: local: disconnected; box: phase suspended; vps: unknown concurrency limit", clonable: [],
   });
   assert.deepEqual(anywhere(facts({ limits: null })).hostId, null);
-  assert.deepEqual(anywhere(facts({ hosts: [] })), { hostId: null, why: "bb lists no machine" });
+  assert.deepEqual(anywhere(facts({ hosts: [] })), { hostId: null, why: "bb lists no machine", clonable: [] });
 });
 
 test("pickHost keeps a full host eligible and spreads by headroom past zero, counting holds", () => {

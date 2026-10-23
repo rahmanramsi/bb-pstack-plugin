@@ -1,8 +1,9 @@
 import { isAbsolute, join } from "node:path";
 import { cliCommand, PluginCliError, type BbPluginApi, type PluginCliContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { NO_REMOTE, pressured, type AskResult, type Checkouts } from "./checkouts.ts";
-import { hostId, NO_CHECKOUT, type HostId, type Need, type Placement } from "./placement.ts";
+import { NO_REMOTE, pressured, type Checkouts } from "./checkouts.ts";
+import type { RemoteBase } from "./remote-base.ts";
+import { hostId, NO_CHECKOUT, type HostId, type Need, type Placement, type Target } from "./placement.ts";
 
 const Flags = z.object({
   "parent-self": z.boolean().default(false),
@@ -64,14 +65,23 @@ export function needFromFlags(flags: SpawnFlags, invoking: Invoking, pinnedHost:
   };
 }
 
-function askLine(result: AskResult): string {
-  if (result.kind === "opened") return `opened the checkout form in this thread for ${result.hosts.map((host) => host.name).join(", ")}`;
-  if (result.kind === "already-open") return `a checkout form for this project is already open in ${result.threadId}`;
-  if (result.kind === "cooling-down") return `the checkout form was dismissed; it reopens after ${new Date(result.until).toISOString()}`;
-  return "every machine without a checkout already has a clone rule";
-}
+export function createPlacementCommands({ bb, placement, checkouts, remoteBase }: { bb: BbPluginApi; placement: Placement; checkouts: Checkouts; remoteBase?: RemoteBase }) {
+  /**
+   * A fresh worktree on `origin/<branch>` or the default branch starts from the ref remoteBase fetched through the
+   * GitHub App. When that fetch fails, bb fetches as before.
+   */
+  async function throughApp(projectId: string, environment: Target["environment"]): Promise<Target["environment"]> {
+    if (!remoteBase || environment.type !== "host" || !environment.hostId || environment.workspace?.type !== "managed-worktree") return environment;
+    const named = environment.workspace.baseBranch?.kind === "named" ? environment.workspace.baseBranch.name : null;
+    try {
+      const ref = await remoteBase({ projectId, hostId: environment.hostId, base: named });
+      return ref === null || ref === named ? environment : { ...environment, workspace: { ...environment.workspace, baseBranch: { kind: "named", name: ref } } };
+    } catch (error) {
+      bb.log.warn(`pstack spawn: ${error instanceof Error ? error.message : String(error)}; bb fetches the base itself`);
+      return environment;
+    }
+  }
 
-export function createPlacementCommands({ bb, placement, checkouts }: { bb: BbPluginApi; placement: Placement; checkouts: Checkouts }) {
   async function origin(ctx: PluginCliContext) {
     if (!ctx.threadId) throw new PluginCliError("placement commands need an invoking thread", { code: "thread_required" });
     const thread = await bb.sdk.threads.get({ threadId: ctx.threadId });
@@ -144,7 +154,7 @@ export function createPlacementCommands({ bb, placement, checkouts }: { bb: BbPl
           let spawnArgs: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0] | null = null;
           const result = await placement.place(need, async (target) => {
             spawnArgs = {
-              projectId: need.projectId!, environment: target.environment, prompt: text,
+              projectId: need.projectId!, environment: flags["dry-run"] ? target.environment : await throughApp(need.projectId!, target.environment), prompt: text,
               parentThreadId: flags["parent-self"] ? ctx.threadId : undefined,
               providerId, model,
               reasoningLevel: flags["reasoning-level"] ?? (sameProvider && (!flags.model || flags.model === defaults?.model) ? defaults?.reasoningLevel : undefined),
@@ -158,7 +168,7 @@ export function createPlacementCommands({ bb, placement, checkouts }: { bb: BbPl
           });
           if (!flags["dry-run"] && !result.threadId) throw new PluginCliError("no thread was spawned", { code: "spawn_failed" });
           const clonable = flags["dry-run"] ? [] : pressured(result.board, need);
-          if (clonable.length > 0) checkouts.notice(ctx.threadId!, need.projectId!, clonable);
+          if (clonable.length > 0) checkouts.clone(need.projectId!, clonable.map((host) => host.id));
           const value = { threadId: result.threadId, target: result.target, ...(flags["dry-run"] ? { spawnArgs } : {}) };
           return {
             exitCode: 0,
@@ -178,7 +188,7 @@ export function createPlacementCommands({ bb, placement, checkouts }: { bb: BbPl
         provider: { type: "string", description: "Provider whose model catalog to check" },
         model: { type: "string", description: "Model required on each away machine" },
         json: { type: "boolean", description: "Emit the placement board as JSON" },
-        "ask-clone": { type: "boolean", description: "Ask in this thread whether to clone the project onto machines without a checkout" },
+        clone: { type: "boolean", description: "Clone the project onto every connected machine without a checkout that no checkouts rule denies" },
       },
       async run(input, ctx) {
         try {
@@ -186,21 +196,21 @@ export function createPlacementCommands({ bb, placement, checkouts }: { bb: BbPl
           const { invoking } = await origin(ctx);
           const flags = parseSpawnFlags({ "new-environment": "worktree", provider: input.options.provider, model: input.options.model });
           const board = await placement.board(needFromFlags(flags, { ...invoking, model: null }, null));
-          const askClone = input.options["ask-clone"] ? await checkouts.ask(ctx.threadId!, invoking.projectId) : null;
-          const consent = { allow: "clone allowed", deny: "clone denied", undecided: "clone undecided, ask with --ask-clone" };
+          const cloning = input.options.clone ? await checkouts.cloneEverywhere(invoking.projectId) : null;
+          const consent = { allow: "clone allowed, start one with --clone", deny: "clone denied by the checkouts setting" };
           const remoteProblem = board.hosts.some((row) => row.blocker === NO_CHECKOUT)
             ? await checkouts.remote(invoking.projectId).then((url) => url === null ? NO_REMOTE : null, (error) => `git remote unknown (${error instanceof Error ? error.message : String(error)})`)
             : null;
           const lines = await Promise.all(board.hosts.map(async (row) => {
             const clone = row.blocker !== NO_CHECKOUT ? null
               : remoteProblem === NO_REMOTE ? NO_REMOTE
-              : [consent[await checkouts.verdict(invoking.projectId, row.id) ?? "undecided"], remoteProblem].filter(Boolean).join("; ");
+              : [cloning?.some((host) => host.id === row.id) ? "cloning in the background" : consent[await checkouts.verdict(invoking.projectId, row.id)], remoteProblem].filter(Boolean).join("; ");
             const blocker = clone === null ? row.blocker : `${NO_CHECKOUT}; ${clone}`;
             return `${row.id}  ${row.name}  ${row.running}+${row.held}/${row.limit ?? "?"}  ${blocker ?? `${row.free} free`}`;
           }));
           lines.push(`global ${board.global.running}/${board.global.limit ?? "unlimited"}`, `next ${board.next ?? "none"}`);
-          if (askClone) lines.push(askLine(askClone));
-          return { exitCode: 0, stdout: input.options.json ? `${JSON.stringify(askClone ? { ...board, askClone } : board, null, 2)}\n` : `${lines.join("\n")}\n` };
+          if (cloning) lines.push(cloning.length > 0 ? `cloning onto ${cloning.map((host) => host.name).join(", ")}` : "no machine to clone onto");
+          return { exitCode: 0, stdout: input.options.json ? `${JSON.stringify(cloning ? { ...board, cloning } : board, null, 2)}\n` : `${lines.join("\n")}\n` };
         } catch (error) {
           if (error instanceof PluginCliError) throw error;
           throw new PluginCliError(error instanceof Error ? error.message : String(error), { code: "machines_failed" });

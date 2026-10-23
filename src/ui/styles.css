@@ -196,12 +196,6 @@
 @media (prefers-reduced-motion: reduce) {
   .pstack *, .pstack *::before, .pstack *::after { animation: none !important; transition: none !important; }
 }
-.ps-consent-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
-.ps-consent-hosts { list-style: none; margin: 0; padding: 0 16px 12px; display: grid; gap: 6px; }
-.ps-consent-host { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
-.ps-consent-name { min-width: 0; overflow-wrap: anywhere; }
-.ps-consent-choice { display: inline-flex; gap: 4px; flex-shrink: 0; }
-.pstack .ps-consent-choice button[aria-pressed=true] { background: var(--secondary); color: var(--foreground); }
 .ps-issues { height: 100%; overflow-y: auto; background: var(--background); }
 .ps-repo-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; margin-bottom: 8px; }
 .ps-section .ps-repo-heading h3 { margin-bottom: 0; overflow-wrap: anywhere; }

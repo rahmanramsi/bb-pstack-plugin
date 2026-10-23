@@ -104,6 +104,13 @@ export type IssuesDeps = {
   checkWorker: (hostId: string, tuple: string) => Promise<string | null>;
   /** Placement's facts for a worker on any machine with a worktree of the project and `provider/model` at `level`. */
   machines: (query: { projectId: string; model: string; level: string }) => Promise<PlacementFacts>;
+  /** Clones the project onto these hosts in the background; a host becomes eligible once its checkout exists. */
+  clone?: (projectId: string, hosts: readonly HostId[]) => void;
+  /**
+   * The ref a fresh worker worktree on `hostId` starts from in place of `origin/<branch>`, fetched through the GitHub
+   * App so bb does not fetch with the machine's own credentials. Null keeps `base`.
+   */
+  remoteBase?: (input: { projectId: string; hostId: string; base: string }) => Promise<string | null>;
   /** The pstack runs and child threads a thread is waiting on, as the checklist nudge counts them. */
   activeWork: (threadId: string) => Promise<{ activeRuns: number; activeChildren: number }>;
   clock?: () => number;
@@ -150,7 +157,7 @@ const short = (sha: string) => sha.slice(0, 7);
 
 type Worktree = { ok: true; path: string; environmentId: string; branch: string; headSha: Sha; dirty: boolean; ahead: number; commits: Sha[] } | { ok: false; transient: boolean; error: string };
 
-type MachineInputs = { facts: PlacementFacts; model: string; exclude: ReadonlyMap<HostId, string> } | { error: string };
+type MachineInputs = { facts: PlacementFacts; model: string; projectId: string; exclude: ReadonlyMap<HostId, string> } | { error: string };
 
 function workerHost(job: Job): string {
   if (job.host.id === null) throw new Error(`issue job ${job.id} has no machine yet`);
@@ -290,13 +297,19 @@ export function createIssues(deps: IssuesDeps): Issues {
     spawn: {
       async perform(job, effect) {
         const { spec } = effect;
+        let baseRef = spec.baseRef;
+        try {
+          baseRef = (await deps.remoteBase?.({ projectId: job.projectId, hostId: workerHost(job), base: spec.baseRef })) ?? spec.baseRef;
+        } catch (error) {
+          return { kind: "retry-unissued", error: `fetch before spawn: ${message(error)}`, notBefore: null };
+        }
         try {
           const thread = await bb.sdk.threads.spawn({
             projectId: job.projectId,
             visibility: "visible",
             // Not the project's worktree base: the first worker starts from the ref report validation counts new
             // commits against, so a fresh worktree has nothing ahead of it; a replacement starts from the pushed branch.
-            environment: { type: "host", hostId: workerHost(job), workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: spec.baseRef } } },
+            environment: { type: "host", hostId: workerHost(job), workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: baseRef } } },
             pluginMetadata: { pstackIssue: 1, jobId: job.id, epoch: job.control.epoch },
             prompt: spec.prompt,
             title: spec.title,
@@ -609,7 +622,7 @@ export function createIssues(deps: IssuesDeps): Issues {
     const model = `${worker.providerId}/${worker.model}`;
     try {
       const [facts, { primaryHostId }] = await Promise.all([deps.machines({ projectId: job.projectId, model, level: worker.reasoningLevel }), bb.sdk.system.config()]);
-      return { facts, model, exclude: new Map(primaryHostId ? [[hostId.parse(primaryHostId), "the bb server's machine"]] : []) };
+      return { facts, model, projectId: job.projectId, exclude: new Map(primaryHostId ? [[hostId.parse(primaryHostId), "the bb server's machine"]] : []) };
     } catch (error) {
       return { error: `could not read the machines: ${message(error)}` };
     }
@@ -625,7 +638,12 @@ export function createIssues(deps: IssuesDeps): Issues {
     if ("error" in machine) return { ...facts, machine: { wait: machine.error } };
     const holds = store.list({ all: false }).flatMap((row): Hold[] => (owesSpawn(row) && row.host.id !== null ? [{ hostId: hostId.parse(row.host.id), threadId: null, settledAt: null }] : []));
     const pick = pickHost(machine.facts, holds, { model: machine.model }, machine.exclude, facts.now);
-    return { ...facts, machine: pick.hostId === null ? { wait: pick.why } : { hostId: pick.hostId } };
+    if (pick.hostId !== null) return { ...facts, machine: { hostId: pick.hostId } };
+    if (pick.clonable.length > 0 && deps.clone) {
+      deps.clone(machine.projectId, pick.clonable);
+      return { ...facts, machine: { wait: `${pick.why}; cloning the project onto ${pick.clonable.join(", ")}` } };
+    }
+    return { ...facts, machine: { wait: pick.why } };
   }
 
   async function gather(job: Job, observations?: { review: boolean }): Promise<Facts> {

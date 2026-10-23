@@ -9,8 +9,6 @@ export const rpcContract = defineRpcContract({
   pstackThreadView: { input: z.object({ threadId: z.string() }), output: ThreadView },
   pstackRunView: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: RunView.nullable() },
   pstackStopRun: { input: z.object({ threadId: z.string(), runId: z.string().regex(RUN_ID) }), output: z.object({ stopped: z.boolean() }) },
-  /** Sends the form's proof over realtime only, never in the reply, so a CLI caller cannot read it. */
-  pstackCheckoutProof: { input: z.object({ formId: z.string() }), output: z.object({ sent: z.boolean() }) },
   /** GitHub issues and worker jobs, ended jobs only with `all`; or the job a worker thread is bound to. */
   pstackIssueBoard: {
     input: z.union([z.strictObject({ all: z.boolean() }), z.strictObject({ threadId: z.string() })]),

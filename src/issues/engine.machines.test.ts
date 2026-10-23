@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MIN, REPO, SHA3, harness, type Machine } from "./engine-harness.ts";
+import type { IssuesDeps } from "./engine.ts";
 import { FEEDBACK_QUIET_MS } from "./job.ts";
 
 function automatic(machines: Record<string, Machine>) {
@@ -119,4 +120,58 @@ test("a pinned repository's job runs on its machine even when another has more r
   assert.deepEqual(job.host, { id: "host_worker", pinned: true });
   assert.match((await h.engine().run(["issues", "list"])).stdout!, /#41 {2}working {2}on host_worker {2}thr_/);
   assert.match((await h.engine().run(["issues", "show", job.id])).stdout!, /machine {7}host_worker \(pinned by issueRepos\)\n/);
+});
+
+function withDeps(machines: Record<string, Machine>, configure: (deps: IssuesDeps) => void) {
+  const h = harness({ configureDeps: configure });
+  h.setRepo({ repo: REPO, projectId: "prj_web", hostId: null });
+  h.fleet.clear();
+  for (const [id, machine] of Object.entries(machines)) h.fleet.set(id, machine);
+  return h;
+}
+
+test("with no eligible machine but one that lacks only a checkout, the job clones the project there and starts once it exists", async () => {
+  const clones: unknown[] = [];
+  const h = withDeps({ host_server: {}, host_mini: { checkout: false }, host_vps: { connected: false } }, (deps) => {
+    deps.clone = (projectId, hosts) => { clones.push([projectId, [...hosts]]); };
+  });
+  h.label(41);
+  await h.settle();
+  const waiting = await h.only();
+  assert.equal(waiting.state, "queued");
+  assert.match(waiting.error!, /; cloning the project onto host_mini$/);
+  assert.deepEqual(clones.at(-1), ["prj_web", ["host_mini"]], "the bb server's machine and a disconnected one are never cloned onto");
+
+  h.fleet.set("host_mini", {});
+  h.clock.now += MIN;
+  await h.engine().issues.sweep();
+  assert.equal((await h.only()).state, "working");
+  assert.deepEqual(spawnedOn(h), ["host_mini"]);
+});
+
+test("a worker's worktree starts from the remote ref fetched through the App, and a failed fetch retries the spawn", async () => {
+  const bases: unknown[] = [];
+  let fail = true;
+  const h = withDeps({ host_server: {}, host_mini: {} }, (deps) => {
+    deps.remoteBase = async (input) => {
+      bases.push(input);
+      if (fail) throw new Error("network");
+      return `refs/remotes/${input.base}`;
+    };
+  });
+  h.label(41);
+  await h.settle();
+  assert.equal(h.spawned.length, 0);
+  assert.match((await h.only()).error ?? "", /fetch before spawn: network/);
+  h.clock.now += MIN;
+  await h.settle();
+  assert.equal(h.spawned.length, 0);
+  assert.equal((await h.only()).state, "starting", "a fetch that keeps failing does not stick the job early");
+
+  fail = false;
+  h.clock.now += 5 * MIN;
+  await h.settle();
+  assert.equal((await h.only()).state, "working");
+  assert.deepEqual(h.spawned.map((spawn) => spawn.environment.workspace), [{ type: "managed-worktree", baseBranch: { kind: "named", name: "refs/remotes/origin/main" } }]);
+  assert.deepEqual(bases.at(-1), { projectId: "prj_web", hostId: "host_mini", base: "origin/main" });
 });

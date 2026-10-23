@@ -808,7 +808,9 @@ function settled(job: Job, outcome: EffectOutcome, now: number): Change {
     case "retry-unissued": {
       const previous = job.control.recoveryObservation;
       const observation = { effectKey: head.key, attempts: previous?.effectKey === head.key ? previous.attempts + 1 : 1, firstAt: previous?.effectKey === head.key ? previous.firstAt : now };
-      if (observation.attempts >= MAX_RECOVERY_OBSERVATIONS) return stick(job, `safe workspace observation exhausted: ${outcome.error}; work retained at ${job.control.workspace?.path ?? "the original environment"}`);
+      if (observation.attempts >= MAX_RECOVERY_OBSERVATIONS) {
+        return stick(job, head.op === "spawn" ? `the worker could not start after ${observation.attempts} tries: ${outcome.error}` : `safe workspace observation exhausted: ${outcome.error}; work retained at ${job.control.workspace?.path ?? "the original environment"}`);
+      }
       const delay = BACKOFF_MS[Math.min(observation.attempts - 1, BACKOFF_MS.length - 1)]!;
       return { phase: { ...phase, tries: 0, firstAt: null, leaseUntil: null, nextAt: Math.max(outcome.notBefore ?? 0, now + delay) }, control: { ...job.control, recoveryObservation: observation }, error: outcome.error };
     }

@@ -20,6 +20,7 @@ import { createPlacement } from "./placement.ts";
 import { createPlacementCommands } from "./placement-commands.ts";
 import { registerDispatchGuard } from "./dispatch-guard.ts";
 import { createCheckouts, parseCheckouts } from "./checkouts.ts";
+import { createRemoteBase } from "./remote-base.ts";
 import { GH_INSTRUCTIONS, ghCommands, repoFromRemote } from "./gh/commands.ts";
 import {
   PluginCliError,
@@ -124,7 +125,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Checkouts",
       description:
-        "Where pstack may clone a project so delegates can run there. One `<projectId|*> allow|deny <hostId|*>` line per rule. The most specific rule wins; deny wins a tie. A machine with no rule is asked about in the thread when it would help.",
+        "Where pstack may not clone a project. pstack clones a project onto a machine with no checkout when a delegate or issue worker needs that machine; a deny rule stops it. One `<projectId|*> allow|deny <hostId|*>` line per rule. The most specific rule wins; deny wins a tie; no matching rule allows.",
       experimental_multiline: true,
       experimental_schema: checkoutsSchema,
       default: "",
@@ -164,10 +165,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { appId: current.githubAppId, privateKey: key.pem };
     },
   });
-  const checkouts = createCheckouts(bb, {
-    get: async () => (await settings.get()).checkouts,
-    set: async (text) => { await settings.experimental_set({ checkouts: text }); },
-  }, {
+  const checkouts = createCheckouts(bb, async () => (await settings.get()).checkouts, {
     async appClone(hostId, remoteUrl, projectName) {
       const name = repoFromRemote(remoteUrl);
       if (name === null || !githubConfigured()) return null;
@@ -188,6 +186,17 @@ export default async function plugin(bb: BbPluginApi) {
         await repo.revoke(credentials.token).catch((error) => bb.log.warn(`pstack checkouts: could not revoke a clone token: ${error instanceof Error ? error.message : String(error)}`));
       }
     },
+  });
+  const remoteBase = createRemoteBase({
+    async checkout(projectId, hostId) {
+      const source = (await bb.sdk.projects.get({ projectId })).sources.find((candidate) => candidate.hostId === hostId);
+      const remote = source ? await checkouts.remote(projectId) : null;
+      const repo = remote === null ? null : repoFromRemote(remote);
+      return source && repo ? { path: source.path, repo } : null;
+    },
+    repo: (name) => githubConfigured() ? github.repo(name) : null,
+    fetch: (hostId, input) => hosts.call("fetch", input, { hostId, timeoutMs: PUSH_TIMEOUT_MS }),
+    warn: (message) => bb.log.warn(`pstack checkouts: ${message}`),
   });
   const checklistStore = openChecklistStore(db);
   const runner = createRunner(bb, runStore, {
@@ -281,6 +290,8 @@ export default async function plugin(bb: BbPluginApi) {
       return `${tuple}: ${check.detail}`;
     },
     machines: (query) => placement.facts(query),
+    clone: (projectId, hosts) => checkouts.clone(projectId, hosts),
+    remoteBase,
   });
   issues.register();
 
@@ -339,7 +350,6 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
     pstackStopRun: async ({ threadId, runId }) => ({ stopped: await runner.stop(runId as RunId, threadId) }),
-    pstackCheckoutProof: async ({ formId }) => ({ sent: checkouts.publishProof(formId) }),
     pstackIssueBoard: async (filter) => issues.board(filter),
     pstackStartIssue: async ({ repo, issue }) => ({ id: await issues.start(repo, issue) }),
     pstackStopIssueJob: async ({ id }) => ({ stopped: await issues.stop(id as JobId, "the bb app") }),
@@ -352,7 +362,7 @@ export default async function plugin(bb: BbPluginApi) {
       commands: {
         ...checklist.commands,
         ...runs.commands,
-        ...createPlacementCommands({ bb, placement, checkouts }),
+        ...createPlacementCommands({ bb, placement, checkouts, remoteBase }),
         ...issues.commands,
         ...ghCommands({
           bb,
