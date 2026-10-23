@@ -194,6 +194,41 @@ test("fetch brings remote branches into origin/* without the worktree's config, 
   await f.harness.experimental_dispose();
 });
 
+test("clone checks out next to bb's clones with a plain origin and leaves the token nowhere on disk", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pstack-clone-"));
+  after(() => rmSync(root, { recursive: true, force: true }));
+  const remote = join(root, "remote.git");
+  const source = join(root, "source");
+  const bbDir = join(root, "bb");
+  const temp = join(root, "temp");
+  for (const dir of [source, temp]) mkdirSync(dir);
+  sh(root, "init", "--bare", "-q", "-b", "main", remote);
+  sh(source, "init", "-q", "-b", "main");
+  const head = commit(source, "README.md", "hello\n");
+  sh(source, "push", "-q", remote, "main");
+  const harness = experimental_createHostEntryHarness(entry, { experimental_paths: { dataDir: join(bbDir, "plugins", "pstack", "host-data"), tempDir: temp } });
+  const remoteUrl = `file://${remote}`;
+
+  const result = await harness.experimental_call("clone", { remoteUrl, token: TOKEN, name: "web" });
+  const path = join(bbDir, "checkouts", "web");
+  assert.deepEqual(result, { status: "cloned", path });
+  assert.equal(sh(path, "rev-parse", "HEAD"), head);
+  assert.equal(sh(path, "config", "--get", "remote.origin.url"), remoteUrl);
+  assert.deepEqual(filesContaining(root, TOKEN), []);
+  assert.deepEqual(readdirSync(join(bbDir, "checkouts")), ["web"], "no partial clone is left behind");
+  assert.deepEqual(readdirSync(temp), []);
+
+  assert.deepEqual(await harness.experimental_call("clone", { remoteUrl, token: TOKEN, name: "web" }), { status: "cloned", path }, "a retry reuses the earlier clone");
+  mkdirSync(join(bbDir, "checkouts", "api"));
+  assert.deepEqual(await harness.experimental_call("clone", { remoteUrl, token: TOKEN, name: "api" }), { status: "cloned", path: join(bbDir, "checkouts", "api-2") }, "an unrelated directory is never overwritten");
+
+  const failed = await harness.experimental_call("clone", { remoteUrl: `file://${join(root, "missing.git")}`, token: TOKEN, name: "gone" });
+  assert.equal(failed.status, "failed");
+  assert.equal(existsSync(join(bbDir, "checkouts", "gone")), false);
+  assert.deepEqual(readdirSync(join(bbDir, "checkouts")).sort(), ["api", "api-2", "web"]);
+  await harness.experimental_dispose();
+});
+
 test("commit inspection includes deleted and reverted workflow ancestors without reading worker commands", async () => {
   const f = fixture();
   const base = sh(f.worktree, "rev-parse", "HEAD");

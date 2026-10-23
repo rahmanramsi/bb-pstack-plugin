@@ -73,6 +73,20 @@ export const FetchResult = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("failed"), detail: z.string() }),
 ]);
 
+/** A directory name under bb's checkouts directory: the project's name, made path-safe by the caller. */
+export const CHECKOUT_NAME = /^(?![.-])[A-Za-z0-9._-]{1,100}$/;
+export const CloneInput = z.strictObject({
+  remoteUrl: RemoteUrl,
+  /** A one-repository, contents-read installation token. It lives only in the git child's environment. */
+  token: z.string().min(1),
+  name: z.string().regex(CHECKOUT_NAME),
+});
+/** `path` is the new checkout, or one an earlier attempt cloned from the same URL. Its origin is `remoteUrl`. */
+export const CloneResult = z.discriminatedUnion("status", [
+  z.strictObject({ status: z.literal("cloned"), path: z.string() }),
+  z.strictObject({ status: z.literal("failed"), detail: z.string() }),
+]);
+
 export const InspectCommitInput = z.strictObject({ worktreePath: WorktreePath, sha: Sha, comparisonSha: Sha, publishedSha: Sha.nullable(), ancestorShas: z.array(Sha).optional() });
 export const InspectCommitResult = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("inspected"), sha: Sha, comparisonSha: Sha, nonemptyDiff: z.boolean(), workflows: z.boolean(), ancestry: z.array(z.strictObject({ sha: Sha, included: z.boolean() })).optional() }),
@@ -88,6 +102,7 @@ export const hostContract = defineRpcContract({
   pushBranch: { input: PushBranchInput, output: PushResult },
   inspect: { input: InspectInput, output: InspectResult },
   fetch: { input: FetchInput, output: FetchResult },
+  clone: { input: CloneInput, output: CloneResult },
 });
 
 export type PushInput = z.infer<typeof PushInput>;
@@ -95,6 +110,8 @@ export type PushResult = z.infer<typeof PushResult>;
 export type PushBranchInput = z.infer<typeof PushBranchInput>;
 export type FetchInput = z.infer<typeof FetchInput>;
 export type FetchResult = z.infer<typeof FetchResult>;
+export type CloneInput = z.infer<typeof CloneInput>;
+export type CloneResult = z.infer<typeof CloneResult>;
 /** The server-side port. server.ts builds it from bb.hosts.experimental_client; tests pass a fake or the host harness. */
 export type HostPush = (hostId: string, input: PushInput, signal?: AbortSignal) => Promise<PushResult>;
 
@@ -108,3 +125,5 @@ export type HostGit = {
 
 /** A real `git push` of a large first commit needs more than the 30 s default. */
 export const PUSH_TIMEOUT_MS = 10 * 60 * 1000;
+/** A first clone of a large repository. */
+export const CLONE_TIMEOUT_MS = 30 * 60 * 1000;
