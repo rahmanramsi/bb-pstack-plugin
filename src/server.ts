@@ -5,7 +5,7 @@ import { createChecklistFeature } from "./checklist-commands.ts";
 import { openChecklistStore } from "./checklist-store.ts";
 import { evidenceFreshnessError } from "./checklist.ts";
 import { ISSUES_CHANNEL, STATE_CHANNEL } from "./contract.ts";
-import { PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
+import { CLONE_TIMEOUT_MS, PUSH_TIMEOUT_MS, hostContract } from "./host-contract.ts";
 import { ISSUE_SETTINGS, parseIssueRepos } from "./issues/commands.ts";
 import { createIssues } from "./issues/engine.ts";
 import { GitHubSetupError, createGitHub, decodePrivateKey } from "./issues/github.ts";
@@ -20,7 +20,7 @@ import { createPlacement } from "./placement.ts";
 import { createPlacementCommands } from "./placement-commands.ts";
 import { registerDispatchGuard } from "./dispatch-guard.ts";
 import { createCheckouts, parseCheckouts } from "./checkouts.ts";
-import { GH_INSTRUCTIONS, ghCommands } from "./gh/commands.ts";
+import { GH_INSTRUCTIONS, ghCommands, repoFromRemote } from "./gh/commands.ts";
 import {
   PluginCliError,
   cliCommand,
@@ -154,9 +154,40 @@ export default async function plugin(bb: BbPluginApi) {
   const isRunWorker = (threadId: string) => runStore.attemptByThread(threadId) !== null;
   const placement = createPlacement(bb);
   const placementDispatch = registerDispatchGuard(bb, placement, () => placementGuard);
+  const hosts = bb.hosts.experimental_client({ contract: hostContract });
+  const githubConfigured = () => !!current.githubAppId && !!current.githubPrivateKey;
+  const github = createGitHub({
+    credentials: () => {
+      if (!githubConfigured()) return null;
+      const key = decodePrivateKey(current.githubPrivateKey);
+      if (!key.ok) throw new GitHubSetupError(key.error);
+      return { appId: current.githubAppId, privateKey: key.pem };
+    },
+  });
   const checkouts = createCheckouts(bb, {
     get: async () => (await settings.get()).checkouts,
     set: async (text) => { await settings.experimental_set({ checkouts: text }); },
+  }, {
+    async appClone(hostId, remoteUrl, projectName) {
+      const name = repoFromRemote(remoteUrl);
+      if (name === null || !githubConfigured()) return null;
+      const repo = github.repo(name);
+      let credentials: { remoteUrl: string; token: string };
+      try {
+        credentials = await repo.fetchCredentials();
+      } catch (error) {
+        if (error instanceof GitHubSetupError) return null;
+        throw error;
+      }
+      try {
+        const checkoutName = projectName.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+/, "").slice(0, 100) || name.split("/")[1]!;
+        const result = await hosts.call("clone", { remoteUrl: credentials.remoteUrl, token: credentials.token, name: checkoutName }, { hostId, timeoutMs: CLONE_TIMEOUT_MS });
+        if (result.status === "failed") throw new Error(result.detail);
+        return result.path;
+      } finally {
+        await repo.revoke(credentials.token).catch((error) => bb.log.warn(`pstack checkouts: could not revoke a clone token: ${error instanceof Error ? error.message : String(error)}`));
+      }
+    },
   });
   const checklistStore = openChecklistStore(db);
   const runner = createRunner(bb, runStore, {
@@ -218,16 +249,6 @@ export default async function plugin(bb: BbPluginApi) {
     const parsed = parseIssueRepos(current.issueRepos);
     return parsed.ok ? parsed.repos : [];
   };
-  const hosts = bb.hosts.experimental_client({ contract: hostContract });
-  const githubConfigured = () => !!current.githubAppId && !!current.githubPrivateKey;
-  const github = createGitHub({
-    credentials: () => {
-      if (!githubConfigured()) return null;
-      const key = decodePrivateKey(current.githubPrivateKey);
-      if (!key.ok) throw new GitHubSetupError(key.error);
-      return { appId: current.githubAppId, privateKey: key.pem };
-    },
-  });
   const issues = createIssues({
     bb,
     store: issueStore,

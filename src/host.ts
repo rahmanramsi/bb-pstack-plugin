@@ -1,6 +1,6 @@
 /**
  * pstack's host entry, run by the host daemon on the machine that holds a thread's worktree: `push` for issue workers,
- * and `pushBranch`, `inspect` and `fetch` for `bb pstack gh`.
+ * `pushBranch`, `inspect` and `fetch` for `bb pstack gh`, and `clone` for a checkout of a private repository.
  *
  * The worktree and its repository config belong to the worker. A plain `git push` inside it would honor the worker's
  * `url.<x>.insteadOf` (sending the token elsewhere), `http.proxy`, `credential.helper` and pre-push hooks. So the push
@@ -10,10 +10,10 @@
  */
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFile, mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
-import { hostContract, type FetchInput, type FetchResult, type PushInput, type PushResult, type InspectCommitInput, type InspectCommitResult } from "./host-contract.ts";
+import { hostContract, type CloneInput, type CloneResult, type FetchInput, type FetchResult, type PushInput, type PushResult, type InspectCommitInput, type InspectCommitResult } from "./host-contract.ts";
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -253,6 +253,43 @@ async function fetchRefs(input: FetchInput, tempDir: string, signal: AbortSignal
   }, (detail) => ({ status: "failed", detail }));
 }
 
+/** bb keeps its own clones in `<bb dir>/checkouts`, and a host entry's data dir is `<bb dir>/plugins/<plugin>/host-data`. */
+function checkoutsDir(dataDir: string): string {
+  const plugins = resolve(dataDir, "..", "..");
+  return basename(plugins) === "plugins" ? join(plugins, "..", "checkouts") : join(dataDir, "checkouts");
+}
+
+/**
+ * Clones with the token in the git child's environment only, so the checkout's origin is the plain URL and nothing on
+ * disk holds the token. The clone lands in a hidden directory and is renamed into place, so a failed clone leaves no
+ * half-written checkout. A directory already cloned from the same URL is returned as is, so a retry is idempotent.
+ */
+async function cloneRepo(input: CloneInput, dataDir: string, tempDir: string, signal: AbortSignal): Promise<CloneResult> {
+  const redact = (text: string) => text.split(input.token).join("***").trim();
+  const dir = checkoutsDir(dataDir);
+  await mkdir(dir, { recursive: true });
+  let target: string | null = null;
+  for (let n = 1; n <= 20 && target === null; n++) {
+    const candidate = join(dir, n === 1 ? input.name : `${input.name}-${n}`);
+    if (!existsSync(candidate)) target = candidate;
+    else if ((await inspect(candidate, signal).catch(() => ({ originUrl: null }))).originUrl === input.remoteUrl) return { status: "cloned", path: candidate };
+  }
+  if (target === null) return { status: "failed", detail: `${dir} already holds 20 other directories named ${input.name}` };
+
+  const home = await mkdtemp(join(tempDir, "home-"));
+  const partial = await mkdtemp(join(dir, `.${input.name}-`));
+  try {
+    const { GIT_DIR: _unused, ...env } = isolatedEnv(home, input.remoteUrl, input.token);
+    const cloned = await git(["clone", "--quiet", "--no-recurse-submodules", "--", input.remoteUrl, partial], env, signal);
+    if (cloned.code !== 0) return { status: "failed", detail: redact(`${cloned.stdout}\n${cloned.stderr}`) };
+    await rename(partial, target);
+    return { status: "cloned", path: target };
+  } finally {
+    await rm(partial, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
@@ -261,5 +298,6 @@ export default experimental_defineHostEntry({
     pushBranch: (input, ctx) => push(input, ctx.experimental_paths.tempDir, ctx.signal),
     inspect: (input, ctx) => inspect(input.worktreePath, ctx.signal),
     fetch: (input, ctx) => fetchRefs(input, ctx.experimental_paths.tempDir, ctx.signal),
+    clone: (input, ctx) => cloneRepo(input, ctx.experimental_paths.dataDir, ctx.experimental_paths.tempDir, ctx.signal),
   },
 });

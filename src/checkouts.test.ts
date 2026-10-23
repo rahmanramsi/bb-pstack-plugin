@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { BbPluginApi, PluginInteractionRequest, PluginInteractionResult } from "@get-bb/plugin-sdk";
 import { CHECKOUT_PROOF_CHANNEL, CHECKOUT_RENDERER, ConsentForm, ProofSignal } from "./checkout-form.ts";
-import { CLONE_BACKOFF_MS, DISMISS_COOLDOWN_MS, createCheckouts, decide, parseCheckouts, pressured, recordDecisions } from "./checkouts.ts";
+import { CLONE_BACKOFF_MS, DISMISS_COOLDOWN_MS, createCheckouts, type AppClone, decide, parseCheckouts, pressured, recordDecisions } from "./checkouts.ts";
 import { hostId, type Board, type HostRow, type Need } from "./placement.ts";
 
 const HOME = hostId.parse("host_home");
@@ -60,7 +60,7 @@ test("pressure needs a full home and a machine that lacks only a checkout", () =
 const REMOTE = "https://example.com/p1.git";
 type Repo = { path: string; originUrl: string | null };
 
-function fake(options: { setting?: string; sources?: string[]; addFailures?: number; addCreatesSource?: boolean; gitRemoteUrl?: string | null; repos?: Repo[] } = {}) {
+function fake(options: { setting?: string; sources?: string[]; addFailures?: number; addCreatesSource?: boolean; gitRemoteUrl?: string | null; repos?: Repo[]; appClone?: AppClone } = {}) {
   let setting = options.setting ?? "";
   let now = 1_000_000;
   const sources = new Set(options.sources ?? [HOME]);
@@ -107,7 +107,7 @@ function fake(options: { setting?: string; sources?: string[]; addFailures?: num
     log: { warn() {}, info() {} },
   } as unknown as BbPluginApi;
   const checkouts = createCheckouts(bb, { get: async () => setting, set: async (text) => { setting = text; } }, {
-    clock: () => now, sleep: async (ms) => { sleeps.push(ms); },
+    clock: () => now, sleep: async (ms) => { sleeps.push(ms); }, ...(options.appClone ? { appClone: options.appClone } : {}),
   });
   const proofFor = (formId: string) => {
     assert.equal(checkouts.publishProof(formId), true);
@@ -280,4 +280,29 @@ test("with no git remote anywhere nothing is cloned or retried", async () => {
     assert.deepEqual(h.sleeps, []);
     assert.equal(await h.checkouts.remote("p1"), null);
   }
+});
+
+test("a repository the GitHub App can read is cloned by the App and added as a local path", async () => {
+  const calls: unknown[] = [];
+  const h = fake({ setting: "p1 allow host_box", appClone: async (...args) => { calls.push(args); return "/bb/checkouts/Project-One"; } });
+  h.checkouts.notice("thr_a", "p1", BOX_ROW);
+  await settle();
+  assert.deepEqual(calls, [[BOX, REMOTE, "Project One"]]);
+  assert.deepEqual(h.adds, [{ projectId: "p1", type: "local_path", hostId: BOX, path: "/bb/checkouts/Project-One" }]);
+});
+
+test("a repository the GitHub App cannot reach falls back to bb's own clone", async () => {
+  const h = fake({ setting: "p1 allow host_box", appClone: async () => null });
+  h.checkouts.notice("thr_a", "p1", BOX_ROW);
+  await settle();
+  assert.deepEqual(h.adds, [{ projectId: "p1", type: "clone", hostId: BOX, remoteUrl: REMOTE }]);
+});
+
+test("a failed App clone is retried with back-off and never handed to bb's clone", async () => {
+  let failures = 1;
+  const h = fake({ setting: "p1 allow host_box", appClone: async () => { if (failures-- > 0) throw new Error("network"); return "/bb/checkouts/p1"; } });
+  h.checkouts.notice("thr_a", "p1", BOX_ROW);
+  await settle();
+  assert.deepEqual(h.sleeps, CLONE_BACKOFF_MS.slice(0, 1));
+  assert.deepEqual(h.adds, [{ projectId: "p1", type: "local_path", hostId: BOX, path: "/bb/checkouts/p1" }]);
 });

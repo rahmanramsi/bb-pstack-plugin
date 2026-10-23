@@ -93,9 +93,16 @@ export interface CheckoutSetting {
   set(text: string): Promise<void>;
 }
 
+/**
+ * Clones `remoteUrl` onto `host` through the pstack GitHub App and returns the checkout's path, or null when the App
+ * cannot reach the repository (not GitHub, not configured, not installed), in which case bb clones it itself.
+ */
+export type AppClone = (host: HostId, remoteUrl: string, projectName: string) => Promise<string | null>;
+
 export function createCheckouts(bb: BbPluginApi, setting: CheckoutSetting, deps: {
   clock?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  appClone?: AppClone;
 } = {}): Checkouts {
   const clock = deps.clock ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -146,8 +153,13 @@ export function createCheckouts(bb: BbPluginApi, setting: CheckoutSetting, deps:
             bb.log.warn(`pstack checkouts: not cloning ${projectId} onto ${host}: ${NO_REMOTE}; the project has no git remote and its default checkout has no origin`);
             return;
           }
-          await bb.sdk.projects.sources.add({ projectId, type: "clone", hostId: host, remoteUrl });
-          bb.log.info(`pstack checkouts: cloned ${projectId} onto ${host}`);
+          // bb's own clone runs plain git on the host, which holds no GitHub credentials, so a private repository
+          // goes through the App first.
+          const path = deps.appClone ? await deps.appClone(host, remoteUrl, project.name) : null;
+          await bb.sdk.projects.sources.add(path === null
+            ? { projectId, type: "clone", hostId: host, remoteUrl }
+            : { projectId, type: "local_path", hostId: host, path });
+          bb.log.info(`pstack checkouts: cloned ${projectId} onto ${host}${path === null ? "" : ` at ${path} through the GitHub App`}`);
           return;
         } catch (error) { warn(`clone of ${projectId} onto ${host}, attempt ${attempt + 1}`, error); }
       }
